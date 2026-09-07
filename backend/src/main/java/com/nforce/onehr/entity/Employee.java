@@ -45,8 +45,12 @@ public class Employee {
 
     // Shift/weekly-off/penalisation assignments (ONEHR-108) — separate from workMode above,
     // which is a self-service ONSITE/REMOTE/HYBRID profile attribute, not a policy assignment.
+    // Every employee is expected to always have a Shift (product invariant; see
+    // ShiftDayPolicy's class Javadoc) — nullable=false mirrors the DB-level NOT NULL added by
+    // V160, so a stray direct save with no shift set fails at flush time instead of silently
+    // persisting a shift-less employee.
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "shift_id")
+    @JoinColumn(name = "shift_id", nullable = false)
     private Shift shift;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -99,6 +103,18 @@ public class Employee {
 
     @Column(name = "emergency_contact_phone", length = 30)
     private String emergencyContactPhone;
+
+    // Admin-controlled ONLY — never editable through the self-service profile API
+    // (ProfileController/ProfileService/UpdateProfileRequest deliberately have no timezone field
+    // at all). IANA zone id (e.g. "America/New_York", "Asia/Kolkata"), or null to fall back to
+    // the employee's Location.timezone, and beyond that to AttendanceRules.defaultTimezone — see
+    // AttendanceService.resolveZone. Authoritative for attendance work-date/lateness/shift-day
+    // math once set: the employee's own browser-reported zone is never consulted (see
+    // resolveZone's own doc comment), and changing this value never reinterprets any existing
+    // Attendance row (each already snapshots its own timezone at check-in — see
+    // Attendance.timezone).
+    @Column(name = "timezone", length = 50)
+    private String timezone;
 
     @Column(name = "profile_photo", columnDefinition = "BYTEA")
     private byte[] profilePhoto;

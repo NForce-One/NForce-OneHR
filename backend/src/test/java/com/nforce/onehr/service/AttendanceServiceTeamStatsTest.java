@@ -80,11 +80,10 @@ class AttendanceServiceTeamStatsTest {
         lenient().when(workingDayService.computeExpectedWorkingDaysBulk(any(), any(), any())).thenReturn(Map.of(
                 emp1Id, WorkingDaySchedule.builder().employeeUserId(emp1Id).workingDates(Set.of(day1, day2)).build(),
                 emp2Id, WorkingDaySchedule.builder().employeeUserId(emp2Id).workingDates(Set.of(day1, day2)).build()));
-        // Mockito's default unstubbed answer for a boxed Long-returning method is 0L, not null —
-        // matching the REAL ExpectedWorkHoursService's actual "no shift assigned" contract (which
-        // returns null, not 0) requires this explicit default so employees with no shift on file
-        // (emp1/emp2 above) correctly fall back to the flat per-day estimate rather than 0 hours.
-        lenient().when(expectedWorkHoursService.shiftMinutes(any())).thenReturn(null);
+        // AttendanceService's own "does a real shift exist" gate now reads employee.getShift()
+        // directly rather than calling shiftMinutes (see its own comment) — emp1/emp2 above have
+        // no shift assigned, so that gate alone already routes them to the flat per-day estimate;
+        // no expectedWorkHoursService stub is needed for that decision anymore.
     }
 
     private Attendance record(UUID id, UUID employeeId, LocalDate date, int workedMinutes, String status) {
@@ -143,15 +142,12 @@ class AttendanceServiceTeamStatsTest {
 
     @Test
     void getTeamEffort_expectedHours_usesRealAssignedShift_whenEmployeeHasOne_insteadOfFlatConstant() {
-        com.nforce.onehr.entity.Shift nineHourShift = com.nforce.onehr.entity.Shift.builder()
-                .id(UUID.randomUUID()).name("Regular")
-                .startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        com.nforce.onehr.entity.Shift nineHourShift = com.nforce.onehr.entity.Shift.builder().id(UUID.randomUUID()).name("Regular").build();
         Employee emp1WithShift = Employee.builder().userId(emp1Id).fullName("Employee One").employeeCode("NF-1").shift(nineHourShift).build();
         when(employeeRepository.findAllByIdWithScheduleDetails(List.of(emp1Id, emp2Id))).thenReturn(List.of(emp1WithShift, emp2));
         when(workingDayService.computeExpectedWorkingDaysBulk(any(), any(), any())).thenReturn(Map.of(
                 emp1Id, WorkingDaySchedule.builder().employeeUserId(emp1Id).workingDates(Set.of(day1, day2)).build(),
                 emp2Id, WorkingDaySchedule.builder().employeeUserId(emp2Id).workingDates(Set.of(day1, day2)).build()));
-        when(expectedWorkHoursService.shiftMinutes(emp1WithShift)).thenReturn(540L);
         when(expectedWorkHoursService.adjustedExpectedMinutes(eq(emp1WithShift), any(), any())).thenReturn(540L);
         List<Attendance> records = List.of(
                 record(UUID.randomUUID(), emp1Id, day1, 480, "PRESENT"),

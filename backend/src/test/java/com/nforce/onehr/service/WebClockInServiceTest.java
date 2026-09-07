@@ -1,6 +1,5 @@
 package com.nforce.onehr.service;
 
-import com.nforce.onehr.config.AttendanceProperties;
 import com.nforce.onehr.dto.attendance.CreateWebClockInRequest;
 import com.nforce.onehr.dto.attendance.WebClockInResponse;
 import com.nforce.onehr.entity.Attendance;
@@ -53,16 +52,48 @@ class WebClockInServiceTest {
     @Mock private EmployeeRepository employeeRepository;
     @Mock private AuditService auditService;
     @Mock private AuditSnapshotSerializer auditSnapshot;
-    @Mock private AttendanceProperties attendanceProps;
     @Mock private LatePenaltyService latePenaltyService;
     @Mock private NotificationService notificationService;
     @Mock private AttendanceService attendanceService;
+    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private com.nforce.onehr.repository.AttendanceRulesRepository attendanceRulesRepository;
+    @Mock private com.nforce.onehr.repository.ShiftRepository shiftRepository;
 
-    @InjectMocks private WebClockInService service;
+    private WebClockInService service;
+
+    // The default employee's assigned Shift (set up below) — a field so individual @Test methods
+    // can reference its id for Attendance fixtures' .shiftId(...), exactly as
+    // AttendanceInterpretationService.interpretExistingSession now requires for any "existing
+    // record" test scenario to resolve as RESOLVED rather than LEGACY_UNRESOLVED.
+    private com.nforce.onehr.entity.Shift defaultShift;
 
     private final UUID employeeId = UUID.randomUUID();
     private final UUID hrAdminId = UUID.randomUUID();
     private final String hrAdminEmail = "hr@test.com";
+    // A minimal, real (not mocked) Shift Version resolver — single-version-per-shift, in-memory
+    // "latest effectiveFrom <= day" lookup, mirroring ShiftVersionRepository's own query semantics.
+    private final List<com.nforce.onehr.entity.ShiftVersion> shiftVersions = new java.util.ArrayList<>();
+    private final ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
+        @Override
+        public com.nforce.onehr.entity.ShiftVersion resolve(com.nforce.onehr.entity.Shift s, LocalDate workDate) {
+            return shiftVersions.stream()
+                    .filter(v -> v.getShift().getId().equals(s.getId()))
+                    .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
+                    .max(java.util.Comparator.comparing(com.nforce.onehr.entity.ShiftVersion::getEffectiveFrom))
+                    .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
+        }
+    };
+
+    // Matches the pre-migration global app.attendance.late-grace-minutes default (10).
+    private static final int DEFAULT_TEST_GRACE_MINUTES = 10;
+
+    /** Builds a Shift (with a real id) and registers a single version effective from the dawn of time. */
+    private com.nforce.onehr.entity.Shift shift(String name, LocalTime start, LocalTime end) {
+        com.nforce.onehr.entity.Shift s = com.nforce.onehr.entity.Shift.builder().id(UUID.randomUUID()).name(name).active(true).build();
+        shiftVersions.add(com.nforce.onehr.entity.ShiftVersion.builder().shift(s).startTime(start).endTime(end)
+                .lateGraceMinutes(DEFAULT_TEST_GRACE_MINUTES).effectiveFrom(LocalDate.MIN).build());
+        return s;
+    }
 
     @BeforeEach
     void setUp() {
@@ -70,21 +101,47 @@ class WebClockInServiceTest {
         User hrUser = User.builder().id(hrAdminId).email(hrAdminEmail).roles(Set.of(hrRole)).build();
         lenient().when(userRepository.findByEmail(hrAdminEmail)).thenReturn(Optional.of(hrUser));
         lenient().when(webClockInRepository.save(any(WebClockInRequest.class))).thenAnswer(inv -> inv.getArgument(0));
-        lenient().when(employeeRepository.findById(any())).thenReturn(Optional.empty());
+        // Default: a real employee with a real (overnight, 15:30-00:30 — matching the org's own
+        // Default Shift) assigned shift, since every employee is now expected to have
+        // one (ShiftDayPolicy has no fallback for a null shift, and requireEmployee() below fails
+        // loudly for a genuinely missing Employee profile — see WebClockInService's own Javadoc on
+        // both). Individual tests below override this with their own Employee where the specific
+        // shift/timing matters; tests that don't care about shift specifics get this sane default
+        // rather than an anomalous "no employee" state that no longer reflects normal operation.
+        defaultShift = shift("Regular Shift", LocalTime.of(15, 30), LocalTime.of(0, 30));
+        com.nforce.onehr.entity.Employee defaultEmployee = com.nforce.onehr.entity.Employee.builder()
+                .userId(employeeId).employeeCode("E1").fullName("Test Employee").shift(defaultShift).build();
+        lenient().when(employeeRepository.findById(any())).thenReturn(Optional.of(defaultEmployee));
         lenient().when(userRepository.findById(any())).thenReturn(Optional.empty());
         lenient().when(auditSnapshot.toJson(any())).thenReturn("{}");
-        // recomputeDerivedFields() (invoked via approve() -> applyCheckInToAttendance()) needs a
-        // real shift-start deadline to compute lateByMinutes against.
-        lenient().when(attendanceProps.getShiftStart()).thenReturn(LocalTime.of(9, 0));
-        lenient().when(attendanceProps.getLateGraceMinutes()).thenReturn(10);
-        // approve() -> applyCheckInToAttendance() -> resolveZone() falls back to this when the
-        // (mocked, empty) employeeRepository lookup finds no Location.timezone to prefer.
-        lenient().when(attendanceProps.getZone()).thenReturn("Asia/Kolkata");
-        // shiftDayOf() (called unconditionally by submit()/checkOut()) needs this even when a
-        // test isn't specifically exercising the overnight-shift-crossing-midnight behavior.
-        lenient().when(attendanceProps.getShiftDayCutover()).thenReturn(LocalTime.of(7, 0));
+        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
+                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        // Matches app.attendance.half-day-max-hours' old YAML default (3.5) — see
+        // AttendanceRulesService's own Javadoc for why this moved off AttendanceProperties.
+        lenient().when(attendanceRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                com.nforce.onehr.entity.AttendanceRules.builder()
+                        .halfDayMaxHours(java.math.BigDecimal.valueOf(3.5)).defaultTimezone("Asia/Kolkata").build()));
+        AttendanceRulesService attendanceRulesService = new AttendanceRulesService(attendanceRulesRepository);
+        // Resolves any Shift created via this test file's own shift() helper above — so a fixture
+        // that sets Attendance.shiftId to one of those shifts' ids resolves correctly through
+        // AttendanceInterpretationService.interpretExistingSession, exactly like the real
+        // ShiftRepository would.
+        lenient().when(shiftRepository.findById(any())).thenAnswer(inv -> {
+            UUID id = inv.getArgument(0);
+            return shiftVersions.stream().map(com.nforce.onehr.entity.ShiftVersion::getShift)
+                    .filter(s -> s.getId().equals(id)).findFirst();
+        });
+        AttendanceInterpretationService attendanceInterpretationService =
+                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+        service = new WebClockInService(webClockInRepository, attendanceRepository, attendancePunchRepository,
+                historyRepository, userRepository, employeeRepository, auditService, auditSnapshot,
+                latePenaltyService, notificationService, attendanceService, attendanceRulesService,
+                attendanceInterpretationService);
         lenient().when(attendanceRepository.findByEmployeeUserIdAndWorkDate(any(), any())).thenReturn(Optional.empty());
         lenient().when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
+        lenient().when(attendanceRepository.saveAndFlush(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
         // submit() -> resolveAssignedApprover() needs a non-null Optional regardless of whether
         // the test cares about manager assignment.
         lenient().when(historyRepository.findByEmployeeUserIdAndEffectiveToIsNull(any())).thenReturn(Optional.empty());
@@ -176,7 +233,7 @@ class WebClockInServiceTest {
     }
 
     /**
-     * A Web Clock-In session left open past its own workday/grace window (shiftDayCutover) must
+     * A Web Clock-In session left open past its own logical workday (per ShiftDayPolicy) must
      * reject the click rather than accept it with a fabricated checkedOutAt/workedMinutes. Unlike
      * the normal Check-In/Check-Out flow, this rejection is purely about THIS Web session's own
      * workDate — it must never mutate the shared Attendance record's status (that field is
@@ -189,8 +246,6 @@ class WebClockInServiceTest {
         Role empRole = Role.builder().id(2).code("EMPLOYEE").displayName("Employee").build();
         User empUser = User.builder().id(employeeId).email(employeeEmail).roles(Set.of(empRole)).build();
         lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(empUser));
-        lenient().when(attendanceProps.getZone()).thenReturn("Asia/Kolkata");
-        lenient().when(attendanceProps.getShiftDayCutover()).thenReturn(LocalTime.of(7, 0));
 
         LocalDate workDate = LocalDate.now(java.time.ZoneId.of("Asia/Kolkata")).minusDays(2);
         WebClockInRequest req = WebClockInRequest.builder()
@@ -210,6 +265,7 @@ class WebClockInServiceTest {
                 .checkInAt(LocalDateTime.of(workDate, LocalTime.of(17, 35)))
                 .sessionStartedAt(LocalDateTime.of(workDate, LocalTime.of(17, 35)))
                 .status("PRESENT")
+                .shiftId(defaultShift.getId())
                 .build();
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, workDate))
                 .thenReturn(Optional.of(record));
@@ -220,6 +276,46 @@ class WebClockInServiceTest {
         assertNull(record.getCheckOutAt());
         assertNull(record.getWorkedMinutes());
         verify(attendanceRepository, never()).save(any(Attendance.class));
+    }
+
+    // ── Phase 0.2: active/deleted employee punch gate ────────────────────────
+
+    @Test
+    void submit_deactivatedEmployee_isRejected() {
+        String employeeEmail = "employee@test.com";
+        Role empRole = Role.builder().id(2).code("EMPLOYEE").displayName("Employee").build();
+        User deactivated = User.builder().id(employeeId).email(employeeEmail).roles(Set.of(empRole)).active(false).build();
+        lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(deactivated));
+
+        CreateWebClockInRequest req = CreateWebClockInRequest.builder().reason("Working from home").timezone("Asia/Kolkata").build();
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> service.submit(req, employeeEmail));
+        assertTrue(ex.getMessage().toLowerCase().contains("inactive"));
+        verify(webClockInRepository, never()).save(any(WebClockInRequest.class));
+    }
+
+    @Test
+    void submit_deletedEmployee_isRejected() {
+        String employeeEmail = "employee@test.com";
+        Role empRole = Role.builder().id(2).code("EMPLOYEE").displayName("Employee").build();
+        User deleted = User.builder().id(employeeId).email(employeeEmail).roles(Set.of(empRole))
+                .active(true).deletedAt(java.time.Instant.now()).build();
+        lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(deleted));
+
+        CreateWebClockInRequest req = CreateWebClockInRequest.builder().reason("Working from home").timezone("Asia/Kolkata").build();
+
+        assertThrows(IllegalArgumentException.class, () -> service.submit(req, employeeEmail));
+        verify(webClockInRepository, never()).save(any(WebClockInRequest.class));
+    }
+
+    @Test
+    void checkOut_deactivatedEmployee_isRejected() {
+        String employeeEmail = "employee@test.com";
+        Role empRole = Role.builder().id(2).code("EMPLOYEE").displayName("Employee").build();
+        User deactivated = User.builder().id(employeeId).email(employeeEmail).roles(Set.of(empRole)).active(false).build();
+        lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(deactivated));
+
+        assertThrows(IllegalArgumentException.class, () -> service.checkOut(employeeEmail, null));
     }
 
     @Test
@@ -233,6 +329,24 @@ class WebClockInServiceTest {
 
         // PENDING, not self-approved — a real HR/manager decision is required (see class Javadoc).
         assertEquals("PENDING", resp.getStatus());
+    }
+
+    /**
+     * A fresh Web Clock-In (no prior Attendance context for the day) must snapshot the employee's
+     * CURRENT Shift onto the Attendance row it creates — see
+     * AttendanceInterpretationService.interpretFreshAction/applyCheckInToAttendance.
+     */
+    @Test
+    void submit_freshWebClockIn_snapshotsTheEmployeesCurrentShiftOntoTheAttendanceRecord() {
+        String employeeEmail = "employee@test.com";
+        lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser(employeeEmail)));
+
+        CreateWebClockInRequest req = CreateWebClockInRequest.builder().reason("Working from home").timezone("Asia/Kolkata").build();
+
+        service.submit(req, employeeEmail);
+
+        verify(attendanceRepository).saveAndFlush(argThat(a ->
+                defaultShift.getId().equals(a.getShiftId())));
     }
 
     /**
@@ -322,10 +436,11 @@ class WebClockInServiceTest {
                 .status("PRESENT")
                 .build();
         // Matched by employeeId + any() date, not eq(today): submit() resolves its own workDate
-        // via shiftDayOf(now), which can legitimately land on the previous calendar date when the
-        // test happens to run before the shiftDayCutover (7 AM) — a plain LocalDate.now() here
-        // would then mismatch and flakily fail, exactly the scenario this comment is guarding
-        // against.
+        // via ShiftDayPolicy.shiftDayOf(employee, now), which can legitimately land on the
+        // previous calendar date when the test happens to run before the default shift's own
+        // logical-workday-reset boundary (09:30 AM, for the default 15:30-00:30 shift used here)
+        // — a plain LocalDate.now() here would then mismatch and flakily fail, exactly the
+        // scenario this comment is guarding against.
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(eq(employeeId), any()))
                 .thenReturn(Optional.of(closedRecord));
 
@@ -348,7 +463,6 @@ class WebClockInServiceTest {
     void submit_autoClosesAStaleOpenWebSession_thenStillAllowsAFreshWebClockIn() {
         String employeeEmail = "employee@test.com";
         lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser(employeeEmail)));
-        lenient().when(attendanceProps.getShiftDayCutover()).thenReturn(LocalTime.of(7, 0));
 
         LocalDate staleWorkDate = LocalDate.now(ZoneId.of("Asia/Kolkata")).minusDays(2);
         WebClockInRequest staleWebReq = WebClockInRequest.builder()
@@ -367,6 +481,7 @@ class WebClockInServiceTest {
                 .workDate(staleWorkDate)
                 .checkInAt(LocalDateTime.of(staleWorkDate, LocalTime.of(17, 35)))
                 .status("PRESENT")
+                .shiftId(defaultShift.getId())
                 .build();
         lenient().when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, staleWorkDate))
                 .thenReturn(Optional.of(staleAttendance));
@@ -419,6 +534,7 @@ class WebClockInServiceTest {
                 .workedMinutes(120)
                 .lateByMinutes(0)
                 .status("PRESENT")
+                .shiftId(defaultShift.getId())
                 .build();
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, workDate))
                 .thenReturn(Optional.of(record));
@@ -461,8 +577,7 @@ class WebClockInServiceTest {
         // region name, so this is otherwise the exact same technique as before.
         com.nforce.onehr.entity.Location location = com.nforce.onehr.entity.Location.builder()
                 .name("Test Location").timezone(offset.getId()).build();
-        com.nforce.onehr.entity.Shift overnightShift = com.nforce.onehr.entity.Shift.builder()
-                .name("US Night Shift").startTime(LocalTime.of(20, 30)).endTime(LocalTime.of(5, 30)).build();
+        com.nforce.onehr.entity.Shift overnightShift = shift("US Night Shift", LocalTime.of(20, 30), LocalTime.of(5, 30));
         com.nforce.onehr.entity.Employee employee = com.nforce.onehr.entity.Employee.builder()
                 .userId(employeeId).employeeCode("E1").fullName("Test Employee").shift(overnightShift).location(location).build();
         when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee));
@@ -474,7 +589,7 @@ class WebClockInServiceTest {
         // The request's own status is PENDING (review status) — the underlying attendance effect
         // (checked via the saved Attendance record) is what carries the lateness computation.
         assertEquals("PENDING", resp.getStatus());
-        verify(attendanceRepository).save(argThat(a ->
+        verify(attendanceRepository).saveAndFlush(argThat(a ->
                 "LATE".equals(a.getStatus()) && a.getLateByMinutes() != null && a.getLateByMinutes() > 200));
     }
 

@@ -35,4 +35,10 @@ public class CreateEmployeeRequest {
     private LocalDate joiningDate;
 
     private UUID managerId;
+
+    // Admin-set only — this endpoint is already HR_ADMIN/SUPER_ADMIN-gated (see
+    // EmployeeController). IANA zone id, e.g. "Asia/Kolkata"; null/blank leaves it unset, falling
+    // back to the employee's Location.timezone then the org-wide default — see
+    // AttendanceService.resolveZone.
+    private String timezone;
 }

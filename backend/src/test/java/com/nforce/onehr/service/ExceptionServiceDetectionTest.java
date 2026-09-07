@@ -59,8 +59,33 @@ class ExceptionServiceDetectionTest {
     @Mock private NotificationService notificationService;
     @Mock private EmployeeService employeeService;
     @Mock private AttendancePenaltyService attendancePenaltyService;
+    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
 
     private ExceptionService exceptionService;
+
+    // A minimal, real (not mocked) Shift Version resolver shared by every real (non-mocked)
+    // service this test constructs (ExpectedWorkHoursService, WorkHoursShortageCalculationService,
+    // ShiftDayPolicy, ExceptionService itself) — single-version-per-shift, in-memory "latest
+    // effectiveFrom <= day" lookup, mirroring ShiftVersionRepository's own query semantics. See
+    // shift() below.
+    private final List<ShiftVersion> shiftVersions = new java.util.ArrayList<>();
+    private final ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
+        @Override
+        public ShiftVersion resolve(Shift s, LocalDate workDate) {
+            return shiftVersions.stream()
+                    .filter(v -> v.getShift().getId().equals(s.getId()))
+                    .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
+                    .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                    .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
+        }
+    };
+
+    /** Builds a Shift (with a real id) and registers a single version effective from the dawn of time — none of these tests exercise Shift Versioning itself. */
+    private Shift shift(String name, LocalTime start, LocalTime end) {
+        Shift s = Shift.builder().id(UUID.randomUUID()).name(name).build();
+        shiftVersions.add(ShiftVersion.builder().shift(s).startTime(start).endTime(end).effectiveFrom(LocalDate.MIN).build());
+        return s;
+    }
 
     private final UUID employeeId = UUID.randomUUID();
     private final String hrEmail = "hr@test.com";
@@ -92,17 +117,21 @@ class ExceptionServiceDetectionTest {
         lenient().when(allocationRepository.findEffectiveAt(any(), any())).thenReturn(List.of());
         PenalizationPolicyResolutionService policyResolutionService =
                 new PenalizationPolicyResolutionService(versionRepository, allocationRepository, penalizationPolicyService, employeeRepository, attendanceProperties);
-        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository);
+        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
         WorkHoursShortageCalculationService workHoursShortageCalculationService =
-                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService);
+                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
+        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
+                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, penaltyEvaluationService,
                 workingDayService, holidayRepository, policyResolutionService, expectedWorkHoursService,
-                workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService);
+                workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService,
+                shiftDayPolicy, shiftVersionResolver);
 
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
-        lenient().when(attendanceProperties.getShiftStart()).thenReturn(LocalTime.of(9, 30));
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeId));
         lenient().when(userRepository.findByEmail(hrEmail)).thenReturn(Optional.of(hrUser()));
         lenient().when(leaveRequestRepository.findByEmployeeUserIdInAndStatusAndStartDateLessThanEqualAndEndDateGreaterThanEqual(
@@ -175,7 +204,7 @@ class ExceptionServiceDetectionTest {
     // assigned shift's duration ──
     @Test
     void completedDayShortOfShiftDuration_detectsWorkHoursShortage_appliesPenalty() {
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", LocalTime.of(9, 0), LocalTime.of(18, 0));
         Attendance shortDay = Attendance.builder().employeeUserId(employeeId).workDate(targetDate)
                 .checkInAt(targetDate.atTime(9, 0)).checkOutAt(targetDate.atTime(13, 0))
                 .workedMinutes(240).lateByMinutes(0).build(); // 4h worked against a 9h shift
@@ -203,7 +232,7 @@ class ExceptionServiceDetectionTest {
 
     @Test
     void completedDayMeetingFullShiftDuration_noShortageDetected() {
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", LocalTime.of(9, 0), LocalTime.of(18, 0));
         Attendance fullDay = Attendance.builder().employeeUserId(employeeId).workDate(targetDate)
                 .checkInAt(targetDate.atTime(9, 0)).checkOutAt(targetDate.atTime(18, 0))
                 .workedMinutes(540).lateByMinutes(0).build(); // exactly 9h — no shortfall
@@ -708,7 +737,7 @@ class ExceptionServiceDetectionTest {
         // through Sunday 10 Mar 2024.
         LocalDate monday = LocalDate.of(2024, 3, 4);
         LocalDate sunday = monday.plusDays(6);
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         Employee employee = employeeWithShift(shift);
         List<Attendance> weekRecords = monday.datesUntil(sunday.plusDays(1))
                 .filter(d -> d.getDayOfWeek() != DayOfWeek.SATURDAY && d.getDayOfWeek() != DayOfWeek.SUNDAY)
@@ -742,7 +771,7 @@ class ExceptionServiceDetectionTest {
     void weeklyFrequency_noShortfall_appliesNoPenalty() {
         LocalDate monday = LocalDate.of(2024, 3, 4);
         LocalDate sunday = monday.plusDays(6);
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         Employee employee = employeeWithShift(shift);
         List<Attendance> weekRecords = monday.datesUntil(sunday.plusDays(1))
                 .filter(d -> d.getDayOfWeek() != DayOfWeek.SATURDAY && d.getDayOfWeek() != DayOfWeek.SUNDAY)
@@ -771,7 +800,7 @@ class ExceptionServiceDetectionTest {
     void monthlyFrequency_evaluatesOnceOnTheLastCalendarDayOfTheMonth() {
         LocalDate monthStart = LocalDate.of(2024, 2, 1); // 2024 is a leap year -> Feb has 29 days
         LocalDate monthEnd = LocalDate.of(2024, 2, 29);
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         Employee employee = employeeWithShift(shift);
         List<Attendance> monthRecords = monthStart.datesUntil(monthEnd.plusDays(1))
                 .filter(d -> d.getDayOfWeek() != DayOfWeek.SATURDAY && d.getDayOfWeek() != DayOfWeek.SUNDAY)
@@ -806,7 +835,7 @@ class ExceptionServiceDetectionTest {
         LocalDate monday = LocalDate.of(2024, 3, 4);
         LocalDate wednesday = monday.plusDays(2);
         LocalDate sunday = monday.plusDays(6);
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         Employee employee = employeeWithShift(shift);
         // Only the new version's own window (Wed-Fri) has attendance worth aggregating; a full
         // 9h/day means no shortfall if (and only if) Monday/Tuesday are correctly excluded.
@@ -841,7 +870,7 @@ class ExceptionServiceDetectionTest {
 
     @Test
     void missingLogShortageLinkage_disabledByDefault_noPenaltyForMissingCheckoutDay() {
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         Attendance missingCheckout = Attendance.builder().employeeUserId(employeeId).workDate(targetDate)
                 .checkInAt(targetDate.atTime(9, 0)).checkOutAt(null).lateByMinutes(0).build();
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), targetDate, targetDate))
@@ -860,7 +889,7 @@ class ExceptionServiceDetectionTest {
 
     @Test
     void missingLogShortageLinkage_enabled_appliesShortagePenaltyForMissingCheckoutDay() {
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         Attendance missingCheckout = Attendance.builder().employeeUserId(employeeId).workDate(targetDate)
                 .checkInAt(targetDate.atTime(9, 0)).checkOutAt(null).lateByMinutes(0).build();
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), targetDate, targetDate))
@@ -896,7 +925,7 @@ class ExceptionServiceDetectionTest {
 
     @Test
     void effectiveHoursBasis_aLongBreakInsideAFullPunchSpan_stillTriggersShortage() {
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         // 9:00-19:00 punch span (600 min gross) but a long break means only 460 min were actually
         // effective — Effective basis (460/540 = 85.2%) falls below a 90% tier.
         Attendance record = Attendance.builder().employeeUserId(employeeId).workDate(targetDate)
@@ -920,7 +949,7 @@ class ExceptionServiceDetectionTest {
 
     @Test
     void grossHoursBasis_sameAttendance_thePunchSpanCoversTheWholeShift_noShortage() {
-        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Regular").startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(18, 0)).build();
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
         // Identical Attendance row to the EFFECTIVE-basis test above — GROSS_HOURS instead counts
         // the full 9:00-19:00 span (600/540 = 111%), well above any shortage tier, even though
         // Effective basis would have flagged this exact same day.
@@ -941,6 +970,49 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
         verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+    }
+
+    /**
+     * The historical-integrity invariant Shift Versioning exists to protect: a shift's timing
+     * changing AFTER a date occurred must never retroactively change that date's WORK_HOURS_
+     * SHORTAGE evaluation. Here the shift's ORIGINAL version (9:00-18:00, 540 expected minutes)
+     * makes 480 worked minutes a genuine shortage (88.9% < the 90% tier); a NEW version (9:00-
+     * 13:00, only 240 expected minutes), effective the day AFTER targetDate, would make that same
+     * 480 minutes comfortably NOT a shortage if it were wrongly used instead. Detecting a penalty
+     * at all here proves the OLD version was resolved for targetDate, not the new one.
+     */
+    @Test
+    void workHoursShortage_historicalDate_resolvesTheShiftVersionEffectiveOnThatDate_notALaterChangedOne() {
+        Shift shift = shift("Regular", java.time.LocalTime.of(9, 0), java.time.LocalTime.of(18, 0));
+        // A second version of the SAME shift, effective the day after targetDate — simulates an
+        // admin changing this shift's timing sometime after targetDate's attendance already
+        // happened. Registered directly against the shared in-memory version list (see shift()).
+        shiftVersions.add(com.nforce.onehr.entity.ShiftVersion.builder().shift(shift)
+                .startTime(java.time.LocalTime.of(9, 0)).endTime(java.time.LocalTime.of(13, 0))
+                .effectiveFrom(targetDate.plusDays(1)).build());
+        Attendance record = Attendance.builder().employeeUserId(employeeId).workDate(targetDate)
+                .checkInAt(targetDate.atTime(9, 0)).checkOutAt(targetDate.atTime(17, 0))
+                .workedMinutes(480).lateByMinutes(0).build();
+        when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), targetDate, targetDate))
+                .thenReturn(List.of(record));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, targetDate)).thenReturn(Optional.of(record));
+        when(employeeRepository.findAllByIdWithScheduleDetails(any())).thenReturn(List.of(employee(shift)));
+        lenient().when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee(shift)));
+        PenalizationPolicyVersion version = basisVersion("GROSS_HOURS");
+        when(versionRepository.findVersionsEffectiveAt(any())).thenReturn(List.of(version));
+        when(tierRepository.findByPolicyVersionIdOrderBySortOrderAsc(version.getId())).thenReturn(List.of(
+                PenalizationPolicyWorkHoursTier.builder().thresholdPercent(new java.math.BigDecimal("90"))
+                        .deductionDays(new java.math.BigDecimal("0.5")).sortOrder(0).build()));
+
+        exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
+
+        ArgumentCaptor<AttendanceException> excCaptor = ArgumentCaptor.forClass(AttendanceException.class);
+        verify(attendanceExceptionRepository).save(excCaptor.capture());
+        assertEquals(ExceptionType.WORK_HOURS_SHORTAGE, excCaptor.getValue().getExceptionType());
+        // The displayed "expected" time is also the OLD version's own end (18:00), not the new
+        // version's 13:00 — see ExceptionService's own comment on this exact line.
+        assertEquals(java.time.LocalTime.of(18, 0), excCaptor.getValue().getExpectedTime());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(any());
     }
 
     private static LocalDate priorMidWeekday() {

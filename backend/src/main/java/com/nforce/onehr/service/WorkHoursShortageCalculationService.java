@@ -48,6 +48,7 @@ public class WorkHoursShortageCalculationService {
     private final AttendanceRepository attendanceRepository;
     private final ExpectedWorkHoursService expectedWorkHoursService;
     private final WorkingDayService workingDayService;
+    private final ShiftVersionResolver shiftVersionResolver;
 
     /**
      * The Work Hours Shortage percent fact for {@code date}, honoring the version's configured
@@ -186,8 +187,11 @@ public class WorkHoursShortageCalculationService {
         if (shift == null || record.getCheckInAt() == null || record.getCheckOutAt() == null) {
             return null;
         }
-        LocalTime shiftStart = shift.getStartTime();
-        LocalTime shiftEnd = shift.getEndTime();
+        // The version effective on THIS record's own workDate — never the employee's current/live
+        // shift, so a later timing change can't retroactively change a historical shortage figure.
+        com.nforce.onehr.entity.ShiftVersion version = shiftVersionResolver.resolve(shift, record.getWorkDate());
+        LocalTime shiftStart = version.getStartTime();
+        LocalTime shiftEnd = version.getEndTime();
         LocalDate endDate = !shiftEnd.isAfter(shiftStart) ? record.getWorkDate().plusDays(1) : record.getWorkDate();
         LocalDateTime windowStart = LocalDateTime.of(record.getWorkDate(), shiftStart);
         LocalDateTime windowEnd = LocalDateTime.of(endDate, shiftEnd);

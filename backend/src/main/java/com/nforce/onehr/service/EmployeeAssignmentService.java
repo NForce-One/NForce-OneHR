@@ -57,6 +57,7 @@ public class EmployeeAssignmentService {
     private final PenalizationPolicyAllocationService penalizationPolicyAllocationService;
     private final PenalizationPolicyResolutionService penalizationPolicyResolutionService;
     private final AttendanceProperties attendanceProperties;
+    private final ShiftVersionResolver shiftVersionResolver;
 
     @Transactional(readOnly = true)
     public List<EmployeeAssignmentRow> listTeamAssignments(String managerEmail, UUID shiftId, UUID weeklyOffPolicyId,
@@ -287,8 +288,10 @@ public class EmployeeAssignmentService {
                 .employeeTimezone(e.getLocation() != null ? e.getLocation().getTimezone() : null)
                 .shiftId(e.getShift() != null ? e.getShift().getId() : null)
                 .shiftName(e.getShift() != null ? e.getShift().getName() : null)
-                .shiftStartTime(e.getShift() != null ? e.getShift().getStartTime() : null)
-                .shiftEndTime(e.getShift() != null ? e.getShift().getEndTime() : null)
+                // A live "as of today" display, same convention as the Shifts tab itself — not
+                // tied to any specific historical Attendance date.
+                .shiftStartTime(e.getShift() != null ? shiftVersionResolver.resolveCurrent(e.getShift()).getStartTime() : null)
+                .shiftEndTime(e.getShift() != null ? shiftVersionResolver.resolveCurrent(e.getShift()).getEndTime() : null)
                 .weeklyOffPolicyId(e.getWeeklyOffPolicy() != null ? e.getWeeklyOffPolicy().getId() : null)
                 .weeklyOffPolicyName(e.getWeeklyOffPolicy() != null ? e.getWeeklyOffPolicy().getName() : null)
                 .penalisationPolicyId(resolvedPolicyId)

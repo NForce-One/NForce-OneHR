@@ -79,6 +79,7 @@ public class UserManagementService {
                 .employmentType(req.getEmploymentType() != null ? req.getEmploymentType() : "FULL_TIME")
                 .workMode(req.getWorkMode() != null ? req.getWorkMode() : "ONSITE")
                 .joiningDate(req.getJoiningDate())
+                .timezone(normalizeTimezone(req.getTimezone()))
                 .createdBy(actor.getId())
                 .build();
 
@@ -105,13 +106,34 @@ public class UserManagementService {
             emp.setLocation(loc);
         }
         if (req.getShiftId() != null) {
-            Shift shift = shiftRepository.findById(req.getShiftId()).orElse(null);
+            // A bogus/stale shift id must never silently leave the employee shift-less — every
+            // employee having a real assigned Shift is a hard invariant now, not a tolerated
+            // absence (see ShiftDayPolicy, which throws for a null-shift employee everywhere).
+            Shift shift = shiftRepository.findById(req.getShiftId())
+                    .orElseThrow(() -> new IllegalArgumentException("Shift not found"));
             // A brand-new employee can never have a legitimate pre-existing assignment to
             // preserve, so this is unconditional (unlike updateUser's version below, which only
             // rejects an actual change to a currently-inactive shift).
-            if (shift != null && !shift.isActive())
+            if (!shift.isActive())
                 throw new IllegalArgumentException("This shift is inactive and cannot be assigned. Choose an active shift.");
             emp.setShift(shift);
+        } else {
+            // No shift explicitly chosen — default to the organization's default shift, resolved
+            // server-side so an API-created employee can never accidentally end up with none (the
+            // frontend also preselects this same shift, but this is the actual guarantee). Looked
+            // up by its stable, seeded name — never a hardcoded id. Every employee is a hard
+            // invariant to always have an assigned shift (see ShiftDayPolicy, which has no
+            // fallback for a null one) — so unlike before, a missing/deactivated default shift now
+            // fails account creation loudly rather than leaving the employee shift-less and
+            // relying on ShiftSeedCorrector's next startup sweep to quietly fix it later.
+            // OrgService also refuses to rename/deactivate/delete the default shift itself, so
+            // this should be unreachable in practice — it still must fail clearly if it ever isn't.
+            Shift defaultShift = defaultShift()
+                    .filter(Shift::isActive)
+                    .orElseThrow(() -> new IllegalStateException(
+                            "The organization's default shift ('" + Shift.DEFAULT_SHIFT_NAME + "') is missing or "
+                                    + "inactive — an employee cannot be created without a Shift. Contact an administrator."));
+            emp.setShift(defaultShift);
         }
 
         emp = employeeRepository.save(emp);
@@ -148,6 +170,20 @@ public class UserManagementService {
             roleRepository.findByCode("EMPLOYEE").ifPresent(roles::add);
         }
         return roles;
+    }
+
+    /**
+     * The organization's default shift ({@link Shift#DEFAULT_SHIFT_NAME}, "Default Shift",
+     * 15:30-00:30 as seeded — but this always reads the shift's CURRENT admin-configured timing,
+     * never a cached/duplicated copy: if an admin edits its timing through the Shift Management
+     * UI, every employee defaulted to it from that point on picks up the new timing automatically,
+     * since this is a live lookup of the same row, not a snapshot), looked up by its stable name
+     * — never a hardcoded id, since ids differ per environment/seed run. Used to default a
+     * newly-created employee's shift when the admin doesn't explicitly pick one — see
+     * {@link #createUser}.
+     */
+    private Optional<Shift> defaultShift() {
+        return shiftRepository.findByName(Shift.DEFAULT_SHIFT_NAME);
     }
 
     /**
@@ -214,6 +250,11 @@ public class UserManagementService {
             emp.setWorkMode(req.getWorkMode());
             forceLogoutRequired = true;
         }
+        // Three states (null/blank/value) — see UpdateUserRequest's own doc comment. Doesn't
+        // force logout: unlike role/department/etc., no JWT claim depends on it.
+        if (req.getTimezone() != null) {
+            emp.setTimezone(normalizeTimezone(req.getTimezone()));
+        }
         if (req.getBusinessUnitId() != null) {
             BusinessUnit newBusinessUnit = businessUnitRepository.findById(req.getBusinessUnitId()).orElse(null);
             UUID currentBusinessUnitId = emp.getBusinessUnit() != null ? emp.getBusinessUnit().getId() : null;
@@ -260,14 +301,18 @@ public class UserManagementService {
             }
         }
         if (req.getShiftId() != null) {
-            Shift newShift = shiftRepository.findById(req.getShiftId()).orElse(null);
+            // A bogus/stale shift id must never silently clear the employee's assignment to null
+            // — every employee having a real assigned Shift is a hard invariant now (see
+            // createUser's identical fix and ShiftDayPolicy, which throws for a null-shift
+            // employee everywhere).
+            Shift newShift = shiftRepository.findById(req.getShiftId())
+                    .orElseThrow(() -> new IllegalArgumentException("Shift not found"));
             UUID currentShiftId = emp.getShift() != null ? emp.getShift().getId() : null;
-            UUID newShiftId = newShift != null ? newShift.getId() : null;
-            if (!Objects.equals(currentShiftId, newShiftId)) {
+            if (!Objects.equals(currentShiftId, newShift.getId())) {
                 // Only guarded on an actual change — re-saving an employee whose existing
                 // assignment already points at a since-deactivated shift (shiftId unchanged)
                 // must keep working untouched, not get blocked by this check.
-                if (newShift != null && !newShift.isActive())
+                if (!newShift.isActive())
                     throw new IllegalArgumentException("This shift is inactive and cannot be assigned. Choose an active shift.");
                 emp.setShift(newShift);
                 forceLogoutRequired = true;
@@ -395,11 +440,27 @@ public class UserManagementService {
         snapshot.put("designation", emp.getDesignation() != null ? emp.getDesignation().getTitle() : null);
         snapshot.put("location", emp.getLocation() != null ? emp.getLocation().getName() : null);
         snapshot.put("shift", emp.getShift() != null ? emp.getShift().getName() : null);
+        snapshot.put("timezone", emp.getTimezone());
         snapshot.put("role", RoleUtils.primaryRoleCode(user.getRoles(), null));
         UUID managerId = historyRepository.findByEmployeeUserIdAndEffectiveToIsNull(emp.getUserId())
                 .map(EmployeeManagerHistory::getManagerUserId).orElse(null);
         snapshot.put("manager", resolveEmployeeName(managerId));
         return snapshot;
+    }
+
+    /** Blank/null clears the field; otherwise must be a real IANA zone id. Mirrors EmployeeService's identical helper. */
+    private String normalizeTimezone(String timezone) {
+        if (timezone == null || timezone.isBlank()) {
+            return null;
+        }
+        String trimmed = timezone.trim();
+        try {
+            java.time.ZoneId.of(trimmed);
+        } catch (java.time.DateTimeException e) {
+            throw new IllegalArgumentException(
+                    "'" + trimmed + "' is not a valid IANA timezone id (e.g. Asia/Kolkata, America/New_York)");
+        }
+        return trimmed;
     }
 
     /** Best-effort display name for a user id — employee's full name, falling back to email, null if no id. */
@@ -580,6 +641,7 @@ public class UserManagementService {
                 .employmentType(emp.getEmploymentType())
                 .workMode(emp.getWorkMode())
                 .joiningDate(emp.getJoiningDate())
+                .timezone(emp.getTimezone())
                 .active(user.isActive())
                 .currentManager(manager)
                 .tempPassword(tempPassword)

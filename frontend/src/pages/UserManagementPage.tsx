@@ -9,6 +9,13 @@ import { KebabMenu } from '../components/KebabMenu';
 import { ShiftFormModal, fmtShiftTime } from './OrgSetupPage';
 import { StatusBadge, InactiveEditBanner, InactiveFieldsConfirm } from '../components/EmployeeStatus';
 
+// The organization's default shift — mirrors the backend's Shift.DEFAULT_SHIFT_NAME (same stable,
+// unique, seeded name; never a hardcoded id). The backend already defaults a newly-created
+// employee to this shift server-side when none is explicitly chosen (see
+// UserManagementService#createUser) — preselecting it here is purely a UX convenience so the
+// admin sees what will actually be assigned, and can still freely pick a different active shift.
+const DEFAULT_SHIFT_NAME = 'Default Shift';
+
 const ROLES = [
   { value: 'EMPLOYEE',    label: 'Employee' },
   { value: 'MANAGER',     label: 'Manager' },
@@ -264,6 +271,17 @@ function AddModal({ onClose, onCreated, token, opts, setOpts }: {
       .finally(() => setPreviewLoading(false));
   }, [token]);
 
+  // Preselects the organization's default shift (Default Shift) once the reference shift list is
+  // available — matches what the backend will actually assign server-side if the admin submits
+  // without touching this field at all (see UserManagementService#createUser). Never overrides a
+  // selection already present (an admin's own pick, or a re-run of this effect after `opts.shifts`
+  // reloads post-inline-create) — only ever fills a still-empty field.
+  useEffect(() => {
+    if (form.shiftId) return;
+    const regularShift = opts.shifts.find(s => s.name === DEFAULT_SHIFT_NAME && s.active);
+    if (regularShift) setForm(f => (f.shiftId ? f : { ...f, shiftId: regularShift.id }));
+  }, [opts.shifts]);
+
   // Fetches a fresh suggestion via the same non-consuming preview endpoint used on open, and
   // drops it straight into the Employee ID field — nothing else in the form is touched, and the
   // modal stays open. Backs the "Click here" action in the conflict banner below.
@@ -452,6 +470,21 @@ function AddModal({ onClose, onCreated, token, opts, setOpts }: {
             </Field>
           </div>
           <div style={{ gridColumn: '1/-1' }}>
+            <Field label="Timezone (overrides Location)">
+              <input style={inputStyle} value={form.timezone ?? ''} onChange={e => set('timezone', e.target.value)}
+                placeholder="e.g. Asia/Kolkata" list="nf-user-iana-timezones" />
+              <datalist id="nf-user-iana-timezones">
+                <option value="Asia/Kolkata" /><option value="America/New_York" /><option value="America/Los_Angeles" />
+                <option value="America/Chicago" /><option value="Europe/London" /><option value="Australia/Sydney" />
+                <option value="Asia/Singapore" /><option value="Asia/Dubai" /><option value="Pacific/Auckland" />
+                <option value="Asia/Kathmandu" /><option value="Asia/Chittagong" />
+              </datalist>
+              <span style={{ fontSize: 11, color: 'var(--txt-mut)', marginTop: 3, display: 'block' }}>
+                IANA zone id — takes precedence over Location for check-in/out, lateness, and shift-day calculations. Leave blank to inherit from Location.
+              </span>
+            </Field>
+          </div>
+          <div style={{ gridColumn: '1/-1' }}>
             {(() => {
               const isSA = form.role === 'SUPER_ADMIN';
               const mgrList = getManagersForRole(form.role, opts.managers);
@@ -536,6 +569,7 @@ function EditModal({ user, onClose, onUpdated, token, opts, setOpts }: {
     employmentType: user.employmentType,
     workMode: user.workMode ?? 'ONSITE',
     managerId: user.currentManager?.userId ?? undefined,
+    timezone: user.timezone ?? '',
   });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -618,6 +652,15 @@ function EditModal({ user, onClose, onUpdated, token, opts, setOpts }: {
               <option value="">— None —</option>{getDesignationOptions(opts.designations, form.designationId).map((d: any) => <option key={d.id} value={d.id}>{d.title}</option>)}
             </select>
           </Field>
+          <div style={{ gridColumn: '1/-1' }}>
+            <Field label="Timezone (overrides Location)">
+              <input style={inputStyle} value={form.timezone ?? ''} onChange={e => setForm(f => ({ ...f, timezone: e.target.value }))}
+                placeholder="e.g. Asia/Kolkata" list="nf-user-iana-timezones" />
+              <span style={{ fontSize: 11, color: 'var(--txt-mut)', marginTop: 3, display: 'block' }}>
+                IANA zone id — takes precedence over Location for check-in/out, lateness, and shift-day calculations. Leave blank to inherit from Location.
+              </span>
+            </Field>
+          </div>
           <Field label="Date of Joining">
             <input type="date" style={inputStyle} value={joiningDate} onChange={e => setJoiningDate(e.target.value)} />
           </Field>

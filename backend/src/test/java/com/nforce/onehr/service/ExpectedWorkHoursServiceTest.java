@@ -4,6 +4,7 @@ import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.entity.LeaveDurationType;
 import com.nforce.onehr.entity.LeaveRequest;
 import com.nforce.onehr.entity.Shift;
+import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.repository.LeaveRequestRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,6 +15,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -33,13 +35,33 @@ class ExpectedWorkHoursServiceTest {
 
     private final UUID employeeId = UUID.randomUUID();
     private final LocalDate date = LocalDate.of(2026, 8, 10);
+    // A minimal, real (not mocked) Shift Version resolver — single-version-per-shift, in-memory
+    // "latest effectiveFrom <= day" lookup, mirroring ShiftVersionRepository's own query semantics.
+    private final List<ShiftVersion> shiftVersions = new ArrayList<>();
+    private final ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
+        @Override
+        public ShiftVersion resolve(Shift shift, LocalDate workDate) {
+            return shiftVersions.stream()
+                    .filter(v -> v.getShift().getId().equals(shift.getId()))
+                    .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
+                    .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                    .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
+        }
+    };
+
+    /** Builds a Shift (with a real id) and registers a single version effective from the dawn of time. */
+    private Shift shift(String name, LocalTime start, LocalTime end) {
+        Shift s = Shift.builder().id(UUID.randomUUID()).name(name).build();
+        shiftVersions.add(ShiftVersion.builder().shift(s).startTime(start).endTime(end).effectiveFrom(LocalDate.MIN).build());
+        return s;
+    }
+
     // 9:00-18:00 = 540 minutes (9 hours).
-    private final Shift nineHourShift = Shift.builder().id(UUID.randomUUID()).name("Regular")
-            .startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build();
+    private final Shift nineHourShift = shift("Regular", LocalTime.of(9, 0), LocalTime.of(18, 0));
 
     @BeforeEach
     void setUp() {
-        service = new ExpectedWorkHoursService(leaveRequestRepository);
+        service = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
     }
 
     private Employee employeeWithShift(Shift shift) {
@@ -49,7 +71,7 @@ class ExpectedWorkHoursServiceTest {
     @Test
     void noShift_returnsNull() {
         Employee noShift = employeeWithShift(null);
-        assertNull(service.shiftMinutes(noShift));
+        assertNull(service.shiftMinutes(noShift, date));
     }
 
     @Test
@@ -82,14 +104,40 @@ class ExpectedWorkHoursServiceTest {
     @Test
     void adjustedExpectedMinutes_neverGoesNegative() {
         // Pathological: leaveHours somehow exceeds the shift — floor at 0, don't go negative.
-        Shift oneHourShift = Shift.builder().id(UUID.randomUUID()).name("Short")
-                .startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(10, 0)).build();
+        Shift oneHourShift = shift("Short", LocalTime.of(9, 0), LocalTime.of(10, 0));
         Employee employee = employeeWithShift(oneHourShift);
         LeaveRequest hourly = LeaveRequest.builder().employeeUserId(employeeId)
                 .startDate(date).endDate(date).durationType(LeaveDurationType.HOURLY)
                 .leaveHours(new BigDecimal("5")).build();
 
         assertEquals(0L, service.adjustedExpectedMinutes(employee, date, hourly));
+    }
+
+    /**
+     * Confirmed bug, now fixed: {@code Duration.between} on two bare {@link LocalTime} values has
+     * no notion of "next day," so an overnight shift (end not after start) used to compute a
+     * negative duration and get silently treated as "no shift" (null) — exactly like the org's
+     * own default shift (15:30-00:30). Same elapsed span as the 9-hour day-shift case above.
+     */
+    @Test
+    void overnightShift_returnsCorrectPositiveMinutes_insteadOfNullFromTheOldNegativeDurationBug() {
+        Shift overnightShift = shift("Regular Shift", LocalTime.of(15, 30), LocalTime.of(0, 30));
+        Employee employee = employeeWithShift(overnightShift);
+
+        assertEquals(540L, service.shiftMinutes(employee, date), "15:30-00:30 is a 9-hour shift, not a negative/null one");
+        assertEquals(540L, service.adjustedExpectedMinutes(employee, date, null));
+    }
+
+    /** Same overnight fix, exercised through the adjusted-minutes path leave reduction uses. */
+    @Test
+    void overnightShift_quarterDayLeave_reducesExpectedMinutesCorrectly() {
+        Shift overnightShift = shift("Overnight for quarter-day test", LocalTime.of(15, 30), LocalTime.of(0, 30));
+        Employee employee = employeeWithShift(overnightShift);
+        LeaveRequest quarterDay = LeaveRequest.builder().employeeUserId(employeeId)
+                .startDate(date).endDate(date).durationType(LeaveDurationType.QUARTER_DAY).build();
+
+        // 540 * 0.25 = 135 -> 540 - 135 = 405, same as the non-overnight 9-hour case.
+        assertEquals(405L, service.adjustedExpectedMinutes(employee, date, quarterDay));
     }
 
     @Test
@@ -124,5 +172,21 @@ class ExpectedWorkHoursServiceTest {
                         .startDate(date).endDate(date).durationType(LeaveDurationType.QUARTER_DAY).build()));
 
         assertEquals(405L, service.adjustedExpectedMinutes(employee, date));
+    }
+
+    /**
+     * A Shift Version resolves against the specific date passed in, not "now" — a historical date
+     * (before a newer version's effectiveFrom) must still use the OLD version's duration, exactly
+     * the invariant the whole Shift Versioning design exists to protect.
+     */
+    @Test
+    void shiftMinutes_historicalDate_resolvesTheVersionEffectiveOnThatDate_notTheCurrentOne() {
+        Shift shift = Shift.builder().id(UUID.randomUUID()).name("Versioned").build();
+        shiftVersions.add(ShiftVersion.builder().shift(shift).startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).effectiveFrom(LocalDate.MIN).build());
+        shiftVersions.add(ShiftVersion.builder().shift(shift).startTime(LocalTime.of(6, 0)).endTime(LocalTime.of(15, 0)).effectiveFrom(date.plusDays(5)).build());
+        Employee employee = employeeWithShift(shift);
+
+        assertEquals(540L, service.shiftMinutes(employee, date), "before the new version's effectiveFrom — must still resolve the OLD (9-18) duration");
+        assertEquals(540L, service.shiftMinutes(employee, date.plusDays(10)), "on/after the new version's effectiveFrom — resolves the NEW (6-15) duration, same 9h span here");
     }
 }

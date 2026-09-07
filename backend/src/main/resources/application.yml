@@ -53,28 +53,43 @@ app:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5180,http://localhost:5173,http://localhost:3000}
   base-url: ${APP_BASE_URL:http://localhost:5180}
   attendance:
-    # Business timezone for punch timestamps and work-date attribution.
-    # Deliberately explicit — the JVM default is UTC on Railway.
+    # Business timezone — deploy-time default. Deliberately explicit, since the JVM default is
+    # UTC on Railway. As of the Phase 2 timezone pass, the Attendance/Web-Clock-In/Regularization
+    # flow no longer reads this directly — it uses AttendanceRulesService.getDefaultZoneId(), an
+    # Admin-configurable singleton seeded from this same value (see V167). This YAML value
+    # remains the source for every OTHER org-wide "what business day is it" consumer (Leave,
+    # Penalization Policy, EmployeeAssignmentService, ExceptionService, AttendanceRequestService).
     zone: ${ATTENDANCE_ZONE:Asia/Kolkata}
-    # Provisional shift rules pending PO confirmation.
-    shift-start: "15:30"
-    # Shift ends 12:30 AM, but a fresh punch anywhere from midnight up to this time still
-    # belongs to the shift-day that started the evening before — see
-    # AttendanceService.shiftDayOf.
-    shift-day-cutover: "07:00"
-    late-grace-minutes: 10
-    half-day-max-hours: 3.5
-    full-day-min-hours: 7.5
-    # Provisional — pending PO/final confirmation, same status as the shift fields above.
-    daily-break-budget-minutes: 60
+    # A fixed fallback shift-start was removed entirely (no replacement) — every employee is now
+    # a hard invariant to always have a real assigned Shift (see Shift.DEFAULT_SHIFT_NAME's
+    # server-side default on creation, ShiftSeedCorrector's startup backfill, and OrgService's
+    # refusal to rename/deactivate/delete the default shift itself). ShiftDayPolicy throws for a
+    # null-shift employee everywhere, including resolveShiftStart/shiftEndAt — there is no
+    # fixed-clock-time fallback anywhere in that class by design.
+    # late-grace-minutes previously lived here as the sole org-wide LATE/PRESENT status gate. As
+    # of the Phase 3 grace pass, grace is no longer a single global value — every Shift Version
+    # now has its own (shift_versions.late_grace_minutes, see V168), Admin-editable per Shift via
+    # the Shifts tab, resolved by ShiftDayPolicy#resolveLateGraceMinutes. Removed outright (not
+    # left as a dead/unused fallback) — there is no hidden global override of a Shift's own grace.
+    # half-day-max-hours, full-day-min-hours and daily-break-budget-minutes previously lived here.
+    # half-day-max-hours is now a persisted, Admin-editable org setting — see AttendanceRules/
+    # AttendanceRulesService/V162 (GET/PUT /api/org/attendance-rules). full-day-min-hours was
+    # removed outright (proven dead — AttendanceResponse.fullDay had zero readers anywhere).
+    # daily-break-budget-minutes was removed outright (display-only progress-bar denominator, no
+    # enforcement, not the same concept as the already-persisted, per-shift
+    # ShiftVersion.breakMinutes). See scratch/workstream-b-settings-investigation.md for the full
+    # audit behind each of these three.
     regularization:
       # N-day lookback window (counting today itself) for regularization requests submitted by
       # anyone other than Super Admin, who is exempt entirely — see
       # RegularizationService.submit/update/validateLookbackWindow. E.g. 7 with today=19th
-      # allows the 19th through the 13th and blocks the 12th onward.
+      # allows the 19th through the 13th and blocks the 12th onward. NOT migrated to a persisted
+      # Admin setting — pending a future, dedicated Regularization Policy that will own this
+      # alongside monthly-limit and other regularization-specific configuration.
       employee-lookback-days: 7
       # Max regularization requests a non-Super-Admin employee may submit per calendar month
-      # (counts every submission regardless of eventual status). Super Admin is exempt.
+      # (counts every submission regardless of eventual status). Super Admin is exempt. Same
+      # future-Regularization-Policy note as employee-lookback-days above.
       monthly-limit: 3
 resend:
   api-key: ${RESEND_API_KEY}

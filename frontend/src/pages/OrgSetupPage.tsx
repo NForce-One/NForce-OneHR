@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useLocation } from 'react-router-dom';
-import { Building2, Briefcase, FileText, MapPin, ShieldAlert, Plus, Search, X, Clock, Users } from 'lucide-react';
+import { Building2, Briefcase, FileText, MapPin, ShieldAlert, Plus, Search, X, Clock } from 'lucide-react';
 import { KebabMenu, type KebabItem } from '../components/KebabMenu';
 import type { LucideIcon } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { useToast } from '../context/ToastContext';
-import { orgApi, type BusinessUnitRow, type DepartmentRow, type DesignationRow, type LocationRow, type ShiftRow, type ShiftEmployeeRow } from '../api/org';
-import { usersApi } from '../api/employees';
+import {
+  orgApi, type BusinessUnitRow, type DepartmentRow, type DesignationRow, type LocationRow,
+  type ShiftRow, type ShiftEmployeeRow, type ShiftVersionRow, type WeeklyOffPolicyRow,
+} from '../api/org';
 import {
   listAllDocTypes, createDocType, updateDocType, toggleDocTypeActive, deleteDocType,
   type DocumentType,
@@ -16,7 +18,10 @@ import PolicyListSection from './penalization/PolicyListSection';
 import PenalizationPolicyAllocationSection from './penalization/PenalizationPolicyAllocationSection';
 import { inactiveDimStyle } from '../components/EmployeeStatus';
 
-type OrgTab = 'businessunits' | 'departments' | 'designations' | 'locations' | 'shifts' | 'doctypes' | 'penalization';
+// 'shiftweeklyoff' is ONE top-level Organization Masters tab — Shifts/Weekly Offs/Shift and
+// Weekly Off Rules live as nested sub-tabs inside it (see shiftWeeklyOffSubTab below), matching
+// the approved reference design. They must never become separate top-level entries here again.
+type OrgTab = 'businessunits' | 'departments' | 'designations' | 'locations' | 'shiftweeklyoff' | 'doctypes' | 'penalization' | 'attendance';
 
 interface TabDef {
   label: string;
@@ -53,11 +58,14 @@ const TABS: Record<OrgTab, TabDef> = {
     addLabel: 'Add Location',
     emptyLine: 'No office locations configured yet. Add one to enable location-based features.',
   },
-  shifts: {
-    label: 'Shifts', icon: Clock,
-    columns: ['Name', 'Code', 'Timing', 'Fixed/Flexible', 'Break', 'Employees', 'Status'],
-    addLabel: 'Add Shift',
-    emptyLine: 'No shifts configured yet. Add one so employees can be assigned to it.',
+  // A parent tab with its own nested sub-tab bar (Shifts / Weekly Offs / Shift and Weekly Off
+  // Rules — see shiftWeeklyOffSubTab), not a row-per-item table like the tabs above — mirrors how
+  // Penalization Policy below manages its own policy/allocation sub-tabs. columns/addLabel/
+  // emptyLine are unused here; "Add Shift" (the only add action any sub-tab needs) is rendered
+  // directly, conditioned on the active sub-tab, not driven by this generic addLabel.
+  shiftweeklyoff: {
+    label: 'Shift & Weekly Off', icon: Clock,
+    columns: [], addLabel: '', emptyLine: '',
   },
   doctypes: {
     label: 'Document Types', icon: FileText,
@@ -71,6 +79,14 @@ const TABS: Record<OrgTab, TabDef> = {
   // table-vs-section guards below).
   penalization: {
     label: 'Penalization Policy', icon: ShieldAlert,
+    columns: [], addLabel: '', emptyLine: '',
+  },
+  // A single-setting form (AttendanceRulesSection), not a row-per-item table — same shape as the
+  // "Shift and Weekly Off Rules" sub-tab, but a separate top-level tab since Half Day Max Hours
+  // is a general attendance-classification rule, not a shift/weekly-off concept. columns/addLabel/
+  // emptyLine are unused for this tab (see the search/add-button and table-vs-section guards below).
+  attendance: {
+    label: 'Attendance Rules', icon: Clock,
     columns: [], addLabel: '', emptyLine: '',
   },
 };
@@ -582,22 +598,64 @@ interface ShiftFormModalProps {
   onSaved(saved: ShiftRow): void;
 }
 
+/** Elapsed span of a shift in hours, overnight-aware (end <= start rolls into the next day) — same rollover convention as the backend's ShiftDayPolicy.shiftEndAt. Times are "HH:mm". */
+function elapsedShiftHours(startTime: string, endTime: string): number {
+  const [sh, sm] = startTime.split(':').map(Number);
+  const [eh, em] = endTime.split(':').map(Number);
+  const startMin = sh * 60 + sm;
+  let endMin = eh * 60 + em;
+  if (endMin <= startMin) endMin += 24 * 60;
+  return (endMin - startMin) / 60;
+}
+
+/** YYYY-MM-DD for N days from today, in the viewer's own local calendar — matches what a plain <input type="date"> compares against. */
+function isoDatePlusDays(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 export function ShiftFormModal({ editRow, token, onClose, onSaved }: ShiftFormModalProps) {
   const isEdit = !!editRow;
+  // A pending version already scheduled (from a previous edit) becomes the starting point for
+  // further edits — adjusting it again replaces it, rather than starting fresh from the
+  // currently-effective timing and losing track of what was already scheduled.
+  const pending = editRow?.pendingEffectiveFrom
+    ? {
+        startTime: editRow.pendingStartTime!, endTime: editRow.pendingEndTime!, breakMinutes: editRow.pendingBreakMinutes,
+        lateGraceMinutes: editRow.pendingLateGraceMinutes, effectiveFrom: editRow.pendingEffectiveFrom,
+      }
+    : null;
   const [name, setName] = useState(editRow?.name ?? '');
   const [code, setCode] = useState(editRow?.code ?? '');
   const [description, setDescription] = useState(editRow?.description ?? '');
-  const [startTime, setStartTime] = useState(editRow?.startTime?.slice(0, 5) ?? '09:00');
-  const [endTime, setEndTime] = useState(editRow?.endTime?.slice(0, 5) ?? '18:00');
-  const [flexible, setFlexible] = useState(editRow?.flexible ?? false);
-  const [breakMinutes, setBreakMinutes] = useState(editRow?.breakMinutes != null ? String(editRow.breakMinutes) : '');
-  const [workingDays, setWorkingDays] = useState<string[]>(editRow?.workingDays ?? []);
+  const [startTime, setStartTime] = useState((pending?.startTime ?? editRow?.startTime)?.slice(0, 5) ?? '09:00');
+  const [endTime, setEndTime] = useState((pending?.endTime ?? editRow?.endTime)?.slice(0, 5) ?? '18:00');
+  const [breakMinutes, setBreakMinutes] = useState(
+    (pending?.breakMinutes ?? editRow?.breakMinutes) != null ? String(pending?.breakMinutes ?? editRow?.breakMinutes) : '');
+  const [lateGraceMinutes, setLateGraceMinutes] = useState(
+    (pending?.lateGraceMinutes ?? editRow?.lateGraceMinutes) != null ? String(pending?.lateGraceMinutes ?? editRow?.lateGraceMinutes) : '10');
+  // Shift changes are always future-effective — never today, never in the past (enforced
+  // server-side regardless of what's picked here). Defaults to tomorrow; re-editing an
+  // already-scheduled pending version keeps its own date instead of resetting to tomorrow.
+  const tomorrow = isoDatePlusDays(1);
+  const [effectiveFrom, setEffectiveFrom] = useState(pending?.effectiveFrom ?? tomorrow);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  // Reads the org's current Maximum Shift Day Duration (Shifts & Weekly Off Rules) — the same
+  // value OrgService.validateShiftDuration enforces server-side, reused here (not a second,
+  // hardcoded limit) so the UI can block early with a clear message instead of only surfacing the
+  // backend's 400 after a round-trip. If this fetch fails, `maxDurationHours` stays null and
+  // `exceedsMaxDuration` reads false — the backend still enforces the limit regardless; this is
+  // best-effort UX on top of that, never the actual guarantee.
+  const [maxDurationHours, setMaxDurationHours] = useState<number | null>(null);
 
-  function toggleDay(day: string) {
-    setWorkingDays(prev => prev.includes(day) ? prev.filter(d => d !== day) : [...prev, day]);
-  }
+  useEffect(() => {
+    orgApi.getShiftWeeklyOffRules(token).then(r => setMaxDurationHours(r.maximumShiftDayDurationHours)).catch(() => {});
+  }, [token]);
+
+  const elapsedHours = elapsedShiftHours(startTime, endTime);
+  const exceedsMaxDuration = maxDurationHours != null && elapsedHours > maxDurationHours;
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -607,19 +665,31 @@ export function ShiftFormModal({ editRow, token, onClose, onSaved }: ShiftFormMo
       setError('Break duration must be a non-negative number of minutes');
       return;
     }
-    const payload = {
-      name: name.trim(),
-      code: code.trim() || undefined,
-      description: description.trim() || undefined,
-      startTime, endTime, flexible,
-      breakMinutes: breakMinutes.trim() ? Number(breakMinutes) : undefined,
-      workingDays: workingDays.length > 0 ? workingDays : undefined,
-    };
+    if (lateGraceMinutes.trim() && (isNaN(Number(lateGraceMinutes)) || Number(lateGraceMinutes) < 0)) {
+      setError('Grace period must be a non-negative number of minutes');
+      return;
+    }
+    if (isEdit && effectiveFrom <= isoDatePlusDays(0)) {
+      setError('Effective From must be a future date (after today)');
+      return;
+    }
+    if (exceedsMaxDuration) {
+      setError(`Shift duration cannot exceed the organization's Maximum Shift Day Duration of ${maxDurationHours}h (this shift spans ${elapsedHours % 1 === 0 ? elapsedHours : elapsedHours.toFixed(1)}h)`);
+      return;
+    }
     setLoading(true);
     try {
       const saved = isEdit && editRow
-        ? await orgApi.updateShift(token, editRow.id, payload)
-        : await orgApi.createShift(token, payload);
+        ? await orgApi.updateShift(token, editRow.id, {
+            name: name.trim(), code: code.trim() || undefined, description: description.trim() || undefined,
+            startTime, endTime, breakMinutes: breakMinutes.trim() ? Number(breakMinutes) : undefined,
+            lateGraceMinutes: lateGraceMinutes.trim() ? Number(lateGraceMinutes) : undefined, effectiveFrom,
+          })
+        : await orgApi.createShift(token, {
+            name: name.trim(), code: code.trim() || undefined, description: description.trim() || undefined,
+            startTime, endTime, breakMinutes: breakMinutes.trim() ? Number(breakMinutes) : undefined,
+            lateGraceMinutes: lateGraceMinutes.trim() ? Number(lateGraceMinutes) : undefined,
+          });
       onSaved(saved);
       onClose();
     } catch (err) {
@@ -649,7 +719,22 @@ export function ShiftFormModal({ editRow, token, onClose, onSaved }: ShiftFormMo
   return createPortal(
     <div role="dialog" aria-modal="true" aria-label={isEdit ? 'Edit Shift' : 'Add Shift'} style={{ position: 'fixed', inset: 0, zIndex: 600, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.55)', backdropFilter: 'blur(4px)' }}>
       <div style={{ background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 12, padding: 28, width: 480, maxWidth: '94vw', maxHeight: '90vh', overflowY: 'auto' }}>
-        <h2 style={{ margin: '0 0 20px', fontSize: 15, fontWeight: 700 }}>{isEdit ? 'Edit Shift' : 'Add Shift'}</h2>
+        <h2 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 700 }}>{isEdit ? 'Edit Shift' : 'Add Shift'}</h2>
+        {isEdit && (
+          <p style={{ margin: '0 0 16px', fontSize: 11.5, color: 'var(--txt-mut)' }}>
+            The current timing stays in effect through today exactly as it is — saving schedules a new timing
+            to take over from the Effective From date below, it never changes today's timing retroactively.
+          </p>
+        )}
+        {pending && (
+          <div style={{
+            background: 'var(--info-bg, rgba(59,130,246,.10))', border: '1px solid var(--info, #3b82f6)',
+            borderRadius: 8, padding: '10px 12px', fontSize: 12, color: 'var(--txt)', marginBottom: 16,
+          }}>
+            A change to {fmtShiftTime(pending.startTime)}–{fmtShiftTime(pending.endTime)} is already scheduled to take
+            effect {pending.effectiveFrom}. Saving below replaces that scheduled change.
+          </div>
+        )}
         <form onSubmit={submit}>
           <div className="nf-grid-2col-collapse" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
             <div>
@@ -676,32 +761,37 @@ export function ShiftFormModal({ editRow, token, onClose, onSaved }: ShiftFormMo
               <span style={{ fontSize: 10.5, color: 'var(--txt-mut)' }}>Earlier than start = overnight shift, crossing midnight</span>
             </div>
           </div>
-          <div className="nf-grid-2col-collapse" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14, alignItems: 'end' }}>
+          <div className="nf-grid-2col-collapse" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: isEdit ? 14 : 20 }}>
             <div>
               <label style={labelS}>Break Duration (minutes)</label>
               <input type="number" min={0} style={inputS} value={breakMinutes} onChange={e => setBreakMinutes(e.target.value)} placeholder="e.g. 60" />
             </div>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 13, cursor: 'pointer', paddingBottom: 9 }}>
-              <input type="checkbox" checked={flexible} onChange={e => setFlexible(e.target.checked)} style={{ width: 15, height: 15 }} />
-              Flexible shift
-            </label>
-          </div>
-          <div style={{ marginBottom: 20 }}>
-            <label style={labelS}>Working Days <span style={{ fontWeight: 400, color: 'var(--txt-dim)' }}>(blank = follows the employee's weekly-off policy)</span></label>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6 }}>
-              {WEEKDAYS.map(day => (
-                <label key={day} style={{
-                  display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, cursor: 'pointer',
-                  padding: '4px 9px', borderRadius: 14, border: '1px solid var(--line2)',
-                  background: workingDays.includes(day) ? 'var(--brand)' : 'var(--raised)',
-                  color: workingDays.includes(day) ? '#fff' : 'var(--txt-mut)',
-                }}>
-                  <input type="checkbox" checked={workingDays.includes(day)} onChange={() => toggleDay(day)} style={{ display: 'none' }} />
-                  {day.slice(0, 3)}
-                </label>
-              ))}
+            <div>
+              <label style={labelS}>Grace Period (minutes)</label>
+              <input type="number" min={0} style={inputS} value={lateGraceMinutes} onChange={e => setLateGraceMinutes(e.target.value)} placeholder="e.g. 10" />
+              <span style={{ fontSize: 10.5, color: 'var(--txt-mut)' }}>Minutes past Start Time forgiven before a check-in counts as Late</span>
             </div>
           </div>
+          {isEdit && (
+            <div style={{ marginBottom: 20 }}>
+              <label style={labelS}>Effective From *</label>
+              <input type="date" style={{ ...inputS, maxWidth: 200 }} value={effectiveFrom} min={tomorrow}
+                onChange={e => setEffectiveFrom(e.target.value)} required />
+              <span style={{ fontSize: 10.5, color: 'var(--txt-mut)' }}>Tomorrow or any later date — never today or the past</span>
+            </div>
+          )}
+          {/* Blocks saving (see submit's own check) — the backend enforces the exact same limit
+              regardless, so this is a UX head-start, not the actual guarantee. */}
+          {exceedsMaxDuration && (
+            <div role="alert" style={{
+              background: 'rgba(228,55,61,.1)', border: '1px solid rgba(228,55,61,.3)',
+              borderRadius: 8, padding: '10px 12px', fontSize: 12, color: 'var(--risk)', marginBottom: 16,
+            }}>
+              This shift spans {elapsedHours % 1 === 0 ? elapsedHours : elapsedHours.toFixed(1)}h, which exceeds your
+              organization's current Maximum Shift Day Duration of {maxDurationHours}h. Adjust the timing, or raise the
+              limit in Shifts & Weekly Off Rules first.
+            </div>
+          )}
           {error && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12, marginBottom: 12 }}>{error}</div>}
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
             <button type="button" onClick={onClose} disabled={loading} style={{ padding: '7px 16px', background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6, fontSize: 12.5, color: 'var(--txt-mut)', cursor: 'pointer' }}>Cancel</button>
@@ -716,106 +806,245 @@ export function ShiftFormModal({ editRow, token, onClose, onSaved }: ShiftFormMo
   );
 }
 
-// ── ShiftEmployeesModal — drill-down for the Shifts tab's "View Employees" action ──
-// Reuses the exact same shift-assignment path as Add/Edit User (usersApi.update with just
-// shiftId set) for the per-row "Update Shift" move, so there is only ever one place that writes
-// an employee's shift — see UserManagementService.updateUser.
-interface ShiftEmployeesModalProps {
+// ── ShiftEmployeesPanel — the selected Shift's "Employees" detail tab ───────────
+// Deliberately READ-ONLY: this tab is "which employees are assigned to this Shift," not a place
+// to change that assignment or the Shift's own configuration — editing a Shift's timing affects
+// every employee shown here at once, so that action lives only on the Shift-level kebab/Summary
+// area (see ShiftsMasterDetail, which hides that kebab specifically while this tab is active), and
+// per-employee shift reassignment belongs to the existing Time Assignments area (My Team ->
+// Assignments — bulk update or CSV import), not a second, narrower control duplicated here.
+interface ShiftEmployeesPanelProps {
   shift: ShiftRow;
-  shifts: ShiftRow[];
   token: string;
-  onClose(): void;
-  // Called after any employee's shift is moved from within this modal — lets the parent
-  // re-fetch so both the old and new shift's Employees counts stay accurate immediately.
-  onShiftChanged(): void;
 }
 
-function ShiftEmployeesModal({ shift, shifts, token, onClose, onShiftChanged }: ShiftEmployeesModalProps) {
-  const { showToast } = useToast();
+function ShiftEmployeesPanel({ shift, token }: ShiftEmployeesPanelProps) {
   const [rows, setRows] = useState<ShiftEmployeeRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [movingUserId, setMovingUserId] = useState<string | null>(null);
 
-  function load(setsLoadingFlag: boolean) {
-    if (setsLoadingFlag) setLoading(true);
-    return orgApi.listShiftEmployees(token, shift.id)
+  useEffect(() => {
+    setLoading(true);
+    orgApi.listShiftEmployees(token, shift.id)
       .then(r => setRows(r))
       .catch(e => setError(e instanceof Error ? e.message : 'Failed to load employees'))
-      .finally(() => { if (setsLoadingFlag) setLoading(false); });
-  }
-
-  useEffect(() => { load(true); }, [token, shift.id]);
-
-  async function handleMove(row: ShiftEmployeeRow, newShiftId: string) {
-    if (!newShiftId || newShiftId === shift.id) return;
-    const newShift = shifts.find(s => s.id === newShiftId);
-    setMovingUserId(row.userId);
-    try {
-      await usersApi.update(row.userId, { shiftId: newShiftId }, token);
-      // Moved off this shift — drop it from the list shown here rather than re-fetching the
-      // whole thing, and let the parent refresh every shift row's employee count.
-      setRows(prev => prev.filter(r => r.userId !== row.userId));
-      showToast('success', `${row.fullName} moved to ${newShift?.name ?? 'the new shift'}`);
-      onShiftChanged();
-    } catch (err) {
-      showToast('error', err instanceof Error ? err.message : 'Failed to update shift');
-      load(false);
-    } finally {
-      setMovingUserId(null);
-    }
-  }
-
-  const selectS: React.CSSProperties = {
-    background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6,
-    padding: '5px 8px', fontSize: 11.5, color: 'var(--txt)', maxWidth: 180,
-  };
+      .finally(() => setLoading(false));
+  }, [token, shift.id]);
 
   return (
-    <div role="dialog" aria-modal="true" aria-label={`Employees on ${shift.name}`} style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.55)', backdropFilter: 'blur(4px)' }}>
-      <div style={{ background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 12, padding: 24, width: 620, maxWidth: '94vw', maxHeight: '84vh', overflowY: 'auto' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-          <h2 style={{ margin: 0, fontSize: 15, fontWeight: 700 }}>{shift.name}</h2>
-          <button onClick={onClose} aria-label="Close" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-dim)', padding: 4, display: 'flex' }}><X size={16} /></button>
-        </div>
-        <div style={{ fontSize: 12, color: 'var(--txt-mut)', marginBottom: 16 }}>
-          {fmtShiftTime(shift.startTime)} – {fmtShiftTime(shift.endTime)} · {rows.length} employee{rows.length === 1 ? '' : 's'}
-        </div>
-        {loading ? (
-          <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--txt-mut)', fontSize: 13 }}>Loading…</div>
-        ) : error ? (
-          <div role="alert" style={{ color: 'var(--risk)', fontSize: 13 }}>{error}</div>
-        ) : rows.length === 0 ? (
-          <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--txt-mut)', fontSize: 13 }}>No employees assigned to this shift.</div>
-        ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            {rows.map(r => (
-              <div key={r.userId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '9px 4px', borderBottom: '1px solid var(--line)', fontSize: 13, ...inactiveDimStyle(r.active) }}>
-                <div style={{ minWidth: 0, flex: 1 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <div style={{ color: 'var(--txt)', fontWeight: 500 }}>{r.fullName}</div>
-                    {!r.active && <StatusBadge active={r.active} />}
-                  </div>
-                  <div style={{ color: 'var(--txt-mut)', fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {r.email}{r.departmentName ? ` · ${r.departmentName}` : ''} · {r.employeeCode}
-                  </div>
+    <div>
+      <div style={{ fontSize: 12, color: 'var(--txt-mut)', marginBottom: 14 }}>
+        {rows.length} employee{rows.length === 1 ? '' : 's'} assigned
+      </div>
+      {loading ? (
+        <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--txt-mut)', fontSize: 13 }}>Loading…</div>
+      ) : error ? (
+        <div role="alert" style={{ color: 'var(--risk)', fontSize: 13 }}>{error}</div>
+      ) : rows.length === 0 ? (
+        <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--txt-mut)', fontSize: 13 }}>No employees assigned to this shift.</div>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {rows.map(r => (
+            <div key={r.userId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '9px 4px', borderBottom: '1px solid var(--line)', fontSize: 13, ...inactiveDimStyle(r.active) }}>
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <div style={{ color: 'var(--txt)', fontWeight: 500 }}>{r.fullName}</div>
+                  {!r.active && <StatusBadge active={r.active} />}
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
-                  <span style={{ fontSize: 10.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.04em' }}>Shift</span>
-                  <select
-                    style={selectS}
-                    value={shift.id}
-                    disabled={movingUserId === r.userId}
-                    onChange={e => handleMove(r, e.target.value)}
-                  >
-                    {shifts.map(s => (
-                      <option key={s.id} value={s.id}>{s.name} — {fmtShiftTime(s.startTime)}–{fmtShiftTime(s.endTime)}</option>
-                    ))}
-                  </select>
+                <div style={{ color: 'var(--txt-mut)', fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {r.email}{r.departmentName ? ` · ${r.departmentName}` : ''} · {r.employeeCode}
                 </div>
               </div>
-            ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── ShiftVersionsPanel — the selected Shift's "Track Shift Versions" detail tab ─
+// Read-only: a version is never edited in place (see ShiftFormModal's own comment) — the only way
+// to see a new one appear here is saving an edit through that modal. Exposes the full timing
+// history for the currently-selected logical Shift, backed by the Shift Versioning work
+// (GET /api/org/shifts/{id}/versions) — the "Current"/"Upcoming" badges mirror the same
+// effectiveFrom-vs-today logic the backend's ShiftVersionResolver itself uses to pick a version.
+interface ShiftVersionsPanelProps {
+  shift: ShiftRow;
+  token: string;
+}
+
+function ShiftVersionsPanel({ shift, token }: ShiftVersionsPanelProps) {
+  const [rows, setRows] = useState<ShiftVersionRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setLoading(true);
+    orgApi.listShiftVersions(token, shift.id)
+      .then(r => setRows(r))
+      .catch(e => setError(e instanceof Error ? e.message : 'Failed to load version history'))
+      .finally(() => setLoading(false));
+  }, [token, shift.id]);
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  return loading ? (
+    <div style={{ padding: '24px 0', textAlign: 'center', color: 'var(--txt-mut)', fontSize: 13 }}>Loading…</div>
+  ) : error ? (
+    <div role="alert" style={{ color: 'var(--risk)', fontSize: 13 }}>{error}</div>
+  ) : (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      {rows.map((v, i) => {
+        const isPending = v.effectiveFrom > today;
+        const isCurrent = !isPending && (i === 0 || rows[i - 1].effectiveFrom > today);
+        return (
+          <div key={v.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '9px 4px', borderBottom: '1px solid var(--line)', fontSize: 13 }}>
+            <div>
+              <div style={{ color: 'var(--txt)', fontWeight: 500 }}>{fmtShiftTime(v.startTime)} – {fmtShiftTime(v.endTime)}</div>
+              <div style={{ color: 'var(--txt-mut)', fontSize: 11.5 }}>Effective from {v.effectiveFrom}{v.breakMinutes != null ? ` · ${v.breakMinutes}m break` : ''}{v.lateGraceMinutes != null ? ` · ${v.lateGraceMinutes}m grace` : ''}</div>
+            </div>
+            {isPending && <span style={{ fontSize: 10.5, color: 'var(--info, #3b82f6)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.04em' }}>Upcoming</span>}
+            {isCurrent && <span style={{ fontSize: 10.5, color: 'var(--brand)', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.04em' }}>Current</span>}
           </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── ShiftSummaryPanel — the selected Shift's "Summary" detail tab (default) ─────
+function ShiftSummaryPanel({ shift }: { shift: ShiftRow }) {
+  const rowS: React.CSSProperties = { display: 'contents' };
+  const labelS: React.CSSProperties = { color: 'var(--txt-mut)', padding: '6px 0' };
+  const valueS: React.CSSProperties = { color: 'var(--txt)', padding: '6px 0' };
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '160px 1fr', fontSize: 13, maxWidth: 480 }}>
+        <div style={rowS}><span style={labelS}>Timing</span><span style={valueS}>{fmtShiftTime(shift.startTime)} – {fmtShiftTime(shift.endTime)}</span></div>
+        <div style={rowS}><span style={labelS}>Break Duration</span><span style={valueS}>{shift.breakMinutes != null ? `${shift.breakMinutes} minutes` : '—'}</span></div>
+        <div style={rowS}><span style={labelS}>Grace Period</span><span style={valueS}>{shift.lateGraceMinutes != null ? `${shift.lateGraceMinutes} minutes` : '—'}</span></div>
+        <div style={rowS}><span style={labelS}>Status</span><span style={valueS}><StatusBadge active={shift.active} /></span></div>
+        <div style={rowS}><span style={labelS}>Employees Assigned</span><span style={valueS}><CountBadge count={shift.employeeCount} /></span></div>
+      </div>
+      {shift.pendingEffectiveFrom && (
+        <div style={{
+          background: 'var(--info-bg, rgba(59,130,246,.10))', border: '1px solid var(--info, #3b82f6)',
+          borderRadius: 8, padding: '10px 12px', fontSize: 12, color: 'var(--txt)', maxWidth: 480,
+        }}>
+          A change to {fmtShiftTime(shift.pendingStartTime!)}–{fmtShiftTime(shift.pendingEndTime!)} is scheduled to
+          take effect {shift.pendingEffectiveFrom} — see Track Shift Versions for the full history.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── ShiftsMasterDetail — the Shifts sub-tab's approved layout: a searchable list on the left,
+// the selected Shift's Summary/Employees/Track Shift Versions on the right. Replaces what had
+// regressed into a generic full-width table — every other Organization Masters tab keeps that
+// generic table; only Shifts uses this dedicated layout, matching the approved reference design.
+interface ShiftsMasterDetailProps {
+  shifts: ShiftRow[];
+  token: string;
+  canManageShifts: boolean;
+  kebabItems(row: ShiftRow): KebabItem[];
+}
+
+function ShiftsMasterDetail({ shifts, token, canManageShifts, kebabItems }: ShiftsMasterDetailProps) {
+  const [search, setSearch] = useState('');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detailTab, setDetailTab] = useState<'summary' | 'employees' | 'versions'>('summary');
+
+  const visible = shifts.filter(s =>
+    s.name.toLowerCase().includes(search.toLowerCase()) || (s.code ?? '').toLowerCase().includes(search.toLowerCase()));
+  // Keeps a valid selection across searches/refreshes: the explicitly-selected shift if it's
+  // still around, else the first visible one, else the first shift at all (e.g. right after the
+  // selected one was deleted) — never a stale reference to a shift no longer in the list.
+  const selected = shifts.find(s => s.id === selectedId) ?? visible[0] ?? shifts[0] ?? null;
+
+  useEffect(() => { setDetailTab('summary'); }, [selected?.id]);
+
+  return (
+    <div style={{ display: 'flex', minHeight: 440 }}>
+      <div style={{ width: 260, flexShrink: 0, borderRight: '1px solid var(--line)', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: 12, borderBottom: '1px solid var(--line)' }}>
+          <div style={{ position: 'relative' }}>
+            <Search size={12} aria-hidden="true" style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--txt-dim)', pointerEvents: 'none' }} />
+            <input
+              type="search" value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Search shifts…" aria-label="Search shifts"
+              style={{
+                width: '100%', boxSizing: 'border-box', background: 'var(--raised)', border: '1px solid var(--line2)',
+                borderRadius: 6, padding: '6px 10px 6px 26px', fontSize: 12, color: 'var(--txt)', outline: 'none',
+              }}
+            />
+          </div>
+        </div>
+        <div style={{ overflowY: 'auto', flex: 1 }}>
+          {shifts.length === 0 ? (
+            <div style={{ padding: '32px 16px', textAlign: 'center', color: 'var(--txt-mut)', fontSize: 12.5 }}>No shifts configured yet.</div>
+          ) : visible.length === 0 ? (
+            <div style={{ padding: '32px 16px', textAlign: 'center', color: 'var(--txt-mut)', fontSize: 12.5 }}>No shifts match "{search}"</div>
+          ) : visible.map(s => (
+            <button key={s.id} onClick={() => setSelectedId(s.id)} style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', textAlign: 'left',
+              padding: '10px 14px', background: selected?.id === s.id ? 'var(--raised)' : 'transparent',
+              border: 'none', borderLeft: selected?.id === s.id ? '2px solid var(--brand-bright)' : '2px solid transparent',
+              cursor: 'pointer', fontSize: 13, color: 'var(--txt)', gap: 8,
+            }}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: selected?.id === s.id ? 600 : 400 }}>{s.name}</span>
+              <StatusBadge active={s.active} />
+            </button>
+          ))}
+        </div>
+      </div>
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        {!selected ? (
+          <div style={{ padding: 40, textAlign: 'center', color: 'var(--txt-mut)', fontSize: 13 }}>Select a shift to view its details.</div>
+        ) : (
+          <>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', padding: '18px 20px 0' }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--txt)' }}>{selected.name}</h2>
+                <div style={{ fontSize: 11.5, color: 'var(--txt-mut)', marginTop: 4, textTransform: 'uppercase', letterSpacing: '.04em' }}>
+                  Code: {selected.code ?? '--'}
+                </div>
+              </div>
+              {/* Hidden specifically while viewing Employees: editing/deactivating/deleting the
+                  Shift affects every employee listed there at once, so that action must not be
+                  reachable from what is meant to be a read-only roster view — see
+                  ShiftEmployeesPanel's own comment. Still available from Summary/Track Shift
+                  Versions, both genuinely Shift-level (not employee-list) contexts. */}
+              {canManageShifts && detailTab !== 'employees' && <KebabMenu items={kebabItems(selected)} />}
+            </div>
+            <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--line)', margin: '14px 20px 0' }}>
+              {([
+                { key: 'summary', label: 'Summary' },
+                { key: 'employees', label: 'Employees' },
+                { key: 'versions', label: 'Track Shift Versions' },
+              ] as const).map(t => (
+                <button key={t.key} onClick={() => setDetailTab(t.key)} style={{
+                  padding: '9px 14px', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 12.5,
+                  fontWeight: detailTab === t.key ? 600 : 400,
+                  color: detailTab === t.key ? 'var(--brand-bright)' : 'var(--txt-mut)',
+                  borderBottom: detailTab === t.key ? '2px solid var(--brand-bright)' : '2px solid transparent',
+                  marginBottom: -1,
+                }}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ padding: 20, flex: 1, overflowY: 'auto' }}>
+              {detailTab === 'summary' ? (
+                <ShiftSummaryPanel shift={selected} />
+              ) : detailTab === 'employees' ? (
+                <ShiftEmployeesPanel shift={selected} token={token} />
+              ) : (
+                <ShiftVersionsPanel shift={selected} token={token} />
+              )}
+            </div>
+          </>
         )}
       </div>
     </div>
@@ -857,8 +1086,9 @@ export default function OrgSetupPage() {
   }>({ open: false, key: 0 });
   const [docTypeModal, setDocTypeModal] = useState<{ open: boolean; row?: DocumentType; key: number }>({ open: false, key: 0 });
   const [shiftModal, setShiftModal] = useState<{ open: boolean; row?: ShiftRow; key: number }>({ open: false, key: 0 });
-  const [shiftEmployeesRow, setShiftEmployeesRow] = useState<ShiftRow | null>(null);
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
+  // The Shift & Weekly Off tab's own nested sub-tab — see TABS.shiftweeklyoff's own comment.
+  const [shiftWeeklyOffSubTab, setShiftWeeklyOffSubTab] = useState<'shifts' | 'weeklyoffs' | 'rules'>('shifts');
 
   const tab = TABS[activeTab];
   const Icon = tab.icon;
@@ -898,20 +1128,19 @@ export default function OrgSetupPage() {
     l.name.toLowerCase().includes(q) || (l.city ?? '').toLowerCase().includes(q)
   );
   const visibleDocTypes = docTypes.filter(d => d.name.toLowerCase().includes(q));
-  const visibleShifts = shifts.filter(s =>
-    s.name.toLowerCase().includes(q) || (s.code ?? '').toLowerCase().includes(q)
-  );
+  // Shifts no longer participates in the shared search/generic-table plumbing above — its master-
+  // detail layout (ShiftsMasterDetail) filters the full, unfiltered `shifts` list with its own
+  // internal search state instead (see the reference design's dedicated left-panel search box).
   const visibleRows =
     activeTab === 'businessunits' ? visibleBusinessUnits :
     activeTab === 'departments' ? visibleDepts :
     activeTab === 'designations' ? visibleDesigs :
     activeTab === 'doctypes' ? visibleDocTypes :
-    activeTab === 'shifts' ? visibleShifts :
     visibleLocs;
 
   function openAdd() {
     if (activeTab === 'doctypes') { setDocTypeModal(s => ({ open: true, key: s.key + 1 })); return; }
-    if (activeTab === 'shifts') { setShiftModal(s => ({ open: true, key: s.key + 1 })); return; }
+    if (activeTab === 'shiftweeklyoff' && shiftWeeklyOffSubTab === 'shifts') { setShiftModal(s => ({ open: true, key: s.key + 1 })); return; }
     setAddEditModal(s => ({ open: true, key: s.key + 1 }));
   }
   function openEdit(row: BusinessUnitRow | DepartmentRow | DesignationRow | LocationRow) {
@@ -1130,15 +1359,6 @@ export default function OrgSetupPage() {
           }}
         />
       )}
-      {shiftEmployeesRow && (
-        <ShiftEmployeesModal
-          shift={shiftEmployeesRow}
-          shifts={shifts}
-          token={token}
-          onClose={() => setShiftEmployeesRow(null)}
-          onShiftChanged={fetchAll}
-        />
-      )}
       {confirmState && (
         <ConfirmModal
           {...confirmState}
@@ -1199,7 +1419,7 @@ export default function OrgSetupPage() {
               );
             })}
           </div>
-          {activeTab !== 'penalization' && (
+          {activeTab !== 'penalization' && activeTab !== 'shiftweeklyoff' && activeTab !== 'attendance' && (
             // 8px vertical padding (was 0) gives this block breathing room from the tabs above
             // it on the narrow widths where flexWrap drops it to its own line; harmless on the
             // shared line, where alignItems: center still governs its vertical position.
@@ -1221,18 +1441,30 @@ export default function OrgSetupPage() {
                   }}
                 />
               </div>
-              {/* Shift master-data create is Super Admin only — see canManageShifts. Backend
-                  (OrgService) enforces this regardless; hiding the button is just UX. */}
-              {(activeTab !== 'shifts' || canManageShifts) && (
-                <button onClick={openAdd} aria-label={tab.addLabel} style={{
-                  display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
-                  background: 'var(--brand)', color: '#fff', border: 'none', borderRadius: 6,
-                  fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
-                }}>
-                  <Plus size={13} aria-hidden="true" />
-                  {tab.addLabel}
-                </button>
-              )}
+              <button onClick={openAdd} aria-label={tab.addLabel} style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+                background: 'var(--brand)', color: '#fff', border: 'none', borderRadius: 6,
+                fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+              }}>
+                <Plus size={13} aria-hidden="true" />
+                {tab.addLabel}
+              </button>
+            </div>
+          )}
+          {/* Add Shift stays the primary top-right action (matching the approved reference), but
+              only while the Shifts sub-tab itself is active — Weekly Offs/Shift and Weekly Off
+              Rules manage their own add actions internally (see their own sections below). No
+              shared search box here: the master-detail layout has its own, in the left panel. */}
+          {activeTab === 'shiftweeklyoff' && shiftWeeklyOffSubTab === 'shifts' && canManageShifts && (
+            <div className="nf-org-toolbar-actions" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px' }}>
+              <button onClick={openAdd} aria-label="Add Shift" style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px',
+                background: 'var(--brand)', color: '#fff', border: 'none', borderRadius: 6,
+                fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+              }}>
+                <Plus size={13} aria-hidden="true" />
+                Add Shift
+              </button>
             </div>
           )}
         </div>
@@ -1274,6 +1506,40 @@ export default function OrgSetupPage() {
               />
             )}
           </div>
+        ) : activeTab === 'shiftweeklyoff' ? (
+          <div>
+            <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--line)', padding: '0 18px' }}>
+              {([
+                { key: 'shifts', label: 'Shifts' },
+                { key: 'weeklyoffs', label: 'Weekly Offs' },
+                { key: 'rules', label: 'Shift and Weekly Off Rules' },
+              ] as const).map(t => (
+                <button key={t.key} onClick={() => setShiftWeeklyOffSubTab(t.key)} style={{
+                  padding: '9px 14px', background: 'transparent', border: 'none', cursor: 'pointer',
+                  fontSize: 12.5, fontWeight: shiftWeeklyOffSubTab === t.key ? 600 : 400,
+                  color: shiftWeeklyOffSubTab === t.key ? 'var(--brand-bright)' : 'var(--txt-mut)',
+                  borderBottom: shiftWeeklyOffSubTab === t.key ? '2px solid var(--brand-bright)' : '2px solid transparent',
+                  marginBottom: -1,
+                }}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+            {shiftWeeklyOffSubTab === 'shifts' ? (
+              <ShiftsMasterDetail
+                shifts={shifts}
+                token={token}
+                canManageShifts={canManageShifts}
+                kebabItems={shiftKebabItems}
+              />
+            ) : shiftWeeklyOffSubTab === 'weeklyoffs' ? (
+              <WeeklyOffSection token={token} />
+            ) : (
+              <ShiftWeeklyOffRulesSection token={token} />
+            )}
+          </div>
+        ) : activeTab === 'attendance' ? (
+          <AttendanceRulesSection token={token} />
         ) : (
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
@@ -1309,16 +1575,14 @@ export default function OrgSetupPage() {
                       <>
                         <Icon size={32} aria-hidden="true" style={{ color: 'var(--line2)', display: 'block', margin: '0 auto 12px' }} />
                         <div style={{ color: 'var(--txt-mut)', fontSize: 13, marginBottom: 14 }}>{tab.emptyLine}</div>
-                        {(activeTab !== 'shifts' || canManageShifts) && (
-                          <button onClick={openAdd} style={{
-                            display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 14px',
-                            background: 'var(--raised)', color: 'var(--txt)', border: '1px solid var(--line2)',
-                            borderRadius: 6, fontSize: 12, fontWeight: 500, cursor: 'pointer',
-                          }}>
-                            <Plus size={12} aria-hidden="true" />
-                            {tab.addLabel}
-                          </button>
-                        )}
+                        <button onClick={openAdd} style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 6, padding: '7px 14px',
+                          background: 'var(--raised)', color: 'var(--txt)', border: '1px solid var(--line2)',
+                          borderRadius: 6, fontSize: 12, fontWeight: 500, cursor: 'pointer',
+                        }}>
+                          <Plus size={12} aria-hidden="true" />
+                          {tab.addLabel}
+                        </button>
                       </>
                     )}
                   </td>
@@ -1373,47 +1637,6 @@ export default function OrgSetupPage() {
                     </td>
                   </tr>
                 ))
-              ) : activeTab === 'shifts' ? (
-                visibleShifts.map(s => (
-                  <tr key={s.id} style={{ borderBottom: '1px solid var(--line)' }}>
-                    <td style={{ padding: '10px 16px', color: 'var(--txt)', fontWeight: 500 }}>{s.name}</td>
-                    <td style={{ padding: '10px 16px', color: 'var(--txt-mut)', fontFamily: 'Inter, sans-serif', fontSize: 12 }}>{s.code ?? '—'}</td>
-                    <td style={{ padding: '10px 16px', color: 'var(--txt-mut)' }}>{fmtShiftTime(s.startTime)} – {fmtShiftTime(s.endTime)}</td>
-                    <td style={{ padding: '10px 16px', color: 'var(--txt-mut)' }}>{s.flexible ? 'Flexible' : 'Fixed'}</td>
-                    <td style={{ padding: '10px 16px', color: 'var(--txt-mut)' }}>{s.breakMinutes != null ? `${s.breakMinutes}m` : '—'}</td>
-                    <td style={{ padding: '10px 16px' }}>
-                      {/* Fixed-width wrapper around the count so the "view employees" button
-                          beside it lands at the same x position on every row — CountBadge's own
-                          width is just its digit text (1-4+ chars), so without this the button
-                          crept right/left as the employee count varied row to row. */}
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{ display: 'inline-block', minWidth: 26, flexShrink: 0 }}>
-                          <CountBadge count={s.employeeCount} />
-                        </span>
-                        <button
-                          onClick={() => setShiftEmployeesRow(s)}
-                          disabled={s.employeeCount === 0}
-                          title="View employees on this shift"
-                          aria-label={`View employees on ${s.name}`}
-                          style={{
-                            display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            width: 24, height: 24, padding: 0, borderRadius: 6,
-                            background: 'var(--raised)', border: '1px solid var(--line2)',
-                            color: s.employeeCount === 0 ? 'var(--txt-dim)' : 'var(--brand-bright)',
-                            cursor: s.employeeCount === 0 ? 'not-allowed' : 'pointer',
-                            opacity: s.employeeCount === 0 ? 0.5 : 1,
-                          }}
-                        >
-                          <Users size={13} aria-hidden="true" />
-                        </button>
-                      </div>
-                    </td>
-                    <td style={{ padding: '10px 16px' }}><StatusBadge active={s.active} /></td>
-                    <td style={{ padding: '10px 16px', textAlign: 'right' }}>
-                      <KebabMenu items={shiftKebabItems(s)} />
-                    </td>
-                  </tr>
-                ))
               ) : (
                 visibleDocTypes.map(dt => (
                   <tr key={dt.id} style={{ borderBottom: '1px solid var(--line)' }}>
@@ -1439,6 +1662,445 @@ export default function OrgSetupPage() {
         </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Weekly Offs ──────────────────────────────────────────────────────────────
+// WeeklyOffPolicy is the sole source of truth for weekly-off (Shift carries no working-days
+// concept — see the backend's own comment on Shift.workingDays' removal from this surface).
+// Full-day-only for P1, matching the offDays model already in place; no active/inactive concept
+// (not requested for P1, and the product's own Weekly Off reference screens don't show one).
+// Self-contained, mirroring how the Penalization Policy tab manages its own state/fetch rather
+// than sharing OrgSetupPage's generic table plumbing.
+
+interface WeeklyOffFormModalProps {
+  editRow?: WeeklyOffPolicyRow;
+  token: string;
+  onClose(): void;
+  onSaved(): void;
+}
+
+function WeeklyOffFormModal({ editRow, token, onClose, onSaved }: WeeklyOffFormModalProps) {
+  const isEdit = !!editRow;
+  const [name, setName] = useState(editRow?.name ?? '');
+  const [offDays, setOffDays] = useState<string[]>(editRow?.offDays ?? []);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  function toggleDay(day: string) {
+    setOffDays(prev => prev.includes(day) ? prev.filter(d => d !== day) : [...prev, day]);
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setError('');
+    if (!name.trim()) { setError('Weekly off policy name is required'); return; }
+    if (offDays.length === 0) { setError('At least one off day is required'); return; }
+    const payload = { name: name.trim(), offDays };
+    setLoading(true);
+    try {
+      if (isEdit && editRow) {
+        await orgApi.updateWeeklyOffPolicy(token, editRow.id, payload);
+      } else {
+        await orgApi.createWeeklyOffPolicy(token, payload);
+      }
+      onSaved();
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const inputS: React.CSSProperties = { background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6, padding: '8px 10px', fontSize: 13, color: 'var(--txt)', width: '100%', boxSizing: 'border-box' };
+  const labelS: React.CSSProperties = { fontSize: 12, fontWeight: 600, color: 'var(--txt-mut)', display: 'block', marginBottom: 5 };
+
+  return (
+    <div role="dialog" aria-modal="true" aria-label={isEdit ? 'Edit Weekly Off Policy' : 'Add Weekly Off Policy'} style={{ position: 'fixed', inset: 0, zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,.55)', backdropFilter: 'blur(4px)' }}>
+      <div style={{ background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 12, padding: 28, width: 440, maxWidth: '94vw' }}>
+        <h2 style={{ margin: '0 0 20px', fontSize: 15, fontWeight: 700 }}>{isEdit ? 'Edit Weekly Off Policy' : 'Add Weekly Off Policy'}</h2>
+        <form onSubmit={submit}>
+          <div style={{ marginBottom: 16 }}>
+            <label style={labelS}>Policy Name *</label>
+            <input style={inputS} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Standard Weekly Off Policy" required autoFocus />
+          </div>
+          <div style={{ marginBottom: 20 }}>
+            <label style={labelS}>Off Days * <span style={{ fontWeight: 400, color: 'var(--txt-dim)' }}>(full day)</span></label>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6 }}>
+              {WEEKDAYS.map(day => (
+                <label key={day} style={{
+                  display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, cursor: 'pointer',
+                  padding: '4px 9px', borderRadius: 14, border: '1px solid var(--line2)',
+                  background: offDays.includes(day) ? 'var(--brand)' : 'var(--raised)',
+                  color: offDays.includes(day) ? '#fff' : 'var(--txt-mut)',
+                }}>
+                  <input type="checkbox" checked={offDays.includes(day)} onChange={() => toggleDay(day)} style={{ display: 'none' }} />
+                  {day.slice(0, 3)}
+                </label>
+              ))}
+            </div>
+          </div>
+          {error && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12, marginBottom: 12 }}>{error}</div>}
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+            <button type="button" onClick={onClose} disabled={loading} style={{ padding: '7px 16px', background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6, fontSize: 12.5, color: 'var(--txt-mut)', cursor: 'pointer' }}>Cancel</button>
+            <button type="submit" disabled={loading} style={{ padding: '7px 16px', background: 'var(--brand)', border: 'none', borderRadius: 6, fontSize: 12.5, fontWeight: 600, color: '#fff', cursor: 'pointer', opacity: loading ? 0.7 : 1 }}>
+              {loading ? 'Saving…' : isEdit ? 'Save Changes' : 'Add'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function WeeklyOffSection({ token }: { token: string }) {
+  const { showToast } = useToast();
+  const role = useAuthStore(s => s.user?.role);
+  const canManage = role === 'SUPER_ADMIN';
+
+  const [policies, setPolicies] = useState<WeeklyOffPolicyRow[]>([]);
+  const [search, setSearch] = useState('');
+  const [loadError, setLoadError] = useState('');
+  const [modal, setModal] = useState<{ open: boolean; row?: WeeklyOffPolicyRow; key: number }>({ open: false, key: 0 });
+  const [confirmState, setConfirmState] = useState<ConfirmState | null>(null);
+
+  async function fetchAll() {
+    try {
+      setPolicies(await orgApi.listWeeklyOffPolicies(token));
+      setLoadError('');
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Couldn't load weekly off policies");
+    }
+  }
+
+  useEffect(() => { if (token) fetchAll(); }, [token]);
+
+  const visible = policies.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
+
+  function triggerDelete(row: WeeklyOffPolicyRow) {
+    if (row.employeeCount > 0) {
+      setConfirmState({
+        title: `Cannot Delete ${row.name}`,
+        body: `${row.employeeCount} employee${row.employeeCount === 1 ? ' is' : 's are'} assigned to this weekly off policy. Reassign them first.`,
+        confirmLabel: 'Got it', danger: false, onConfirm: async () => {},
+      });
+      return;
+    }
+    setConfirmState({
+      title: `Delete ${row.name}`,
+      body: `"${row.name}" will be permanently deleted. This cannot be undone.`,
+      confirmLabel: 'Delete', danger: true,
+      onConfirm: async () => {
+        await orgApi.deleteWeeklyOffPolicy(token, row.id);
+        showToast('success', `"${row.name}" deleted`);
+        await fetchAll();
+      },
+    });
+  }
+
+  return (
+    <div style={{ padding: 18 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div style={{ position: 'relative' }}>
+          <Search size={12} aria-hidden="true" style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--txt-dim)', pointerEvents: 'none' }} />
+          <input
+            type="search" value={search} onChange={e => setSearch(e.target.value)}
+            placeholder="Search weekly off policies…" aria-label="Search weekly off policies"
+            style={{ background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6, padding: '5px 10px 5px 26px', fontSize: 12, color: 'var(--txt)', outline: 'none', width: 220 }}
+          />
+        </div>
+        {canManage && (
+          <button onClick={() => setModal(s => ({ open: true, key: s.key + 1 }))} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', background: 'var(--brand)', color: '#fff', border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+            <Plus size={13} aria-hidden="true" /> Add Weekly Off
+          </button>
+        )}
+      </div>
+      {loadError && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12.5, marginBottom: 12 }}>{loadError}</div>}
+      <div style={{ overflowX: 'auto', border: '1px solid var(--line)', borderRadius: 10 }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>
+          <thead>
+            <tr style={{ background: 'var(--raised)' }}>
+              {['Name', 'Off Days', 'Employees'].map(col => (
+                <th key={col} style={{ padding: '10px 16px', textAlign: 'left', fontWeight: 600, color: 'var(--txt-dim)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap', fontSize: 11, letterSpacing: '.04em', textTransform: 'uppercase' }}>{col}</th>
+              ))}
+              <th style={{ padding: '10px 16px', textAlign: 'right', fontWeight: 600, color: 'var(--txt-dim)', borderBottom: '1px solid var(--line)', fontSize: 11, letterSpacing: '.04em', textTransform: 'uppercase', width: 52 }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visible.length === 0 ? (
+              <tr>
+                <td colSpan={4} style={{ padding: '52px 24px', textAlign: 'center' }}>
+                  {search ? (
+                    <div style={{ color: 'var(--txt-mut)', fontSize: 13 }}>No weekly off policies match "{search}"</div>
+                  ) : (
+                    <div style={{ color: 'var(--txt-mut)', fontSize: 13 }}>No weekly off policies configured yet.</div>
+                  )}
+                </td>
+              </tr>
+            ) : (
+              visible.map(p => (
+                <tr key={p.id} style={{ borderBottom: '1px solid var(--line)' }}>
+                  <td style={{ padding: '10px 16px', color: 'var(--txt)', fontWeight: 500 }}>{p.name}</td>
+                  <td style={{ padding: '10px 16px', color: 'var(--txt-mut)' }}>
+                    {p.offDays.map(d => d.slice(0, 3).charAt(0) + d.slice(1, 3).toLowerCase()).join(', ') || '—'}
+                  </td>
+                  <td style={{ padding: '10px 16px' }}><CountBadge count={p.employeeCount} /></td>
+                  <td style={{ padding: '10px 16px', textAlign: 'right' }}>
+                    <KebabMenu items={canManage ? [
+                      { label: 'Edit', onClick: () => setModal(s => ({ open: true, row: p, key: s.key + 1 })) },
+                      { label: 'Delete', danger: true, dividerBefore: true, onClick: () => triggerDelete(p) },
+                    ] : []} />
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+      {modal.open && (
+        <WeeklyOffFormModal
+          key={modal.key} editRow={modal.row} token={token}
+          onClose={() => setModal(s => ({ ...s, open: false }))}
+          onSaved={() => { showToast('success', modal.row ? 'Weekly off policy updated' : 'Weekly off policy added'); fetchAll(); }}
+        />
+      )}
+      {confirmState && (
+        <ConfirmModal
+          title={confirmState.title} body={confirmState.body} confirmLabel={confirmState.confirmLabel}
+          danger={confirmState.danger} onConfirm={confirmState.onConfirm} onClose={() => setConfirmState(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Shifts & Weekly Off Rules ────────────────────────────────────────────────
+// Org-level singleton (ShiftWeeklyOffRules). P1 holds exactly one setting, Maximum Shift Day
+// Duration — a pure elapsed-time boundary for logical-workday attribution (see the backend's
+// ShiftDayPolicy), NOT a per-shift field and NOT an attendance-window/stale/auto-checkout
+// control. Deliberately NOT the Keka-style request-workflow rules editor (shift-change/weekly-
+// off request rate limits) — that's P2 and out of scope; this is a single-field settings form,
+// matching the simplest existing OneHR pattern rather than inventing a Keka-like experience.
+
+function ShiftWeeklyOffRulesSection({ token }: { token: string }) {
+  const { showToast } = useToast();
+  const role = useAuthStore(s => s.user?.role);
+  const canManage = role === 'SUPER_ADMIN';
+
+  const [hours, setHours] = useState('');
+  const [savedHours, setSavedHours] = useState<number | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!token) return;
+    orgApi.getShiftWeeklyOffRules(token)
+      .then(r => { setSavedHours(r.maximumShiftDayDurationHours); setHours(String(r.maximumShiftDayDurationHours)); })
+      .catch(err => setLoadError(err instanceof Error ? err.message : "Couldn't load Shifts & Weekly Off Rules"));
+  }, [token]);
+
+  const dirty = savedHours != null && hours.trim() !== '' && Number(hours) !== savedHours;
+
+  async function save() {
+    setError('');
+    const parsed = Number(hours);
+    if (hours.trim() === '' || isNaN(parsed) || parsed <= 0 || parsed > 24) {
+      setError('Maximum Shift Day Duration must be greater than 0 and at most 24 hours');
+      return;
+    }
+    setLoading(true);
+    try {
+      const updated = await orgApi.updateShiftWeeklyOffRules(token, parsed);
+      setSavedHours(updated.maximumShiftDayDurationHours);
+      setHours(String(updated.maximumShiftDayDurationHours));
+      showToast('success', 'Shifts & Weekly Off Rules updated');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const inputS: React.CSSProperties = { background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6, padding: '8px 10px', fontSize: 13, color: 'var(--txt)', width: 140, boxSizing: 'border-box' };
+
+  return (
+    <div style={{ padding: 18, maxWidth: 560 }}>
+      <h2 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 700 }}>Maximum Shift Day Duration</h2>
+      <p style={{ margin: '0 0 18px', fontSize: 12.5, color: 'var(--txt-mut)', lineHeight: 1.55 }}>
+        The elapsed window, from an employee's assigned shift's own start time, during which attendance activity
+        still belongs to that shift's logical workday. Applies org-wide, to every shift-assigned employee.
+        Does not affect employees with no assigned shift, and is not a per-shift setting.
+      </p>
+      {loadError && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12.5, marginBottom: 12 }}>{loadError}</div>}
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12 }}>
+        <div>
+          <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt-mut)', display: 'block', marginBottom: 5 }}>Hours</label>
+          <input
+            type="number" min={0.1} max={24} step={0.5} style={inputS}
+            value={hours} onChange={e => setHours(e.target.value)}
+            disabled={!canManage || savedHours == null}
+          />
+        </div>
+        {canManage && (
+          <button onClick={save} disabled={loading || !dirty} style={{
+            padding: '8px 16px', background: 'var(--brand)', color: '#fff', border: 'none', borderRadius: 6,
+            fontSize: 12.5, fontWeight: 600, cursor: loading || !dirty ? 'not-allowed' : 'pointer', opacity: loading || !dirty ? 0.6 : 1,
+          }}>
+            {loading ? 'Saving…' : 'Save'}
+          </button>
+        )}
+      </div>
+      {error && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12, marginTop: 12 }}>{error}</div>}
+      {!canManage && <p style={{ fontSize: 11.5, color: 'var(--txt-dim)', marginTop: 14 }}>Only a Super Admin can change this setting.</p>}
+    </div>
+  );
+}
+
+// ── Attendance Rules ─────────────────────────────────────────────────────────
+// Org-level singleton (AttendanceRules). Currently holds exactly one setting, Half Day Max
+// Hours — the absolute-hours threshold below which a worked day is classified HALF_DAY (see the
+// backend's AttendanceService/WebClockInService/RegularizationService, all three of which read
+// this via AttendanceRulesService). Migrated off app.attendance.half-day-max-hours (Workstream
+// B) — the only app.attendance.* YAML property that genuinely needed a persisted, admin-editable
+// home; see scratch/workstream-b-settings-investigation.md for why late-grace-minutes,
+// daily-break-budget-minutes, full-day-min-hours, and the regularization lookback/monthly-limit
+// settings were left alone, removed outright, or deferred to a future Regularization Policy
+// instead of joining this table. A separate top-level tab from "Shift and Weekly Off Rules"
+// since this isn't a shift/weekly-off concept — same single-field settings form pattern though.
+
+function AttendanceRulesSection({ token }: { token: string }) {
+  const { showToast } = useToast();
+  const role = useAuthStore(s => s.user?.role);
+  const canManage = role === 'SUPER_ADMIN';
+
+  const [hours, setHours] = useState('');
+  const [savedHours, setSavedHours] = useState<number | null>(null);
+  const [timezone, setTimezone] = useState('');
+  const [savedTimezone, setSavedTimezone] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [tzError, setTzError] = useState('');
+  const [tzLoading, setTzLoading] = useState(false);
+
+  useEffect(() => {
+    if (!token) return;
+    orgApi.getAttendanceRules(token)
+      .then(r => {
+        setSavedHours(r.halfDayMaxHours); setHours(String(r.halfDayMaxHours));
+        setSavedTimezone(r.defaultTimezone); setTimezone(r.defaultTimezone);
+      })
+      .catch(err => setLoadError(err instanceof Error ? err.message : "Couldn't load Attendance Rules"));
+  }, [token]);
+
+  const dirty = savedHours != null && hours.trim() !== '' && Number(hours) !== savedHours;
+  const tzDirty = savedTimezone != null && timezone.trim() !== '' && timezone.trim() !== savedTimezone;
+
+  async function save() {
+    setError('');
+    const parsed = Number(hours);
+    if (hours.trim() === '' || isNaN(parsed) || parsed <= 0 || parsed >= 24) {
+      setError('Half Day Max Hours must be greater than 0 and less than 24 hours');
+      return;
+    }
+    setLoading(true);
+    try {
+      const updated = await orgApi.updateAttendanceRules(token, parsed);
+      setSavedHours(updated.halfDayMaxHours);
+      setHours(String(updated.halfDayMaxHours));
+      showToast('success', 'Attendance Rules updated');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveTimezone() {
+    setTzError('');
+    if (timezone.trim() === '') {
+      setTzError('Default Timezone is required');
+      return;
+    }
+    setTzLoading(true);
+    try {
+      const updated = await orgApi.updateDefaultTimezone(token, timezone.trim());
+      setSavedTimezone(updated.defaultTimezone);
+      setTimezone(updated.defaultTimezone);
+      showToast('success', 'Default Timezone updated');
+    } catch (err) {
+      setTzError(err instanceof Error ? err.message : 'Something went wrong');
+    } finally {
+      setTzLoading(false);
+    }
+  }
+
+  const inputS: React.CSSProperties = { background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6, padding: '8px 10px', fontSize: 13, color: 'var(--txt)', width: 140, boxSizing: 'border-box' };
+
+  return (
+    <div style={{ padding: 18, maxWidth: 560 }}>
+      <h2 style={{ margin: '0 0 4px', fontSize: 15, fontWeight: 700 }}>Half Day Max Hours</h2>
+      <p style={{ margin: '0 0 18px', fontSize: 12.5, color: 'var(--txt-mut)', lineHeight: 1.55 }}>
+        A worked day with fewer hours than this is classified Half Day. Applies org-wide, to every
+        employee's attendance calculation. An absolute-hours threshold, not a percentage of shift duration.
+      </p>
+      {loadError && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12.5, marginBottom: 12 }}>{loadError}</div>}
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12 }}>
+        <div>
+          <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt-mut)', display: 'block', marginBottom: 5 }}>Hours</label>
+          <input
+            type="number" min={0.1} max={23.9} step={0.5} style={inputS}
+            value={hours} onChange={e => setHours(e.target.value)}
+            disabled={!canManage || savedHours == null}
+          />
+        </div>
+        {canManage && (
+          <button onClick={save} disabled={loading || !dirty} style={{
+            padding: '8px 16px', background: 'var(--brand)', color: '#fff', border: 'none', borderRadius: 6,
+            fontSize: 12.5, fontWeight: 600, cursor: loading || !dirty ? 'not-allowed' : 'pointer', opacity: loading || !dirty ? 0.6 : 1,
+          }}>
+            {loading ? 'Saving…' : 'Save'}
+          </button>
+        )}
+      </div>
+      {error && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12, marginTop: 12 }}>{error}</div>}
+      {!canManage && <p style={{ fontSize: 11.5, color: 'var(--txt-dim)', marginTop: 14 }}>Only a Super Admin can change this setting.</p>}
+
+      <h2 style={{ margin: '28px 0 4px', fontSize: 15, fontWeight: 700 }}>Default Timezone</h2>
+      <p style={{ margin: '0 0 18px', fontSize: 12.5, color: 'var(--txt-mut)', lineHeight: 1.55 }}>
+        Org-wide fallback IANA zone id, used only for an employee who has neither their own
+        Timezone (set on their profile by an Admin) nor their assigned Location's timezone
+        configured. Changing this never reinterprets any existing attendance record.
+      </p>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12 }}>
+        <div>
+          <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt-mut)', display: 'block', marginBottom: 5 }}>Timezone</label>
+          <input
+            style={{ ...inputS, width: 220 }}
+            value={timezone} onChange={e => setTimezone(e.target.value)}
+            placeholder="e.g. Asia/Kolkata" list="nf-default-tz-options"
+            disabled={!canManage || savedTimezone == null}
+          />
+          <datalist id="nf-default-tz-options">
+            <option value="Asia/Kolkata" /><option value="America/New_York" /><option value="America/Los_Angeles" />
+            <option value="America/Chicago" /><option value="Europe/London" /><option value="Australia/Sydney" />
+            <option value="Asia/Singapore" /><option value="Asia/Dubai" /><option value="Pacific/Auckland" />
+            <option value="Asia/Kathmandu" /><option value="Asia/Chittagong" />
+          </datalist>
+        </div>
+        {canManage && (
+          <button onClick={saveTimezone} disabled={tzLoading || !tzDirty} style={{
+            padding: '8px 16px', background: 'var(--brand)', color: '#fff', border: 'none', borderRadius: 6,
+            fontSize: 12.5, fontWeight: 600, cursor: tzLoading || !tzDirty ? 'not-allowed' : 'pointer', opacity: tzLoading || !tzDirty ? 0.6 : 1,
+          }}>
+            {tzLoading ? 'Saving…' : 'Save'}
+          </button>
+        )}
+      </div>
+      {tzError && <div role="alert" style={{ color: 'var(--risk)', fontSize: 12, marginTop: 12 }}>{tzError}</div>}
     </div>
   );
 }

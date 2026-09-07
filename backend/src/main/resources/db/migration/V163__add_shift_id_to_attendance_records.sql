@@ -1,0 +1,23 @@
+-- NForce OneHR — Flyway Migration V163
+-- Historical Shift snapshot for Attendance/Shift decoupling: an Attendance row now remembers
+-- which Shift was in effect when it was created, so a later reassignment of the employee to a
+-- different Shift can never change the interpretation of an already-open session or an
+-- already-created historical record (see AttendanceInterpretationService).
+--
+-- Purely additive: nullable, no backfill of existing rows. Existing rows stay NULL forever —
+-- this is deliberate ("legacy" rows, exactly like historical NULL `timezone` values before that
+-- column existed) — backfilling them from the employee's CURRENT shift would silently
+-- reintroduce the exact historical-corruption problem this column exists to prevent. See
+-- AttendanceInterpretationService's LEGACY_UNRESOLVED handling for how these rows are treated.
+--
+-- ON DELETE RESTRICT (not SET NULL, not CASCADE): a Shift must never be deletable once any
+-- Attendance — including historical — references it, or deletion would silently erase that
+-- historical context the same way a NULL backfill would. See OrgService#deleteShift's new
+-- historical-usage guard (AttendanceRepository#existsByShiftId), added alongside this migration,
+-- which turns what would otherwise be a raw FK-violation error into a clear application message.
+--
+-- Deployment-safe: old application code neither reads nor writes this column, so it can be
+-- applied ahead of, or in the same release as, the code that starts populating it — either
+-- ordering works, and no application code needs to exist before this schema change is deployed.
+ALTER TABLE attendance_records
+    ADD COLUMN shift_id UUID REFERENCES shifts(id) ON DELETE RESTRICT;

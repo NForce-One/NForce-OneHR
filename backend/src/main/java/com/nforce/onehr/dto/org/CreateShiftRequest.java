@@ -6,7 +6,6 @@ import jakarta.validation.constraints.Size;
 import lombok.Data;
 
 import java.time.LocalTime;
-import java.util.List;
 
 @Data
 public class CreateShiftRequest {
@@ -27,10 +26,15 @@ public class CreateShiftRequest {
     @NotNull(message = "End time is required")
     private LocalTime endTime;
 
-    private boolean flexible;
-
     private Integer breakMinutes;
 
-    /** java.time.DayOfWeek names, e.g. ["MONDAY", "TUESDAY"]. Null/empty = not specified at the shift level. */
-    private List<String> workingDays;
+    // Minutes past startTime forgiven before a punch counts as LATE — every Shift has its own
+    // (see ShiftVersion.lateGraceMinutes/V168); null defaults to 10, matching the pre-migration
+    // global default so an admin who doesn't touch this field gets identical behavior to before.
+    private Integer lateGraceMinutes;
+
+    // flexible/workingDays intentionally removed from the P1 surface — flexible is P2 (no shift
+    // in P1 has anything but a fixed start/end); workingDays was never consumed by any weekly-off
+    // decision (WeeklyOffPolicy is the sole source of truth) and conflicted with it. The DB
+    // columns remain for now (see Shift entity) but are no longer settable through this API.
 }

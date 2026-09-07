@@ -7,24 +7,25 @@ import java.util.List;
 
 /**
  * Read-only shift/break config for the frontend's Today's Timings panel, resolved per-caller:
- * shiftStart/shiftEnd come from the caller's assigned Shift (ONEHR-108) if one exists, else fall
- * back to the global AttendanceProperties.shiftStart with a null shiftEnd (no global end exists).
- * weeklyOffDays similarly comes from the caller's assigned WeeklyOffPolicy, else defaults to
- * Saturday/Sunday. See AttendanceService.getConfig().
+ * shiftStart/shiftEnd come from the caller's assigned Shift (ONEHR-108) and its effective Shift
+ * Version — every employee is expected to always have one (product invariant; see
+ * ShiftDayPolicy's class Javadoc), so AttendanceService.getConfig() fails loudly rather than
+ * falling back to any global default if that's ever not the case. weeklyOffDays similarly comes
+ * from the caller's assigned WeeklyOffPolicy, else defaults to Saturday/Sunday. See
+ * AttendanceService.getConfig().
  */
 @Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
 public class AttendanceConfigResponse {
 
-    /** Null only if the caller has no Shift assigned — every employee is seeded with one (V95), so this is normally always set. */
+    /** Never actually null in practice — getConfig() throws before building this response if the caller has no Shift assigned. */
     private String shiftName;
     private LocalTime shiftStart;
-    /** Null only if the caller has no Shift assigned — every employee is seeded with one (V95), so this is normally always set. */
+    /** Never actually null in practice — getConfig() throws before building this response if the caller has no Shift assigned. */
     private LocalTime shiftEnd;
     private int lateGraceMinutes;
-    // Fractional hours (3.5 = 3h30m) — mirrors AttendanceProperties.halfDayMaxHours/fullDayMinHours.
+    // Fractional hours (3.5 = 3h30m). Sourced from the persisted AttendanceRules singleton (see
+    // AttendanceRulesService), not AttendanceProperties — see that service's own Javadoc.
     private double halfDayMaxHours;
-    private double fullDayMinHours;
-    private int dailyBreakBudgetMinutes;
     /** java.time.DayOfWeek names, e.g. ["SATURDAY", "SUNDAY"]. */
     private List<String> weeklyOffDays;
 }

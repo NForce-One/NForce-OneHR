@@ -1,9 +1,10 @@
 package com.nforce.onehr.service;
 
-import com.nforce.onehr.config.AttendanceProperties;
 import com.nforce.onehr.dto.attendance.ApprovalHistoryEntryDto;
 import com.nforce.onehr.dto.attendance.ApproverOptionDto;
+import com.nforce.onehr.dto.attendance.AttendanceInterpretation;
 import com.nforce.onehr.dto.attendance.CreateRegularizationRequest;
+import com.nforce.onehr.dto.attendance.InterpretationOutcome;
 import com.nforce.onehr.dto.attendance.RegularizationResponse;
 import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.Employee;
@@ -11,7 +12,6 @@ import com.nforce.onehr.entity.EmployeeManagerHistory;
 import com.nforce.onehr.entity.RegularizationApproval;
 import com.nforce.onehr.entity.RegularizationRequest;
 import com.nforce.onehr.entity.Role;
-import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.User;
 import com.nforce.onehr.repository.AttendanceRepository;
 import com.nforce.onehr.repository.EmployeeManagerHistoryRepository;
@@ -98,9 +98,22 @@ public class RegularizationService {
     private final EmployeeRepository employeeRepository;
     private final AuditService auditService;
     private final AuditSnapshotSerializer auditSnapshot;
-    private final AttendanceProperties attendanceProps;
     private final NotificationService notificationService;
     private final ExceptionService exceptionService;
+    // The single, narrow, shared owner of Shift-relative punch interpretation — see its own class
+    // Javadoc. Replaces this class's own former private resolveShiftStart/recomputeDerivedFields,
+    // which independently resolved the employee's CURRENT (live) Shift even when correcting a
+    // historical record — the exact "reassigned since this record's date" drift this class now
+    // avoids by resolving through the record's own shiftId snapshot instead (see
+    // AttendanceInterpretationService.interpretExistingSession). This also deliberately unifies
+    // regularization's lateByMinutes onto the same shiftStart-anchored, grace-forgiving formula
+    // AttendanceService/WebClockInService already share — see approve()'s own comment for the
+    // exact, small, visible consequence of that unification. NOT used for this class's own
+    // REGULARIZATION_DAY_BOUNDARY/resolveBusinessDate below, which remains a separate,
+    // intentionally-independent request-validation concept, left untouched.
+    private final AttendanceInterpretationService attendanceInterpretationService;
+    // Persisted, Admin-editable HALF_DAY threshold (Workstream B) — see its own Javadoc.
+    private final AttendanceRulesService attendanceRulesService;
 
     /** Resolved requested times after applying punch auto-fill from attendance history. */
     private record ResolvedTimes(LocalDateTime checkIn, LocalDateTime checkOut) {}
@@ -232,6 +245,30 @@ public class RegularizationService {
         String after = auditSnapshot.toJson(regularizationSnapshot(existing));
         auditService.log(actor.getId(), "REGULARIZATION_UPDATED", existing.getId(), before, after);
         return toResponse(existing);
+    }
+
+    /**
+     * Complete pre/post-correction picture of one Attendance row, for the audit trail captured
+     * around the Attendance mutation in {@link #approve}. {@code null} (no record existed yet —
+     * the "brand-new row" branch) is captured explicitly as {@code existed=false} rather than
+     * an empty map, so the audit history can distinguish "there was nothing here before" from
+     * "the snapshot failed to capture something."
+     */
+    private Map<String, Object> attendanceSnapshot(Attendance a) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        if (a == null) {
+            snapshot.put("existed", false);
+            return snapshot;
+        }
+        snapshot.put("existed", true);
+        snapshot.put("checkInAt", a.getCheckInAt());
+        snapshot.put("checkOutAt", a.getCheckOutAt());
+        snapshot.put("status", a.getStatus());
+        snapshot.put("lateByMinutes", a.getLateByMinutes());
+        snapshot.put("workedMinutes", a.getWorkedMinutes());
+        snapshot.put("source", a.getSource());
+        snapshot.put("shiftId", a.getShiftId());
+        return snapshot;
     }
 
     private Map<String, Object> regularizationSnapshot(RegularizationRequest r) {
@@ -518,7 +555,22 @@ public class RegularizationService {
                 throw new IllegalArgumentException(
                         "Cannot approve: no attendance record exists for this date and no check-in time was requested");
             }
-            if (record == null) {
+            // Brand-new row (no prior punch existed for this date at all) vs. correcting an
+            // already-existing one are resolved differently — see
+            // AttendanceInterpretationService's own class Javadoc for why:
+            //  - brand-new: no prior context to preserve, so lateness/shiftId snapshot resolve
+            //    against the employee's CURRENT Shift (interpretForKnownWorkDate).
+            //  - existing: MUST retain that row's own shiftId snapshot — never re-resolve against
+            //    the employee's current Shift, even if the correction changes its check-in time —
+            //    or an employee reassigned since this record's date would silently get their
+            //    lateness recomputed against a Shift that didn't apply on that historical date.
+            boolean isNewRecord = record == null;
+            // Captured BEFORE any mutation below — this is the row's complete pre-correction
+            // state (including its own `source`, which the next few lines are about to
+            // overwrite), so a disputed or repeated correction can always be reconstructed from
+            // audit_log rather than silently losing what the record looked like beforehand.
+            Map<String, Object> beforeAttendanceSnapshot = attendanceSnapshot(record);
+            if (isNewRecord) {
                 record = Attendance.builder()
                         .employeeUserId(req.getEmployeeUserId())
                         .workDate(req.getAttendanceDate())
@@ -528,8 +580,16 @@ public class RegularizationService {
             if (req.getRequestedCheckIn() != null) record.setCheckInAt(req.getRequestedCheckIn());
             if (req.getRequestedCheckOut() != null) record.setCheckOutAt(req.getRequestedCheckOut());
             record.setSource(SOURCE_REGULARIZATION);
-            recomputeDerivedFields(record, req.getEmployeeUserId());
-            attendanceRepository.save(record);
+            Employee employee = employeeRepository.findById(req.getEmployeeUserId()).orElse(null);
+            AttendanceInterpretation interpretation = isNewRecord
+                    ? attendanceInterpretationService.interpretForKnownWorkDate(employee, record.getWorkDate(), record.getCheckInAt())
+                    : attendanceInterpretationService.interpretExistingRecordLateness(record, record.getCheckInAt());
+            applyInterpretation(record, interpretation, isNewRecord);
+            Attendance savedAttendance = attendanceRepository.save(record);
+
+            auditService.log(actor.getId(), "ATTENDANCE_REGULARIZED", savedAttendance.getId(),
+                    auditSnapshot.toJson(beforeAttendanceSnapshot),
+                    auditSnapshot.toJson(attendanceSnapshot(savedAttendance)));
 
             req.setStatus(STATUS_APPROVED);
             req.setFinalApprovedBy(actor.getId());
@@ -639,40 +699,59 @@ public class RegularizationService {
                 .build());
     }
 
-    /** The employee's actually-assigned Shift start (ONEHR-108) if present, else the global fallback. */
-    private LocalTime resolveShiftStart(UUID employeeUserId) {
-        return employeeRepository.findById(employeeUserId)
-                .map(Employee::getShift)
-                .map(Shift::getStartTime)
-                .orElse(attendanceProps.getShiftStart());
-    }
-
     /**
-     * Mirrors AttendanceService's check-in/check-out status derivation for a corrected row.
-     * shiftStart is anchored to the record's own workDate (not compared as a bare LocalTime-of-
-     * day) so an overnight shift's post-midnight check-in (e.g. 20:30-05:30 shift, 1:11 AM
-     * check-in) is correctly measured as hours late instead of reading as "before" shiftStart.
+     * Applies an {@link AttendanceInterpretationService} result to a record being approved —
+     * replaces this class's former private {@code recomputeDerivedFields}/{@code resolveShiftStart}.
+     *
+     * <p><b>A deliberate, small, visible consequence of unifying onto the shared interpretation
+     * service</b> (per explicit instruction — this was previously left untouched pending exactly
+     * this kind of shown-and-approved change): {@code lateByMinutes} is now the same
+     * shiftStart-anchored, no-grace-forgiveness figure AttendanceService/WebClockInService have
+     * always displayed, rather than this class's own previously-divergent deadline-anchored,
+     * truncated figure. {@code status} is unaffected — both formulas agree on whether the grace
+     * window was exceeded ({@code interpretation.getIsLate()} here; the old formula's
+     * {@code lateByMinutes > 0} was already exactly equivalent, since its own lateByMinutes was
+     * deadline-relative) — only the raw, employee-facing "late by N minutes" number changes,
+     * becoming consistent with what the same employee would see had they simply checked in late
+     * rather than had it regularization-corrected.
+     *
+     * <p>{@code isNewRecord} controls whether {@code shiftId} gets snapshotted (a brand-new row —
+     * see {@link AttendanceInterpretationService#interpretForKnownWorkDate}) or left exactly as it
+     * already was (an existing row — its own snapshot must never be replaced, even by this
+     * correction — see {@link AttendanceInterpretationService#interpretExistingRecordLateness}).
+     *
+     * <p>{@link InterpretationOutcome#LEGACY_UNRESOLVED} (an existing row predating the
+     * {@code shiftId} column, with no recorded Shift context) is never guessed past — this throws
+     * a clear, explicit failure rather than presenting a computed lateness figure that would
+     * necessarily be a guess against however the employee happens to be configured today.
      */
-    private void recomputeDerivedFields(Attendance record, UUID employeeUserId) {
-        LocalDateTime shiftStartAt = LocalDateTime.of(record.getWorkDate(), resolveShiftStart(employeeUserId));
-        LocalDateTime deadlineAt = shiftStartAt.plusMinutes(attendanceProps.getLateGraceMinutes());
-        LocalDateTime checkInAt = record.getCheckInAt();
-        int lateByMinutes = checkInAt.isAfter(deadlineAt)
-                ? (int) Duration.between(deadlineAt, checkInAt).toMinutes()
-                : 0;
+    private void applyInterpretation(Attendance record, AttendanceInterpretation interpretation, boolean isNewRecord) {
+        if (interpretation.isLegacyUnresolved()) {
+            throw new IllegalStateException(
+                    "Cannot recompute lateness for this record: it predates Shift-based attendance "
+                            + "tracking and has no recorded Shift context. This record cannot be safely "
+                            + "corrected through the normal regularization flow — contact an administrator.");
+        }
+        if (isNewRecord) {
+            record.setShiftId(interpretation.getShiftId());
+        }
+        int lateByMinutes = interpretation.getLateByMinutes();
         record.setLateByMinutes(lateByMinutes);
 
         if (record.getCheckOutAt() == null) {
             record.setWorkedMinutes(null);
-            record.setStatus(lateByMinutes > 0 ? STATUS_LATE : STATUS_PRESENT);
+            record.setStatus(interpretation.getIsLate() ? STATUS_LATE : STATUS_PRESENT);
             return;
         }
 
+        // workedMinutes/HALF_DAY are genuinely Shift-independent (a plain duration, and the
+        // org-wide AttendanceRulesService threshold) — left exactly as this class always computed
+        // them, not touched by the interpretation-service unification above.
         int workedMinutes = (int) Duration.between(record.getCheckInAt(), record.getCheckOutAt()).toMinutes();
         record.setWorkedMinutes(workedMinutes);
-        record.setStatus(workedMinutes < attendanceProps.getHalfDayMaxHours() * 60
+        record.setStatus(workedMinutes < attendanceRulesService.getHalfDayMaxHours() * 60
                 ? STATUS_HALF_DAY
-                : (lateByMinutes > 0 ? STATUS_LATE : STATUS_PRESENT));
+                : (interpretation.getIsLate() ? STATUS_LATE : STATUS_PRESENT));
     }
 
     /**
@@ -745,7 +824,7 @@ public class RegularizationService {
     }
 
     private LocalDate regularizationBusinessToday() {
-        return resolveBusinessDate(LocalDateTime.now(ZoneId.of(attendanceProps.getZone())));
+        return resolveBusinessDate(LocalDateTime.now(attendanceRulesService.getDefaultZoneId()));
     }
 
     /**

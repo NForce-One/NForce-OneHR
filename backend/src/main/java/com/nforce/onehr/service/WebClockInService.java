@@ -1,6 +1,7 @@
 package com.nforce.onehr.service;
 
-import com.nforce.onehr.config.AttendanceProperties;
+import com.nforce.onehr.dto.attendance.AttendanceContext;
+import com.nforce.onehr.dto.attendance.AttendanceInterpretation;
 import com.nforce.onehr.dto.attendance.CreateWebClockInRequest;
 import com.nforce.onehr.dto.attendance.WebClockInResponse;
 import com.nforce.onehr.entity.Attendance;
@@ -8,7 +9,6 @@ import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.entity.EmployeeManagerHistory;
 import com.nforce.onehr.entity.Location;
 import com.nforce.onehr.entity.Role;
-import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.User;
 import com.nforce.onehr.entity.WebClockInRequest;
 import com.nforce.onehr.repository.AttendancePunchRepository;
@@ -19,6 +19,7 @@ import com.nforce.onehr.repository.UserRepository;
 import com.nforce.onehr.repository.WebClockInRequestRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -88,7 +89,6 @@ public class WebClockInService {
     private final EmployeeRepository employeeRepository;
     private final AuditService auditService;
     private final AuditSnapshotSerializer auditSnapshot;
-    private final AttendanceProperties attendanceProps;
     // Shared with AttendanceService so the every-3rd-late-arrival penalty applies identically
     // regardless of check-in entry point — see LatePenaltyService.
     private final LatePenaltyService latePenaltyService;
@@ -97,10 +97,24 @@ public class WebClockInService {
     // Check-In/Out + Web Clock-In/Out into one overlap-safe total. No other coupling: this class
     // never reads AttendanceService's own open/closed (canCheckIn/canCheckOut) state.
     private final AttendanceService attendanceService;
+    // Persisted, Admin-editable HALF_DAY threshold (Workstream B) — see its own Javadoc.
+    private final AttendanceRulesService attendanceRulesService;
+    // The single, narrow, shared owner of Shift-relative punch interpretation — see its own
+    // class Javadoc. Replaces this class's own former private recomputeDerivedFields.
+    private final AttendanceInterpretationService attendanceInterpretationService;
 
     @Transactional
     public WebClockInResponse submit(CreateWebClockInRequest req, String actorEmail) {
         User actor = requireActor(actorEmail);
+        // Fetched once and reused for every shift-relative computation below (both the stale-
+        // session check and this fresh submission's own day resolution). Every employee is now
+        // expected to have a real Employee profile AND an assigned Shift (see
+        // Shift.DEFAULT_SHIFT_NAME's server-side default + ShiftSeedCorrector's backfill) —
+        // requireEmployee fails loudly and clearly if the profile itself is missing, so a genuine
+        // "no Employee row" case is never confused with ShiftDayPolicy's own (separate) loud
+        // failure for "no assigned shift" further down.
+        Employee employee = requireEmployee(actor.getId());
+        assertEligibleToPunch(actor);
 
         // Only an already-open WEB session blocks a fresh Web Clock-In — deliberately independent
         // of whether a normal Check-In is currently open (see this class's own Javadoc). This is
@@ -118,8 +132,18 @@ public class WebClockInService {
             Attendance openReqAttendance = attendanceRepository
                     .findByEmployeeUserIdAndWorkDate(actor.getId(), openReq.getWorkDate()).orElse(null);
             LocalDateTime openNow = LocalDateTime.now(resolveZone(openReqAttendance, actor.getId(), req.getTimezone()));
-            if (shiftDayOf(openNow).isAfter(openReq.getWorkDate())) {
-                autoCloseStaleWebSession(openReq, openReqAttendance);
+            // Resolved against the backing Attendance row's own snapshotted Shift (never the
+            // employee's current one) — see AttendanceInterpretationService.interpretExistingSession.
+            // No backing row at all, or one predating the Shift snapshot, means staleness can't be
+            // safely determined — treated the same conservative way as "not stale": block with the
+            // ordinary duplicate message rather than guessing an auto-close.
+            AttendanceInterpretation openInterpretation = openReqAttendance != null
+                    ? attendanceInterpretationService.interpretExistingSession(openReqAttendance, openNow)
+                    : AttendanceInterpretation.legacyUnresolved();
+            boolean stale = !openInterpretation.isLegacyUnresolved()
+                    && openInterpretation.getWorkDate().isAfter(openReq.getWorkDate());
+            if (stale) {
+                autoCloseStaleWebSession(openReq, openReqAttendance, openInterpretation);
             } else {
                 throw new IllegalArgumentException("You have already checked in today");
             }
@@ -131,7 +155,14 @@ public class WebClockInService {
         // creates/resumes (see applyCheckInToAttendance) for the rest of that session's lifetime.
         ZoneId zone = resolveZone(req.getTimezone(), actor.getId());
         LocalDateTime now = LocalDateTime.now(zone);
-        LocalDate today = shiftDayOf(now);
+        // No existing Attendance is known yet at this point — a fresh-action question, resolved
+        // against the employee's CURRENT Shift (see
+        // AttendanceInterpretationService.interpretFreshAction). Reused below by
+        // applyCheckInToAttendance so lateness/shiftId snapshot are computed from this exact same
+        // interpretation, not re-derived a second time.
+        AttendanceInterpretation interpretation = attendanceInterpretationService.interpretFreshAction(
+                employee, new AttendanceContext(actor.getId(), now, zone));
+        LocalDate today = interpretation.getWorkDate();
 
         // Once THIS employee's FIRST Web Clock-In of the shift/workday has a request in flight
         // (PENDING) or already decided (APPROVED), every later Web Clock-In cycle the same
@@ -175,7 +206,7 @@ public class WebClockInService {
         // worked time starts accruing the moment they submit, regardless of how long HR takes to
         // review. See this class's own Javadoc for why these two things are deliberately
         // decoupled.
-        applyCheckInToAttendance(entity, zone.getId());
+        applyCheckInToAttendance(entity, zone.getId(), employee, interpretation);
 
         auditService.log(actor.getId(), "WEB_CLOCK_IN_CHECKED_IN", entity.getId());
 
@@ -359,6 +390,13 @@ public class WebClockInService {
     @Transactional
     public WebClockInResponse checkOut(String actorEmail, String clientTimezone) {
         User actor = requireActor(actorEmail);
+        // Validates the Employee profile exists (a distinct, clearer failure than
+        // ShiftDayPolicy's own "no assigned Shift" one — see requireEmployee's own Javadoc). The
+        // profile itself isn't otherwise needed here: interpretExistingSession below resolves
+        // Shift context from the Attendance record's own snapshot, never the employee's current
+        // Shift.
+        requireEmployee(actor.getId());
+        assertEligibleToPunch(actor);
 
         // Looked up by "not yet checked out" regardless of review status, not by today's
         // work_date — a web clock-in from before midnight (shift crosses into the next day) can
@@ -379,13 +417,21 @@ public class WebClockInService {
         // resolveZone.
         LocalDateTime now = LocalDateTime.now(resolveZone(record, actor.getId(), clientTimezone));
 
-        // Past its own workday/grace window (shiftDayCutover, e.g. 7:00 AM the next calendar day)
-        // — checked purely against THIS Web session's own workDate, deliberately not coupled to
+        // Resolved against THIS RECORD's own snapshotted Shift (never the employee's current
+        // one) — see AttendanceInterpretationService.interpretExistingSession. A legacy
+        // pre-snapshot record ({@code shiftId == null}) can't be safely evaluated for either
+        // question below — treated conservatively as "not past its workday" (don't block) and
+        // "uncapped" (see closeSession's identical null-cutoff handling in AttendanceService),
+        // rather than guessing using the employee's current Shift.
+        AttendanceInterpretation interpretation = attendanceInterpretationService.interpretExistingSession(record, now);
+
+        // Past its own logical workday (per ShiftDayPolicy.shiftDayOf, shift-relative) — checked
+        // purely against THIS Web session's own workDate, deliberately not coupled to
         // the shared Attendance.status field (which is now reserved for the normal session's own
         // Missing-Check-Out flagging — see AttendanceService.flagMissingCheckoutIfStale): an
         // unrelated stale normal session sharing the same day must never block a legitimate,
         // timely Web Clock-Out, and vice versa.
-        if (shiftDayOf(now).isAfter(req.getWorkDate())) {
+        if (!interpretation.isLegacyUnresolved() && interpretation.getWorkDate().isAfter(req.getWorkDate())) {
             throw new IllegalArgumentException(
                     "This session is past its check-out window. Please submit a regularization request.");
         }
@@ -396,7 +442,7 @@ public class WebClockInService {
         // checkedOutAt itself: the actual click time (`now`) is always what gets stored — shift
         // timing only feeds the capped aggregate below (recomputeCombinedWorkedMinutes's capAt),
         // never the timestamp. Mirrors AttendanceService.checkOut/closeSession.
-        LocalDateTime cutoff = shiftEndCutoff(actor.getId(), req.getWorkDate());
+        LocalDateTime cutoff = interpretation.isLegacyUnresolved() ? null : interpretation.getCheckoutCutoff();
 
         String before = auditSnapshot.toJson(Map.of("checkedOutAt", "null"));
         req.setCheckedOutAt(now);
@@ -415,9 +461,11 @@ public class WebClockInService {
         // side's own staleness detection is left alone, not silently overwritten by this
         // unrelated Web checkout. And per AttendanceService.closeSession's identical rule, a
         // Web Clock-Out before the shift's own natural end (cutoff) is a resumable break, not the
-        // day's final word — HALF_DAY is only finalized once the shift has actually ended.
-        if (!STATUS_MISSING_CHECKOUT.equals(record.getStatus()) && !now.isBefore(cutoff)) {
-            record.setStatus(workedMinutes < attendanceProps.getHalfDayMaxHours() * 60
+        // day's final word — HALF_DAY is only finalized once the shift has actually ended. A
+        // null cutoff (legacy pre-snapshot record) is never finalized here either — see
+        // AttendanceService.closeSession's identical null-cutoff handling.
+        if (!STATUS_MISSING_CHECKOUT.equals(record.getStatus()) && cutoff != null && !now.isBefore(cutoff)) {
+            record.setStatus(workedMinutes < attendanceRulesService.getHalfDayMaxHours() * 60
                     ? STATUS_HALF_DAY
                     : (record.getLateByMinutes() > 0 ? STATUS_LATE : STATUS_PRESENT));
         }
@@ -439,9 +487,13 @@ public class WebClockInService {
      * on WebClockInRequest.requestedCheckIn/checkedOutAt, never by mutating the shared row. If no
      * row exists yet for the day, THIS is the day's first-ever punch (from either source) —
      * create it and compute lateness/status/penalty exactly as AttendanceService.checkIn would,
-     * so a remote-only day is still evaluated for lateness like any other.
+     * so a remote-only day is still evaluated for lateness like any other. {@code interpretation}
+     * is the SAME {@link AttendanceInterpretation} {@link #submit} already resolved this employee's
+     * current Shift against — reused here rather than re-derived, so the row's snapshotted
+     * {@code shiftId} and its lateness are guaranteed consistent with each other.
      */
-    private void applyCheckInToAttendance(WebClockInRequest req, String resolvedZoneId) {
+    private void applyCheckInToAttendance(WebClockInRequest req, String resolvedZoneId, Employee employee,
+                                           AttendanceInterpretation interpretation) {
         boolean alreadyExists = attendanceRepository
                 .findByEmployeeUserIdAndWorkDate(req.getEmployeeUserId(), req.getWorkDate()).isPresent();
         if (alreadyExists) {
@@ -453,28 +505,46 @@ public class WebClockInService {
                 .checkInAt(req.getRequestedCheckIn())
                 .sessionStartedAt(req.getRequestedCheckIn())
                 .timezone(resolvedZoneId)
+                .status(interpretation.getIsLate() ? STATUS_LATE : STATUS_PRESENT)
+                .lateByMinutes(interpretation.getLateByMinutes())
+                // Snapshotted once, here, at creation — never updated again — see
+                // AttendanceInterpretationService.interpretExistingSession.
+                .shiftId(interpretation.getShiftId())
                 .build();
         record.setSource(SOURCE_WEB_REMOTE);
-        recomputeDerivedFields(record, req.getEmployeeUserId());
-        Attendance saved = attendanceRepository.save(record);
+        Attendance saved;
+        try {
+            // Flushed immediately so the UNIQUE(employee_user_id, work_date) constraint — the
+            // last line of defense against two near-simultaneous fresh check-ins (a Web Clock-In
+            // racing another Web Clock-In, or a normal Check-In) both passing the alreadyExists
+            // check above before either commits — is hit right here rather than surfacing later
+            // as an unhandled 500.
+            saved = attendanceRepository.saveAndFlush(record);
+        } catch (DataIntegrityViolationException e) {
+            throw new IllegalArgumentException("You have already checked in today");
+        }
 
         // Same penalty as AttendanceService.checkIn — a fresh late arrival costs a half-day every
         // 3rd time in the month, regardless of whether the check-in was in-office or remote.
-        if (STATUS_LATE.equals(saved.getStatus())) {
-            employeeRepository.findById(req.getEmployeeUserId())
-                    .ifPresent(employee -> latePenaltyService.applyIfDue(employee, req.getWorkDate()));
+        if (STATUS_LATE.equals(saved.getStatus()) && employee != null) {
+            latePenaltyService.applyIfDue(employee, req.getWorkDate());
         }
     }
 
     /**
      * A Web Clock-In session left open past its own workday/grace window (a forgotten Web
      * Clock-Out from days ago) — auto-closed at its own natural shift end (same cap a real Web
-     * Clock-Out would apply, see shiftEndCutoff) rather than left open forever blocking a fresh
-     * Web Clock-In. Recomputes the day's combined worked minutes afterward so the auto-close is
-     * correctly reflected in the total.
+     * Clock-Out would apply, see {@link ShiftDayPolicy#shiftEndAt}) rather than left open forever
+     * blocking a fresh Web Clock-In. Recomputes the day's combined worked minutes afterward so the
+     * auto-close is correctly reflected in the total. {@code interpretation} is the SAME
+     * {@link AttendanceInterpretation} {@link #submit} already resolved {@code staleReqAttendance}'s
+     * own snapshotted Shift against (never the employee's current one) — reused here rather than
+     * re-derived. Only ever called once {@code submit} has already confirmed it's resolvable
+     * (non-legacy).
      */
-    private void autoCloseStaleWebSession(WebClockInRequest staleReq, Attendance staleReqAttendance) {
-        LocalDateTime cutoff = shiftEndCutoff(staleReq.getEmployeeUserId(), staleReq.getWorkDate());
+    private void autoCloseStaleWebSession(WebClockInRequest staleReq, Attendance staleReqAttendance,
+                                           AttendanceInterpretation interpretation) {
+        LocalDateTime cutoff = interpretation.getCheckoutCutoff();
         staleReq.setCheckedOutAt(cutoff);
         webClockInRepository.save(staleReq);
         if (staleReqAttendance != null) {
@@ -487,35 +557,25 @@ public class WebClockInService {
     }
 
     /**
-     * Natural end of the shift covering workDate, crossing into the next calendar day when the
-     * configured end time is earlier than the start (e.g. 3:30 PM - 12:30 AM) — see
-     * AttendanceService.shiftEndCutoff.
-     */
-    private LocalDateTime shiftEndCutoff(UUID employeeUserId, LocalDate workDate) {
-        LocalTime shiftStart = resolveShiftStart(employeeUserId);
-        LocalTime shiftEnd = employeeRepository.findById(employeeUserId)
-                .map(Employee::getShift)
-                .map(Shift::getEndTime)
-                .orElse(null);
-        if (shiftEnd == null) {
-            return LocalDateTime.of(workDate, shiftStart).plusHours(24);
-        }
-        LocalDate endDate = !shiftEnd.isAfter(shiftStart) ? workDate.plusDays(1) : workDate;
-        return LocalDateTime.of(endDate, shiftEnd);
-    }
-
-    /**
-     * The employee's configured Location.timezone, falling back to the global business zone —
-     * mirrors AttendanceService.zoneIdFor. Used only when there's no browser-reported (or
+     * Precedence, highest first: the employee's own Employee.timezone (Admin-set, authoritative
+     * once present), then their assigned Location.timezone, then the org-wide default
+     * (AttendanceRulesService.getDefaultZoneId(), Admin-configurable — see V167). Mirrors
+     * AttendanceService.zoneIdFor exactly. Used only when there's no browser-reported (or
      * session-locked) zone to prefer — see resolveZone.
      */
     private ZoneId zoneIdFor(UUID employeeUserId) {
-        return employeeRepository.findById(employeeUserId)
-                .map(Employee::getLocation)
-                .map(Location::getTimezone)
-                .filter(tz -> tz != null && !tz.isBlank())
-                .map(ZoneId::of)
-                .orElseGet(() -> ZoneId.of(attendanceProps.getZone()));
+        Employee employee = employeeRepository.findById(employeeUserId).orElse(null);
+        if (employee == null) {
+            return attendanceRulesService.getDefaultZoneId();
+        }
+        String employeeTimezone = employee.getTimezone();
+        if (employeeTimezone != null && !employeeTimezone.isBlank()) {
+            return ZoneId.of(employeeTimezone);
+        }
+        String locationTimezone = employee.getLocation() != null ? employee.getLocation().getTimezone() : null;
+        return (locationTimezone != null && !locationTimezone.isBlank())
+                ? ZoneId.of(locationTimezone)
+                : attendanceRulesService.getDefaultZoneId();
     }
 
     /**
@@ -534,13 +594,12 @@ public class WebClockInService {
     }
 
     /**
-     * Zone for a fresh Web Clock-In click: ALWAYS the employee's own configured
-     * Location.timezone (falling back only to the global business zone if unconfigured).
-     * {@code clientTimezone} (the browser-reported zone, still sent by the frontend on every Web
-     * Clock action) is deliberately never consulted — per explicit requirement, the employee's
-     * assigned Location timezone is the ONLY source of truth for their attendance clock, and Web
-     * Clock must use the exact same source as normal Check-In/Check-Out, never a different one.
-     * Mirrors AttendanceService.resolveZone(String, Employee).
+     * Zone for a fresh Web Clock-In click: ALWAYS resolved server-side via {@link #zoneIdFor}'s
+     * precedence chain. {@code clientTimezone} (the browser-reported zone, still sent by the
+     * frontend on every Web Clock action) is deliberately never consulted — per explicit
+     * requirement, the employee's own configured timezone is the ONLY authoritative source for
+     * their attendance clock, and Web Clock must use the exact same source as normal
+     * Check-In/Check-Out, never a different one. Mirrors AttendanceService.resolveZone(String, Employee).
      */
     private ZoneId resolveZone(String clientTimezone, UUID employeeUserId) {
         return zoneIdFor(employeeUserId);
@@ -559,60 +618,10 @@ public class WebClockInService {
         return stored != null ? stored : zoneIdFor(employeeUserId);
     }
 
-    /**
-     * The shift-day (work_date) a given instant belongs to — mirrors
-     * AttendanceService.shiftDayOf. The shift runs 3:30 PM - 12:30 AM, crossing midnight;
-     * anything from midnight up to shiftDayCutover (7:00 AM by default) still belongs to the
-     * previous calendar date's shift-day.
-     */
-    private LocalDate shiftDayOf(LocalDateTime dateTime) {
-        return dateTime.toLocalTime().isBefore(attendanceProps.getShiftDayCutover())
-                ? dateTime.toLocalDate().minusDays(1)
-                : dateTime.toLocalDate();
-    }
-
     private UUID resolveAssignedApprover(UUID employeeId) {
         return historyRepository.findByEmployeeUserIdAndEffectiveToIsNull(employeeId)
                 .map(EmployeeManagerHistory::getManagerUserId)
                 .orElse(null);
-    }
-
-    /** The employee's actually-assigned Shift start (ONEHR-108) if present, else the global fallback. */
-    private LocalTime resolveShiftStart(UUID employeeUserId) {
-        return employeeRepository.findById(employeeUserId)
-                .map(Employee::getShift)
-                .map(Shift::getStartTime)
-                .orElse(attendanceProps.getShiftStart());
-    }
-
-    /**
-     * Mirrors AttendanceService.checkIn's identical two-independent-things split (see its own
-     * doc comment): {@code isLate}/status is grace-aware (deadline = shiftStart + grace), while
-     * {@code lateByMinutes} is the raw, no-forgiveness minutes past shiftStart itself shown to
-     * the employee — these must NOT collapse into the same reference point, or a check-in one
-     * second past the deadline would under-report how late it actually was by the whole grace
-     * window. Both are compared as full date-aware instants (shiftStart anchored to the record's
-     * own workDate — the already-resolved shift-day), NOT bare LocalTime-of-day: a pure LocalTime
-     * comparison silently breaks the moment a check-in crosses midnight relative to an overnight
-     * shift (e.g. a 20:30-05:30 shift's 1:11 AM check-in is genuinely hours late, but 01:11 as a
-     * bare LocalTime reads as "before" 20:30).
-     */
-    private void recomputeDerivedFields(Attendance record, UUID employeeUserId) {
-        LocalDateTime shiftStartAt = LocalDateTime.of(record.getWorkDate(), resolveShiftStart(employeeUserId));
-        LocalDateTime deadlineAt = shiftStartAt.plusMinutes(attendanceProps.getLateGraceMinutes());
-        LocalDateTime checkInAt = record.getCheckInAt();
-        boolean isLate = checkInAt.isAfter(deadlineAt);
-        int lateByMinutes = checkInAt.isAfter(shiftStartAt)
-                ? (int) Math.ceil(Duration.between(shiftStartAt, checkInAt).getSeconds() / 60.0)
-                : 0;
-        record.setLateByMinutes(lateByMinutes);
-        record.setWorkedMinutes(null);
-        record.setCheckOutAt(null);
-        // Status/penalty-relevant lateness is grace-aware (isLate) — matches AttendanceService
-        // .checkIn: a check-in that's late by less than the grace window must not count as an
-        // official LATE arrival just because lateByMinutes (its own no-forgiveness display
-        // value) is nonzero.
-        record.setStatus(isLate ? STATUS_LATE : STATUS_PRESENT);
     }
 
     private WebClockInRequest requirePending(UUID requestId) {
@@ -648,6 +657,31 @@ public class WebClockInService {
     private User requireActor(String email) {
         return userRepository.findByEmail(email)
                 .orElseThrow(() -> new IllegalStateException("Actor not found"));
+    }
+
+    /**
+     * Mirrors AttendanceService.resolveEmployee's exact message — a missing Employee profile is a
+     * distinct, clearer failure than ShiftDayPolicy's own (separate) "no assigned Shift" one, and
+     * must never be allowed to surface as that more confusing error further down this call.
+     */
+    private Employee requireEmployee(UUID userId) {
+        return employeeRepository.findById(userId)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "No employee profile found for this account. Contact HR to complete your profile."));
+    }
+
+    /**
+     * Gate for self-service Web Clock-In/Out ONLY — mirrors
+     * AttendanceService.assertEligibleToPunch exactly (same duplication precedent already
+     * established for resolveZone/zoneIdFor in this class). Takes the already-loaded actor
+     * User directly rather than re-deriving it from the Employee, avoiding a redundant lazy-load
+     * of the same row.
+     */
+    private void assertEligibleToPunch(User actor) {
+        if (!actor.isActive() || actor.getDeletedAt() != null) {
+            throw new IllegalArgumentException(
+                    "Your account is inactive. Contact HR if you believe this is an error.");
+        }
     }
 
     private String employeeName(UUID userId) {

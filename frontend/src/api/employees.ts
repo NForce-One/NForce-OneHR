@@ -33,6 +33,8 @@ export interface EmployeeRecord {
   employmentType: string;
   workMode: string;
   joiningDate: string;
+  /** Admin-set IANA zone id (e.g. "Asia/Kolkata"), or null to fall back to Location then the org default. */
+  timezone: string | null;
   active: boolean;
   currentManager: ManagerRef | null;
   tempPassword?: string;
@@ -51,6 +53,8 @@ export interface CreateEmployeePayload {
   workMode?: string;
   joiningDate: string;
   managerId?: string;
+  /** Admin-only. IANA zone id, e.g. "Asia/Kolkata"; omit/blank to leave unset (falls back to Location, then the org default). */
+  timezone?: string;
 }
 
 export interface UpdateEmployeePayload {
@@ -64,6 +68,8 @@ export interface UpdateEmployeePayload {
   workMode?: string;
   /** Required (true) to change department/designation/employmentType on a deactivated employee. */
   confirmInactiveEdit?: boolean;
+  /** Admin-only. null/omit = leave unchanged; "" = clear it; else = set it. */
+  timezone?: string;
 }
 
 export interface CreateUserPayload extends CreateEmployeePayload {
@@ -83,6 +89,8 @@ export interface UpdateUserPayload {
   managerId?: string;
   /** Required (true) to change role/manager/department/designation/employmentType on a deactivated user. */
   confirmInactiveEdit?: boolean;
+  /** Admin-only (this endpoint is Super-Admin-only). null/omit = leave unchanged; "" = clear it; else = set it. */
+  timezone?: string;
 }
 
 export interface UpdateJoiningDatePayload {
