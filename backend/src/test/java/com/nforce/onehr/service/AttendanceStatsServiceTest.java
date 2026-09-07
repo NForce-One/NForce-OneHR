@@ -16,7 +16,6 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.time.LocalDate;
-import java.time.LocalTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,8 +44,9 @@ class AttendanceStatsServiceTest {
     private final String employeeEmail = "employee@test.com";
     private final LocalDate day1 = LocalDate.of(2026, 8, 3);
     private final LocalDate day2 = LocalDate.of(2026, 8, 4);
-    private final Shift nineHourShift = Shift.builder().id(UUID.randomUUID()).name("Regular")
-            .startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build();
+    // Timing is irrelevant here — AttendanceStatsService never reads it, only whether a shift is
+    // assigned at all (expectedWorkHoursService, mocked below, supplies the actual figures).
+    private final Shift nineHourShift = Shift.builder().id(UUID.randomUUID()).name("Regular").build();
 
     @BeforeEach
     void setUp() {

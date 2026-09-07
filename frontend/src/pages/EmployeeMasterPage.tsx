@@ -141,6 +141,7 @@ function EditModal({ emp, onClose, onUpdated, token }: { emp: EmployeeRecord; on
     locationId: emp.locationId ?? undefined,
     employmentType: emp.employmentType,
     workMode: emp.workMode ?? 'ONSITE',
+    timezone: emp.timezone ?? '',
   });
   const [opts, setOpts] = useState<{ businessUnits: any[]; departments: any[]; designations: any[]; locations: any[] }>({ businessUnits: [], departments: [], designations: [], locations: [] });
   const [submitting, setSubmitting] = useState(false);
@@ -214,6 +215,33 @@ function EditModal({ emp, onClose, onUpdated, token }: { emp: EmployeeRecord; on
                 onChange={id => setForm(f => ({ ...f, locationId: id }))}
                 token={token}
               />
+            </Field>
+          </div>
+          <div style={{ gridColumn: '1/-1' }}>
+            <Field label="Timezone (overrides Location)">
+              <input
+                style={inputStyle}
+                value={form.timezone ?? ''}
+                onChange={e => setForm(f => ({ ...f, timezone: e.target.value }))}
+                placeholder="e.g. Asia/Kolkata"
+                list="nf-employee-iana-timezones"
+              />
+              <datalist id="nf-employee-iana-timezones">
+                <option value="Asia/Kolkata" />
+                <option value="America/New_York" />
+                <option value="America/Los_Angeles" />
+                <option value="America/Chicago" />
+                <option value="Europe/London" />
+                <option value="Australia/Sydney" />
+                <option value="Asia/Singapore" />
+                <option value="Asia/Dubai" />
+                <option value="Pacific/Auckland" />
+                <option value="Asia/Kathmandu" />
+                <option value="Asia/Chittagong" />
+              </datalist>
+              <span style={{ fontSize: 11, color: 'var(--txt-mut)', marginTop: 3, display: 'block' }}>
+                IANA zone id — takes precedence over this employee's Location timezone for their check-in/out, lateness, and shift-day calculations. Leave blank to inherit from Location.
+              </span>
             </Field>
           </div>
           <div style={{ gridColumn: '1/-1', fontSize: 11, color: 'var(--txt-dim)' }}>

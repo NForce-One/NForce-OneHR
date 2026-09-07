@@ -52,19 +52,43 @@ public class Attendance {
     @Builder.Default
     private String source = "SYSTEM";
 
-    // IANA zone id (e.g. "Australia/Adelaide") the employee's browser/device reported at
-    // Check-In / Web Clock-In — locked in for the whole session so Check-Out, worked-minutes,
-    // and shift-day/grace-window math all stay internally consistent even if the browser's
-    // reported zone later changes (e.g. travel, DST). Null for records predating this column,
-    // or where the browser didn't supply one — see AttendanceService.resolveZone.
+    // IANA zone id (e.g. "Asia/Kolkata") resolved server-side at Check-In / Web Clock-In — via
+    // the employee's own Employee.timezone, then their Location.timezone, then the org-wide
+    // default (see AttendanceService.zoneIdFor's precedence chain) — locked in for the whole
+    // session so Check-Out, worked-minutes, and shift-day/grace-window math all stay internally
+    // consistent even if the employee's configured timezone later changes (e.g. a relocation).
+    // The browser's reported zone is NEVER the source of this value. Null for records predating
+    // this column.
     @Column(name = "timezone", length = 50)
     private String timezone;
+
+    // Raw UUID, not a @ManyToOne (same convention as employeeUserId above) — the Shift that was
+    // in effect when this row was FIRST created (normal Check-In, Web Clock-In, or a
+    // Regularization-created row), set once and never updated afterward. Null for rows created
+    // before this column existed ("legacy" rows — see AttendanceInterpretationService's
+    // LEGACY_UNRESOLVED handling) or, in principle, for a row predating any Shift assignment;
+    // never silently backfilled from the employee's current Shift. This is what lets an
+    // already-open session or an already-created historical record keep its own original Shift
+    // context even after the employee is reassigned to a different Shift — see V163's migration
+    // comment and AttendanceInterpretationService.
+    @Column(name = "shift_id")
+    private UUID shiftId;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
     @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
+
+    // Concurrent Check-Out (or a concurrent Regularization approval, or the stale-session
+    // sweeper racing a live user action) can otherwise read-modify-write this same row with
+    // nothing coordinating between them — the loser's save() would silently overwrite the
+    // winner's checkOutAt/workedMinutes/status with stale values. @Version turns that into an
+    // ObjectOptimisticLockingFailureException (translated to a clean 409 by
+    // GlobalExceptionHandler) instead of a silently wrong attendance record. Mirrors
+    // LeaveBalance's identical fix (V153) for the same class of read-modify-write race.
+    @Version
+    private Long version;
 
     @PrePersist
     protected void onCreate() {

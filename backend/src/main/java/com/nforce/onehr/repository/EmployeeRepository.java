@@ -79,6 +79,9 @@ public interface EmployeeRepository extends JpaRepository<Employee, UUID>, JpaSp
     @Query("SELECT COUNT(e) FROM Employee e JOIN e.user u WHERE e.shift.id = :id AND u.deletedAt IS NULL")
     long countByShiftId(@Param("id") UUID id);
 
+    @Query("SELECT COUNT(e) FROM Employee e JOIN e.user u WHERE e.weeklyOffPolicy.id = :id AND u.deletedAt IS NULL")
+    long countByWeeklyOffPolicyId(@Param("id") UUID id);
+
     // Batch equivalents of the 4 single-id counts above, one GROUP BY query each instead of one
     // COUNT query per row — backs OrgService's listDepartments/listDesignations/listLocations/
     // listShifts, which used to issue N extra round trips for N master-data rows on every
@@ -99,6 +102,9 @@ public interface EmployeeRepository extends JpaRepository<Employee, UUID>, JpaSp
 
     @Query("SELECT e.shift.id, COUNT(e) FROM Employee e JOIN e.user u WHERE e.shift IS NOT NULL AND u.deletedAt IS NULL GROUP BY e.shift.id")
     List<Object[]> countGroupedByShiftId();
+
+    @Query("SELECT e.weeklyOffPolicy.id, COUNT(e) FROM Employee e JOIN e.user u WHERE e.weeklyOffPolicy IS NOT NULL AND u.deletedAt IS NULL GROUP BY e.weeklyOffPolicy.id")
+    List<Object[]> countGroupedByWeeklyOffPolicyId();
 
     // Backs the Shifts master-data "Employees" drill-down (Organization Masters → Shifts) —
     // same non-deleted scoping as countByShiftId, with department fetched to avoid an N+1.
@@ -123,7 +129,7 @@ public interface EmployeeRepository extends JpaRepository<Employee, UUID>, JpaSp
     List<Employee> findAllByIdWithDepartment(@Param("ids") Collection<UUID> ids);
 
     // Backs ShiftSeedCorrector's startup backfill for employees created after V95's one-time
-    // "assign everyone the Regular Shift" migration ran (e.g. anyone onboarded since).
+    // "assign everyone the default shift" migration ran (e.g. anyone onboarded since).
     List<Employee> findByShiftIsNull();
 
     // Backs the Policy List's "Employee Count" column (Section 5) — the legacy-FK-only half of
@@ -193,4 +199,8 @@ public interface EmployeeRepository extends JpaRepository<Employee, UUID>, JpaSp
     @Modifying
     @Query("UPDATE Employee e SET e.shift = NULL WHERE e.shift.id = :id")
     void clearShiftReferences(@Param("id") UUID id);
+
+    @Modifying
+    @Query("UPDATE Employee e SET e.weeklyOffPolicy = NULL WHERE e.weeklyOffPolicy.id = :id")
+    void clearWeeklyOffPolicyReferences(@Param("id") UUID id);
 }

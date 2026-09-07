@@ -59,6 +59,8 @@ class PenalizationPolicyProductionFlowTest {
     @Mock private NotificationService notificationService;
     @Mock private EmployeeService employeeService;
     @Mock private AttendancePenaltyService attendancePenaltyService;
+    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private ShiftVersionResolver shiftVersionResolver;
 
     private ExceptionService exceptionService;
 
@@ -83,17 +85,21 @@ class PenalizationPolicyProductionFlowTest {
         lenient().when(allocationRepository.findEffectiveAt(any(), any())).thenReturn(List.of());
         PenalizationPolicyResolutionService policyResolutionService =
                 new PenalizationPolicyResolutionService(versionRepository, allocationRepository, penalizationPolicyService, employeeRepository, attendanceProperties);
-        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository);
+        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
         WorkHoursShortageCalculationService workHoursShortageCalculationService =
-                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService);
+                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
+        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
+                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, penaltyEvaluationService,
                 workingDayService, holidayRepository, policyResolutionService, expectedWorkHoursService,
-                workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService);
+                workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService,
+                shiftDayPolicy, shiftVersionResolver);
 
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
-        lenient().when(attendanceProperties.getShiftStart()).thenReturn(LocalTime.of(9, 30));
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeId));
         lenient().when(userRepository.findByEmail(hrEmail)).thenReturn(Optional.of(hrUser()));
         lenient().when(leaveRequestRepository.findByEmployeeUserIdInAndStatusAndStartDateLessThanEqualAndEndDateGreaterThanEqual(
@@ -110,8 +116,14 @@ class PenalizationPolicyProductionFlowTest {
         // and its shortage/NO_ATTENDANCE branches never fire (workedMinutes is left null on every
         // fixture Attendance and no default policy is configured), leaving this test class free to
         // focus purely on the LATE_ARRIVAL flow it was written for.
+        Shift shift = Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(true).build();
         lenient().when(employeeRepository.findAllByIdWithScheduleDetails(any()))
-                .thenReturn(List.of(Employee.builder().userId(employeeId).build()));
+                .thenReturn(List.of(Employee.builder().userId(employeeId).shift(shift).build()));
+        // shiftDayPolicy.resolveShiftStart(...) (LATE_ARRIVAL's "expected" start time) needs this
+        // employee's Shift to resolve to *some* ShiftVersion rather than throw — the exact
+        // start/end values don't matter to any assertion in this class.
+        lenient().when(shiftVersionResolver.resolve(any(), any()))
+                .thenReturn(ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build());
     }
 
     private User hrUser() {

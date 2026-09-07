@@ -5,6 +5,7 @@ import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.entity.PenalizationPolicyVersion;
 import com.nforce.onehr.entity.Shift;
+import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.repository.AttendanceRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,12 +43,32 @@ class WorkHoursShortageCalculationServiceTest {
     private final UUID employeeId = UUID.randomUUID();
     private final LocalDate monday = LocalDate.of(2026, 8, 3);
     private final LocalDate tuesday = monday.plusDays(1);
-    private final Shift nineToSix = Shift.builder().id(UUID.randomUUID()).name("Regular")
-            .startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build();
+    // A minimal, real (not mocked) Shift Version resolver — single-version-per-shift, in-memory
+    // "latest effectiveFrom <= day" lookup, mirroring ShiftVersionRepository's own query semantics.
+    private final List<ShiftVersion> shiftVersions = new java.util.ArrayList<>();
+    private final ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
+        @Override
+        public ShiftVersion resolve(Shift shift, LocalDate workDate) {
+            return shiftVersions.stream()
+                    .filter(v -> v.getShift().getId().equals(shift.getId()))
+                    .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
+                    .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                    .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
+        }
+    };
+
+    /** Builds a Shift (with a real id) and registers a single version effective from the dawn of time. */
+    private Shift shift(String name, LocalTime start, LocalTime end) {
+        Shift s = Shift.builder().id(UUID.randomUUID()).name(name).build();
+        shiftVersions.add(ShiftVersion.builder().shift(s).startTime(start).endTime(end).effectiveFrom(LocalDate.MIN).build());
+        return s;
+    }
+
+    private final Shift nineToSix = shift("Regular", LocalTime.of(9, 0), LocalTime.of(18, 0));
 
     @BeforeEach
     void setUp() {
-        service = new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService);
+        service = new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
     }
 
     private Employee employeeWithShift(Shift shift) {
@@ -222,8 +243,7 @@ class WorkHoursShortageCalculationServiceTest {
 
     @Test
     void excludeOutsideShift_overnightShift_windowCrossesMidnightCorrectly() {
-        Shift overnight = Shift.builder().id(UUID.randomUUID()).name("Night")
-                .startTime(LocalTime.of(22, 0)).endTime(LocalTime.of(6, 0)).build();
+        Shift overnight = shift("Night", LocalTime.of(22, 0), LocalTime.of(6, 0));
         Employee employee = employeeWithShift(overnight);
         // Punched in at 21:00 (1h early) through 07:00 next day (1h late) — spans midnight.
         Attendance record = Attendance.builder().employeeUserId(employeeId).workDate(monday)

@@ -11,4 +11,6 @@ import java.util.UUID;
 public interface WeeklyOffPolicyRepository extends JpaRepository<WeeklyOffPolicy, UUID> {
 
     Optional<WeeklyOffPolicy> findByName(String name);
+
+    boolean existsByNameIgnoreCase(String name);
 }

@@ -49,8 +49,10 @@ class ExceptionServiceTest {
     @Mock private AttendancePolicyEngine attendancePolicyEngine;
     @Mock private AttendancePenaltyRepository attendancePenaltyRepository;
     @Mock private AttendancePenaltyService attendancePenaltyService;
+    @Mock private ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private ShiftVersionResolver shiftVersionResolver;
 
-    @InjectMocks private ExceptionService exceptionService;
+    private ExceptionService exceptionService;
 
     private final UUID employeeId = UUID.randomUUID();
     private final UUID managerId = UUID.randomUUID();
@@ -69,10 +71,24 @@ class ExceptionServiceTest {
     @BeforeEach
     void setUp() {
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
-        lenient().when(attendanceProperties.getShiftStart()).thenReturn(LocalTime.of(9, 30));
+        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                ShiftWeeklyOffRules.builder().maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
+                attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
+                regularizationRequestRepository, attendanceProperties, emailService, attendancePenaltyEvaluationService,
+                workingDayService, holidayRepository, penalizationPolicyResolutionService, expectedWorkHoursService,
+                workHoursShortageCalculationService, attendancePolicyEngine, attendancePenaltyRepository,
+                attendancePenaltyService, shiftDayPolicy, shiftVersionResolver);
         // Default: employeeId is the only account holding the EMPLOYEE role — matches
         // EmployeeService.listEmployees()'s own definition of who counts as an employee.
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeId));
+        // Default: the LATE_ARRIVAL path resolves each employee's shift-relative "expected"
+        // start time via shiftDayPolicy.resolveShiftStart(...) — stubWorkingDays() below gives
+        // that employee a real Shift, so this just needs to resolve to *some* ShiftVersion
+        // rather than throw. The exact start/end values don't matter to any assertion here.
+        lenient().when(shiftVersionResolver.resolve(any(), any()))
+                .thenReturn(ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build());
         lenient().when(leaveRequestRepository.findByEmployeeUserIdInAndStatusAndStartDateLessThanEqualAndEndDateGreaterThanEqual(
                 any(), anyString(), any(), any())).thenReturn(List.of());
         lenient().when(attendanceExceptionRepository.findByEmployeeUserIdInAndExceptionDateBetweenOrderByExceptionDateDescCreatedAtDesc(
@@ -88,8 +104,9 @@ class ExceptionServiceTest {
      * {@code detectNoAttendanceAndShortage}'s own, unrelated NO_ATTENDANCE detection.
      */
     private void stubWorkingDays(LocalDate... workDates) {
+        Shift shift = Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(true).build();
         when(employeeRepository.findAllByIdWithScheduleDetails(any()))
-                .thenReturn(List.of(Employee.builder().userId(employeeId).build()));
+                .thenReturn(List.of(Employee.builder().userId(employeeId).shift(shift).build()));
         when(workingDayService.computeExpectedWorkingDaysBulk(anyList(), any(), any()))
                 .thenReturn(java.util.Map.of(employeeId, com.nforce.onehr.dto.attendance.WorkingDaySchedule.builder()
                         .employeeUserId(employeeId).workingDates(Set.of(workDates)).build()));

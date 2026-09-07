@@ -25,8 +25,6 @@ public class AttendanceResponse {
     private Integer workedMinutes;
     private String status;
     private Integer lateByMinutes;
-    /** True once workedMinutes meets app.attendance.full-day-min-hours. Null while still open. */
-    private Boolean fullDay;
     /** SYSTEM for a normal punch, REGULARIZATION if this row came from an approved correction. */
     private String source;
     /** The employee's configured work mode (ONSITE/REMOTE/HYBRID) at the time of the query. */

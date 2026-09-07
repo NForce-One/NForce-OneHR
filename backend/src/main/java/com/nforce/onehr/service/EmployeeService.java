@@ -31,6 +31,7 @@ public class EmployeeService {
     private final DepartmentRepository departmentRepository;
     private final DesignationRepository designationRepository;
     private final LocationRepository locationRepository;
+    private final ShiftRepository shiftRepository;
     private final PasswordEncoder passwordEncoder;
     private final AuditService auditService;
     private final AuditSnapshotSerializer auditSnapshot;
@@ -74,6 +75,7 @@ public class EmployeeService {
                 .employmentType(req.getEmploymentType() != null ? req.getEmploymentType() : "FULL_TIME")
                 .workMode(req.getWorkMode() != null ? req.getWorkMode() : "ONSITE")
                 .joiningDate(req.getJoiningDate())
+                .timezone(normalizeTimezone(req.getTimezone()))
                 .createdBy(actor.getId())
                 .build();
 
@@ -101,6 +103,21 @@ public class EmployeeService {
                 throw new IllegalArgumentException("This location is inactive and cannot be assigned. Choose an active location.");
             emp.setLocation(loc);
         }
+        // CreateEmployeeRequest has no shiftId field to pick a specific shift, so this always
+        // defaults to the organization's default shift, resolved server-side — same default,
+        // same stable-name lookup, same live (never cached) read as
+        // UserManagementService#createUser's identical default. Every employee is a hard invariant
+        // to always have an assigned shift (see ShiftDayPolicy, which throws for a null-shift
+        // employee everywhere), so a missing/deactivated default shift now fails account creation
+        // loudly rather than silently leaving the employee shift-less. OrgService also refuses to
+        // rename/deactivate/delete the default shift itself, so this should be unreachable in
+        // practice — it still must fail clearly if it ever isn't.
+        Shift defaultShift = shiftRepository.findByName(Shift.DEFAULT_SHIFT_NAME)
+                .filter(Shift::isActive)
+                .orElseThrow(() -> new IllegalStateException(
+                        "The organization's default shift ('" + Shift.DEFAULT_SHIFT_NAME + "') is missing or "
+                                + "inactive — an employee cannot be created without a Shift. Contact an administrator."));
+        emp.setShift(defaultShift);
 
         emp = employeeRepository.save(emp);
         leaveService.initializeDefaultBalances(newUser.getId());
@@ -213,6 +230,10 @@ public class EmployeeService {
             }
         }
 
+        if (req.getTimezone() != null) {
+            emp.setTimezone(normalizeTimezone(req.getTimezone()));
+        }
+
         emp = employeeRepository.save(emp);
         String after = auditSnapshot.toJson(employeeSnapshot(emp));
         auditService.log(actor.getId(), "EMPLOYEE_UPDATED", userId, before, after);
@@ -245,7 +266,23 @@ public class EmployeeService {
         snapshot.put("department", emp.getDepartment() != null ? emp.getDepartment().getName() : null);
         snapshot.put("designation", emp.getDesignation() != null ? emp.getDesignation().getTitle() : null);
         snapshot.put("location", emp.getLocation() != null ? emp.getLocation().getName() : null);
+        snapshot.put("timezone", emp.getTimezone());
         return snapshot;
+    }
+
+    /** Blank/null clears the field; otherwise must be a real IANA zone id. */
+    private String normalizeTimezone(String timezone) {
+        if (timezone == null || timezone.isBlank()) {
+            return null;
+        }
+        String trimmed = timezone.trim();
+        try {
+            java.time.ZoneId.of(trimmed);
+        } catch (java.time.DateTimeException e) {
+            throw new IllegalArgumentException(
+                    "'" + trimmed + "' is not a valid IANA timezone id (e.g. Asia/Kolkata, America/New_York)");
+        }
+        return trimmed;
     }
 
     /**
@@ -572,6 +609,7 @@ public class EmployeeService {
                 .employmentType(emp.getEmploymentType())
                 .workMode(emp.getWorkMode())
                 .joiningDate(emp.getJoiningDate())
+                .timezone(emp.getTimezone())
                 .active(user.isActive())
                 .currentManager(manager)
                 .tempPassword(tempPassword)

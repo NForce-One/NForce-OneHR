@@ -1,6 +1,5 @@
 package com.nforce.onehr.service;
 
-import com.nforce.onehr.config.AttendanceProperties;
 import com.nforce.onehr.dto.attendance.CreateRegularizationRequest;
 import com.nforce.onehr.dto.attendance.RegularizationResponse;
 import com.nforce.onehr.entity.Attendance;
@@ -8,6 +7,8 @@ import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.entity.EmployeeManagerHistory;
 import com.nforce.onehr.entity.RegularizationRequest;
 import com.nforce.onehr.entity.Role;
+import com.nforce.onehr.entity.Shift;
+import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.entity.User;
 import com.nforce.onehr.repository.AttendanceRepository;
 import com.nforce.onehr.repository.EmployeeManagerHistoryRepository;
@@ -18,6 +19,7 @@ import com.nforce.onehr.repository.UserRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -28,6 +30,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -54,11 +57,14 @@ class RegularizationServiceTest {
     @Mock private EmployeeRepository employeeRepository;
     @Mock private AuditService auditService;
     @Mock private AuditSnapshotSerializer auditSnapshot;
-    @Mock private AttendanceProperties attendanceProps;
     @Mock private NotificationService notificationService;
     @Mock private ExceptionService exceptionService;
+    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private com.nforce.onehr.repository.AttendanceRulesRepository attendanceRulesRepository;
+    @Mock private ShiftVersionResolver shiftVersionResolver;
+    @Mock private com.nforce.onehr.repository.ShiftRepository shiftRepository;
 
-    @InjectMocks private RegularizationService regularizationService;
+    private RegularizationService regularizationService;
 
     private final UUID employeeId = UUID.randomUUID();
     private final UUID managerId = UUID.randomUUID();
@@ -76,6 +82,9 @@ class RegularizationServiceTest {
     private User hrUser;
     private User strangerUser;
     private User superAdminUser;
+    // employeeId's default assigned Shift (set up below) — a field so individual @Test methods
+    // can reference its id, e.g. to assert a fresh regularization-created row snapshots it.
+    private Shift defaultShift;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -98,7 +107,21 @@ class RegularizationServiceTest {
         lenient().when(userRepository.findById(hrId)).thenReturn(Optional.of(hrUser));
         lenient().when(userRepository.findById(strangerId)).thenReturn(Optional.of(strangerUser));
         lenient().when(userRepository.findById(superAdminId)).thenReturn(Optional.of(superAdminUser));
-        lenient().when(employeeRepository.findById(any())).thenReturn(Optional.empty());
+        // Default: employeeId (the usual regularization subject in this file) resolves to an
+        // Employee with a real assigned Shift, so recomputeDerivedFields' shift-relative timing
+        // never hits the no-shift invariant guard by accident — tests that care about the exact
+        // shift-start value stub shiftVersionResolver.resolve(...) themselves; everything else
+        // just needs this not to throw. Any other employeeId still resolves to empty.
+        defaultShift = Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(true).build();
+        // 15-minute grace matches this file's pre-existing expectations (previously the global
+        // app.attendance.late-grace-minutes stub) — see individual tests' own lateness assertions.
+        ShiftVersion defaultShiftVersion = ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0))
+                .lateGraceMinutes(15).build();
+        lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(defaultShiftVersion);
+        lenient().when(employeeRepository.findById(employeeId))
+                .thenReturn(Optional.of(Employee.builder().userId(employeeId).shift(defaultShift).build()));
+        lenient().when(employeeRepository.findById(argThat(id -> id != null && !id.equals(employeeId))))
+                .thenReturn(Optional.empty());
         lenient().when(regularizationApprovalRepository.findByRequestIdOrderByActionDateDesc(any()))
                 .thenReturn(List.of());
         lenient().when(regularizationRepository.save(any(RegularizationRequest.class)))
@@ -107,12 +130,31 @@ class RegularizationServiceTest {
                     if (r.getId() == null) r.setId(UUID.randomUUID());
                     return r;
                 });
-        lenient().when(attendanceProps.getShiftStart()).thenReturn(LocalTime.of(9, 30));
-        lenient().when(attendanceProps.getLateGraceMinutes()).thenReturn(15);
-        lenient().when(attendanceProps.getHalfDayMaxHours()).thenReturn(4.0);
-        // Matches the system default zone so LocalDate.now(ZoneId.of(...)) in the service
-        // agrees with the plain LocalDate.now() used throughout these tests.
-        lenient().when(attendanceProps.getZone()).thenReturn(java.time.ZoneId.systemDefault().getId());
+        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
+                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        lenient().when(attendanceRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                com.nforce.onehr.entity.AttendanceRules.builder()
+                        .halfDayMaxHours(java.math.BigDecimal.valueOf(4.0))
+                        // Matches the system default zone so LocalDate.now(ZoneId.of(...)) in the
+                        // service agrees with the plain LocalDate.now() used throughout these tests
+                        // (previously attendanceProps.getZone()'s identical stub).
+                        .defaultTimezone(java.time.ZoneId.systemDefault().getId())
+                        .build()));
+        AttendanceRulesService attendanceRulesService = new AttendanceRulesService(attendanceRulesRepository);
+        // Resolves any Shift referenced by an Attendance fixture's own .shiftId(...) — mirrors the
+        // real ShiftRepository for AttendanceInterpretationService.interpretExistingRecordLateness.
+        // Defaults to resolving defaultShift itself (declared just above), since every existing-
+        // record approve() test in this file currently stubs an empty Attendance lookup (always
+        // hitting the brand-new-record/interpretForKnownWorkDate path) rather than an existing one.
+        lenient().when(shiftRepository.findById(defaultShift.getId())).thenReturn(Optional.of(defaultShift));
+        AttendanceInterpretationService attendanceInterpretationService =
+                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+        regularizationService = new RegularizationService(regularizationRepository, regularizationApprovalRepository,
+                attendanceRepository, historyRepository, userRepository, employeeRepository, auditService,
+                auditSnapshot, notificationService, exceptionService, attendanceInterpretationService,
+                attendanceRulesService);
 
         // @Value-injected fields — never populated outside a Spring container.
         Field employeeLookback = RegularizationService.class.getDeclaredField("employeeLookbackDays");
@@ -517,6 +559,217 @@ class RegularizationServiceTest {
                 a.getRequestId().equals(pending.getId()) && a.getActionType().equals("APPROVED")
                         && a.getActionBy().equals(managerId) && "MANAGER".equals(a.getActorRole())));
         verify(auditService).log(managerId, "REGULARIZATION_APPROVED", employeeId);
+    }
+
+    /**
+     * A brand-new Attendance row (no prior punch existed for this date) must snapshot the
+     * employee's CURRENT Shift — there is no prior context to preserve for a date that was never
+     * punched. See AttendanceInterpretationService.interpretForKnownWorkDate.
+     */
+    @Test
+    void approve_createsANewRecord_snapshotsTheEmployeesCurrentShift() {
+        LocalDate date = LocalDate.now();
+        RegularizationRequest pending = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 0)).requestedCheckOut(date.atTime(18, 0))
+                .reason("Missed punch").status("PENDING").build();
+
+        when(userRepository.findByEmail(managerEmail)).thenReturn(Optional.of(managerUser));
+        when(regularizationRepository.findById(pending.getId())).thenReturn(Optional.of(pending));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, date)).thenReturn(Optional.empty());
+        when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        regularizationService.approve(pending.getId(), null, managerEmail);
+
+        verify(attendanceRepository).save(argThat(a -> defaultShift.getId().equals(a.getShiftId())));
+    }
+
+    /**
+     * An EXISTING legacy row (predates the shiftId snapshot column, {@code shiftId == null})
+     * cannot be safely recomputed for lateness — this must fail loudly and explicitly rather than
+     * substitute the employee's current Shift or present a guessed number as reliable. See
+     * AttendanceInterpretationService's own LEGACY_UNRESOLVED handling.
+     */
+    @Test
+    void approve_existingLegacyRecordWithNoShiftSnapshot_throwsRatherThanGuessingLateness() {
+        LocalDate date = LocalDate.now();
+        RegularizationRequest pending = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 5)).requestedCheckOut(date.atTime(18, 0))
+                .reason("Wrong check-in time").status("PENDING").build();
+        Attendance existingLegacyRecord = Attendance.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).workDate(date)
+                .checkInAt(date.atTime(9, 30)).checkOutAt(date.atTime(18, 0))
+                .shiftId(null) // predates the shiftId column
+                .build();
+
+        when(userRepository.findByEmail(managerEmail)).thenReturn(Optional.of(managerUser));
+        when(regularizationRepository.findById(pending.getId())).thenReturn(Optional.of(pending));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, date))
+                .thenReturn(Optional.of(existingLegacyRecord));
+
+        assertThrows(IllegalStateException.class,
+                () -> regularizationService.approve(pending.getId(), null, managerEmail));
+        verify(attendanceRepository, never()).save(any(Attendance.class));
+    }
+
+    /**
+     * Historical Attendance under Shift A, employee since reassigned to Shift B, then this record
+     * is regularization-corrected: lateness must still be computed against Shift A (the record's
+     * own snapshot) — never Shift B, even though {@code employee.getShift()} now returns B. See
+     * AttendanceInterpretationService.interpretExistingRecordLateness.
+     */
+    @Test
+    void approve_correctingAnExistingRecord_usesItsOwnSnapshottedShift_notTheEmployeesCurrentOne() {
+        LocalDate date = LocalDate.now();
+        Shift shiftB = Shift.builder().id(UUID.randomUUID()).name("Day Shift B").active(true).build();
+        ShiftVersion shiftAVersion = ShiftVersion.builder().shift(defaultShift).startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).lateGraceMinutes(15).build();
+        ShiftVersion shiftBVersion = ShiftVersion.builder().shift(shiftB).startTime(LocalTime.of(6, 0)).endTime(LocalTime.of(14, 0)).lateGraceMinutes(15).build();
+        // Overrides setUp()'s blanket any()/any() stub with shift-discriminating behavior — Shift
+        // A and Shift B must resolve to DIFFERENT timings for this test to actually prove which
+        // one governed, rather than passing regardless by coincidence.
+        lenient().when(shiftVersionResolver.resolve(any(), any())).thenAnswer(inv -> {
+            Shift s = inv.getArgument(0);
+            return s.getId().equals(shiftB.getId()) ? shiftBVersion : shiftAVersion;
+        });
+        // Reassigned since this record's date: the CURRENT employee now resolves to Shift B.
+        lenient().when(employeeRepository.findById(employeeId))
+                .thenReturn(Optional.of(Employee.builder().userId(employeeId).shift(shiftB).build()));
+        // Shift A (this record's own snapshot, 9:00-18:00) must still be what's resolved — never Shift B.
+        lenient().when(shiftRepository.findById(defaultShift.getId())).thenReturn(Optional.of(defaultShift));
+
+        RegularizationRequest pending = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 20)).requestedCheckOut(date.atTime(18, 0))
+                .reason("Wrong check-in time").status("PENDING").build();
+        Attendance existingRecord = Attendance.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).workDate(date)
+                .checkInAt(date.atTime(9, 30)).checkOutAt(date.atTime(18, 0))
+                .shiftId(defaultShift.getId())
+                .build();
+
+        when(userRepository.findByEmail(managerEmail)).thenReturn(Optional.of(managerUser));
+        when(regularizationRepository.findById(pending.getId())).thenReturn(Optional.of(pending));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, date))
+                .thenReturn(Optional.of(existingRecord));
+        when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        regularizationService.approve(pending.getId(), null, managerEmail);
+
+        // 9:20 is BEFORE Shift A's 9:00+15min-grace deadline... use the actual configured grace
+        // (15 in this test's setUp) — 9:20 is 20 minutes past 9:00, past the 15-minute grace, so
+        // this should be LATE under Shift A. Under Shift B (6:00-14:00) it would be over 3 hours
+        // late instead — the shiftId snapshot (defaultShift, 9:00 start) is what must govern.
+        assertEquals(defaultShift.getId(), existingRecord.getShiftId(), "existing record's shiftId must never be replaced");
+        assertEquals("LATE", existingRecord.getStatus());
+    }
+
+    // ── Phase 0.1: before/after Attendance audit snapshot on approve() ───────
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void approve_correctingAnExistingRecord_capturesTheCompleteBeforeAndAfterAttendanceState_includingSource() {
+        LocalDate date = LocalDate.now();
+        RegularizationRequest pending = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 20)).requestedCheckOut(date.atTime(18, 0))
+                .reason("Wrong check-in time").status("PENDING").build();
+        // The record's ORIGINAL state before correction — source SYSTEM (a normal punch), status
+        // PRESENT — is exactly what must be captured in the "before" snapshot, since approve()'s
+        // own record.setSource(SOURCE_REGULARIZATION) is about to overwrite it.
+        Attendance existingRecord = Attendance.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).workDate(date)
+                .checkInAt(date.atTime(9, 30)).checkOutAt(date.atTime(18, 0))
+                .status("PRESENT").lateByMinutes(15).workedMinutes(510).source("SYSTEM")
+                .shiftId(defaultShift.getId())
+                .build();
+
+        when(userRepository.findByEmail(managerEmail)).thenReturn(Optional.of(managerUser));
+        when(regularizationRepository.findById(pending.getId())).thenReturn(Optional.of(pending));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, date))
+                .thenReturn(Optional.of(existingRecord));
+        when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        regularizationService.approve(pending.getId(), null, managerEmail);
+
+        ArgumentCaptor<Map<String, Object>> snapshotCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(auditSnapshot, atLeastOnce()).toJson(snapshotCaptor.capture());
+        List<Map<String, Object>> snapshots = snapshotCaptor.getAllValues();
+        // The specific pair this test cares about: one snapshot with existed=true/source=SYSTEM
+        // (the "before"), and one with source=REGULARIZATION (the "after") — captured somewhere
+        // among all toJson() calls this approve() invocation makes (update()/reject() aren't
+        // reached here, but other snapshot calls in this codepath are irrelevant noise).
+        boolean hasBeforeWithOriginalSource = snapshots.stream().anyMatch(s ->
+                Boolean.TRUE.equals(s.get("existed")) && "SYSTEM".equals(s.get("source"))
+                        && "PRESENT".equals(s.get("status")));
+        boolean hasAfterWithRegularizationSource = snapshots.stream().anyMatch(s ->
+                "REGULARIZATION".equals(s.get("source")));
+        assertTrue(hasBeforeWithOriginalSource, "before-snapshot must preserve the record's ORIGINAL source (SYSTEM), not the overwritten value");
+        assertTrue(hasAfterWithRegularizationSource, "after-snapshot must reflect the corrected source (REGULARIZATION)");
+
+        verify(auditService).log(eq(managerId), eq("ATTENDANCE_REGULARIZED"), eq(existingRecord.getId()), any(), any());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void approve_forABrandNewRecord_capturesExistedFalseAsTheBeforeState() {
+        LocalDate date = LocalDate.now();
+        RegularizationRequest pending = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 0)).requestedCheckOut(date.atTime(18, 0))
+                .reason("Missed punch").status("PENDING").build();
+
+        when(userRepository.findByEmail(managerEmail)).thenReturn(Optional.of(managerUser));
+        when(regularizationRepository.findById(pending.getId())).thenReturn(Optional.of(pending));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, date)).thenReturn(Optional.empty());
+        when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        regularizationService.approve(pending.getId(), null, managerEmail);
+
+        ArgumentCaptor<Map<String, Object>> snapshotCaptor = ArgumentCaptor.forClass(Map.class);
+        verify(auditSnapshot, atLeastOnce()).toJson(snapshotCaptor.capture());
+        boolean hasExistedFalseBefore = snapshotCaptor.getAllValues().stream()
+                .anyMatch(s -> Boolean.FALSE.equals(s.get("existed")));
+        assertTrue(hasExistedFalseBefore, "a brand-new row's before-state must be an explicit existed=false, not an empty/null map");
+    }
+
+    /**
+     * The audit trail's whole point: TWO separate corrections to the same date must each leave
+     * their own before/after pair — reconstructing the record's state after correction #1 must
+     * remain possible even after correction #2 has since changed it again.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void approve_appliedTwiceToTheSameDate_retainsBothCorrectionsInAuditHistory_notJustTheLatest() {
+        LocalDate date = LocalDate.now();
+        Attendance record = Attendance.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).workDate(date)
+                .checkInAt(date.atTime(9, 30)).checkOutAt(date.atTime(18, 0))
+                .status("PRESENT").lateByMinutes(15).workedMinutes(510).source("SYSTEM")
+                .shiftId(defaultShift.getId())
+                .build();
+        when(userRepository.findByEmail(managerEmail)).thenReturn(Optional.of(managerUser));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, date)).thenReturn(Optional.of(record));
+        when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        RegularizationRequest firstCorrection = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 20)).requestedCheckOut(date.atTime(18, 0))
+                .reason("First correction").status("PENDING").build();
+        when(regularizationRepository.findById(firstCorrection.getId())).thenReturn(Optional.of(firstCorrection));
+        regularizationService.approve(firstCorrection.getId(), null, managerEmail);
+
+        RegularizationRequest secondCorrection = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 45)).requestedCheckOut(date.atTime(18, 0))
+                .reason("Second correction").status("PENDING").build();
+        when(regularizationRepository.findById(secondCorrection.getId())).thenReturn(Optional.of(secondCorrection));
+        regularizationService.approve(secondCorrection.getId(), null, managerEmail);
+
+        // Every audit call is a fresh INSERT (see AuditService.log — a new builder().build() is
+        // always saved, never updated), so two separate calls are exactly what preserves both
+        // corrections independently, rather than one being silently overwritten by the other.
+        verify(auditService, times(2)).log(eq(managerId), eq("ATTENDANCE_REGULARIZED"), eq(record.getId()), any(), any());
     }
 
     @Test

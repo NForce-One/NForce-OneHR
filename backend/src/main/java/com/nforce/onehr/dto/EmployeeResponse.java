@@ -26,6 +26,7 @@ public class EmployeeResponse {
     private String employmentType;
     private String workMode;
     private LocalDate joiningDate;
+    private String timezone;
     private boolean active;
     private ManagerRef currentManager;
     private String tempPassword;

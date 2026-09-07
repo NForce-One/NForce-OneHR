@@ -122,8 +122,10 @@ public class AttendanceController {
 
     /**
      * Shift/break config for the Today's Timings panel — no @PreAuthorize, same as /punch/{date}.
-     * Resolved per-caller: shiftStart/shiftEnd/weeklyOffDays reflect the caller's assigned
-     * Shift/WeeklyOffPolicy (ONEHR-108) if any, else fall back to global defaults.
+     * Resolved per-caller: shiftStart/shiftEnd come from the caller's assigned Shift (ONEHR-108)
+     * — every employee is expected to always have one, so this fails loudly rather than falling
+     * back to a global default if that invariant is ever violated. weeklyOffDays comes from the
+     * caller's assigned WeeklyOffPolicy if any, else falls back to Saturday/Sunday.
      */
     @GetMapping("/config")
     public AttendanceConfigResponse config(Principal principal) {

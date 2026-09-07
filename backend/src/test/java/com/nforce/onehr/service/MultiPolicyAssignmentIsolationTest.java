@@ -59,6 +59,8 @@ class MultiPolicyAssignmentIsolationTest {
     @Mock private NotificationService notificationService;
     @Mock private EmployeeService employeeService;
     @Mock private AttendancePenaltyService attendancePenaltyService;
+    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private ShiftVersionResolver shiftVersionResolver;
 
     private ExceptionService exceptionService;
 
@@ -84,17 +86,21 @@ class MultiPolicyAssignmentIsolationTest {
         lenient().when(allocationRepository.findEffectiveAt(any(), any())).thenReturn(List.of());
         PenalizationPolicyResolutionService policyResolutionService =
                 new PenalizationPolicyResolutionService(versionRepository, allocationRepository, penalizationPolicyService, employeeRepository, attendanceProperties);
-        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository);
+        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
         WorkHoursShortageCalculationService workHoursShortageCalculationService =
-                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService);
+                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
+        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
+                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
+                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, penaltyEvaluationService,
                 workingDayService, holidayRepository, policyResolutionService, expectedWorkHoursService,
-                workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService);
+                workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService,
+                shiftDayPolicy, shiftVersionResolver);
 
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
-        lenient().when(attendanceProperties.getShiftStart()).thenReturn(LocalTime.of(9, 30));
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeAId, employeeBId));
         lenient().when(userRepository.findByEmail(hrEmail)).thenReturn(Optional.of(hrUser()));
         lenient().when(leaveRequestRepository.findByEmployeeUserIdInAndStatusAndStartDateLessThanEqualAndEndDateGreaterThanEqual(
@@ -111,6 +117,11 @@ class MultiPolicyAssignmentIsolationTest {
                 .thenReturn(0L);
         lenient().when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         lenient().when(employeeRepository.findAllByIdWithScheduleDetails(any())).thenReturn(List.of());
+        // Every employee() built below carries this same Shift, so the LATE_ARRIVAL path's
+        // shiftDayPolicy.resolveShiftStart(...) call never hits the no-shift invariant guard —
+        // the exact start/end values don't matter here, only that resolution doesn't throw.
+        lenient().when(shiftVersionResolver.resolve(any(), any()))
+                .thenReturn(ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build());
     }
 
     private User hrUser() {
@@ -120,8 +131,9 @@ class MultiPolicyAssignmentIsolationTest {
 
     private Employee employee(UUID id, PenalisationPolicy policy) {
         User user = User.builder().id(id).email(id + "@test.com").build();
+        Shift shift = Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(true).build();
         return Employee.builder().userId(id).user(user).employeeCode("NF-" + id).fullName("Employee " + id)
-                .joiningDate(date.minusYears(1)).penalisationPolicy(policy).build();
+                .joiningDate(date.minusYears(1)).penalisationPolicy(policy).shift(shift).build();
     }
 
     private Attendance lateAttendance(UUID employeeId, int lateByMinutes) {

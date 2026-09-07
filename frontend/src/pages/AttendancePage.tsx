@@ -92,20 +92,19 @@ function todayIsoDate(): string {
 
 /**
  * The day's required effective minutes — the employee's assigned shift duration (wrapping past
- * midnight for overnight shifts), falling back to the global fullDayMinHours target only for the
- * edge case of an employee with no Shift assigned. Same calc as ExceptionService.
- * computeEffectiveHoursPercent on the backend, kept in sync so "100% effective hours" means the
- * same thing on both sides.
+ * midnight for overnight shifts). Same calc as ExceptionService.computeEffectiveHoursPercent on
+ * the backend, kept in sync so "100% effective hours" means the same thing on both sides. Every
+ * employee is expected to always have an assigned Shift (a hard DB invariant — see
+ * AttendanceConfigResponse's own Javadoc), so config.shiftEnd is null only before the config
+ * fetch resolves, never for a real employee thereafter — there is deliberately no other fallback
+ * here (the old global full-day-min-hours target was removed as dead code once that invariant
+ * shipped).
  */
 function fullDayTargetMinutesFor(config: AttendanceConfig | null): number | null {
-  const shiftMinutes = config?.shiftEnd
-    ? (() => {
-        const startMin = minutesSinceMidnight(`${todayIsoDate()}T${config.shiftStart}`) ?? 0;
-        const endMin = minutesSinceMidnight(`${todayIsoDate()}T${config.shiftEnd}`) ?? 0;
-        return endMin <= startMin ? endMin + 1440 - startMin : endMin - startMin;
-      })()
-    : null;
-  return shiftMinutes ?? (config ? config.fullDayMinHours * 60 : null);
+  if (!config?.shiftEnd) return null;
+  const startMin = minutesSinceMidnight(`${todayIsoDate()}T${config.shiftStart}`) ?? 0;
+  const endMin = minutesSinceMidnight(`${todayIsoDate()}T${config.shiftEnd}`) ?? 0;
+  return endMin <= startMin ? endMin + 1440 - startMin : endMin - startMin;
 }
 
 /** Whether a day's worked minutes reached 100% of its required effective hours target. */
@@ -2165,9 +2164,14 @@ function AttendanceStatsPanel({ token }: { token: string }) {
 }
 
 // ─── Today's Timings ────────────────────────────────────────────────────────────
-// No shift-end (or per-employee shift) exists yet — ONEHR-108 shift assignment is not built.
-// The progress bar target is deliberately the existing fullDayMinHours config, labeled as
-// "progress toward a full day" rather than "shift end", so nothing here is invented.
+// Every employee is expected to always have an assigned Shift (ONEHR-108 shipped as a hard DB
+// invariant), so config.shiftEnd is effectively always populated here — see
+// fullDayTargetMinutesFor's own comment. The break-used/break-budget progress bar this panel used
+// to show was removed along with app.attendance.daily-break-budget-minutes (Workstream B): it was
+// a display-only denominator with no enforcement and no other config to source it from (Shift's
+// own per-shift breakMinutes is a separate, admin-metadata concept — not an org-wide live budget).
+// Break used time itself (real, computed from actual punch gaps) is still shown, just without a
+// target/percentage to compare it against.
 function TodaysTimingsPanel({ today, config, workedMinutesToday }: {
   today: TodayAttendance | null;
   config: AttendanceConfig | null;
@@ -2179,9 +2183,7 @@ function TodaysTimingsPanel({ today, config, workedMinutesToday }: {
   const progressPct = fullDayTargetMinutes && workedMinutesToday != null
     ? Math.min(100, Math.round((workedMinutesToday / fullDayTargetMinutes) * 100))
     : 0;
-  const breakUsed = today?.breakUsedMinutes ?? 0;
-  const breakBudget = today?.breakBudgetMinutes ?? config?.dailyBreakBudgetMinutes ?? 60;
-  const breakPct = breakBudget > 0 ? Math.min(100, Math.round((breakUsed / breakBudget) * 100)) : 0;
+  const breakUsed = today?.breakUsedMinutes;
 
   return (
     <div style={{ ...panelStyle, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
@@ -2195,22 +2197,19 @@ function TodaysTimingsPanel({ today, config, workedMinutesToday }: {
       )}
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--txt-dim)', marginBottom: 4 }}>
-          <span>{config?.shiftEnd ? 'Progress toward shift end' : `Progress toward a full day${config ? ` (${config.fullDayMinHours}h)` : ''}`}</span>
+          <span>Progress toward shift end</span>
           <span>{formatDuration(workedMinutesToday) ?? dash}</span>
         </div>
         <div style={{ height: 7, borderRadius: 4, background: 'var(--raised2)', overflow: 'hidden' }}>
           <div style={{ height: '100%', width: `${progressPct}%`, background: 'var(--brand)', borderRadius: 4, transition: 'width .3s' }} />
         </div>
       </div>
-      <div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--txt-dim)', marginBottom: 4 }}>
+      {breakUsed != null && (
+        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--txt-dim)' }}>
           <span>Break used</span>
-          <span>{breakUsed} / {breakBudget} min</span>
+          <span>{breakUsed} min</span>
         </div>
-        <div style={{ height: 5, borderRadius: 3, background: 'var(--raised2)', overflow: 'hidden' }}>
-          <div style={{ height: '100%', width: `${breakPct}%`, background: '#E0A93B', borderRadius: 3, transition: 'width .3s' }} />
-        </div>
-      </div>
+      )}
     </div>
   );
 }

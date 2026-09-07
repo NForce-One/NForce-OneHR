@@ -26,4 +26,8 @@ public class UpdateUserRequest {
     // UserManagementService#updateUser). Defaults to false so a stale/older client that never
     // sends this field is always treated as unconfirmed.
     private boolean confirmInactiveEdit;
+
+    // Admin-set only — this endpoint is Super-Admin-only (see class comment). Three states
+    // (null/blank/value) — see UpdateEmployeeRequest's identical field for the full convention.
+    private String timezone;
 }

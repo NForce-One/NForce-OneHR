@@ -3,6 +3,7 @@ package com.nforce.onehr.service;
 import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.entity.LeaveDurationType;
 import com.nforce.onehr.entity.LeaveRequest;
+import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.repository.LeaveRequestRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -10,6 +11,7 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -36,13 +38,33 @@ public class ExpectedWorkHoursService {
             List.of(LeaveDurationType.HOURLY, LeaveDurationType.QUARTER_DAY);
 
     private final LeaveRequestRepository leaveRequestRepository;
+    private final ShiftVersionResolver shiftVersionResolver;
 
-    /** The employee's assigned shift duration in minutes, or null if no shift is assigned (or it has zero/negative duration). */
-    public Long shiftMinutes(Employee employee) {
+    /**
+     * The employee's assigned shift duration in minutes on {@code date} (per the Shift Version
+     * effective on that date — never the employee's current/live shift for a date it doesn't
+     * govern, so a later timing change can't retroactively change a historical expected-hours
+     * figure), or null if no shift is assigned. Overnight-aware: {@code Duration.between} on two
+     * bare {@link java.time.LocalTime} values has no notion of "next day" — for an overnight shift
+     * (end not after start, e.g. the org's own default 15:30-00:30) it returns a negative value,
+     * which used to be silently treated as "no shift" (returning null here, same as an employee
+     * with no shift at all). That masked expected-hours/Work-Hours-Shortage evaluation for every
+     * overnight-shift employee. Corrected using the exact same rollover rule already established
+     * elsewhere for this purpose (see {@link ShiftDayPolicy#shiftEndAt}): when the end is not
+     * after the start, it falls on the next calendar day, so the elapsed span wraps forward by
+     * 24h instead of going negative.
+     */
+    public Long shiftMinutes(Employee employee, LocalDate date) {
         if (employee == null || employee.getShift() == null) {
             return null;
         }
-        long minutes = Duration.between(employee.getShift().getStartTime(), employee.getShift().getEndTime()).toMinutes();
+        ShiftVersion version = shiftVersionResolver.resolve(employee.getShift(), date);
+        LocalTime start = version.getStartTime();
+        LocalTime end = version.getEndTime();
+        long minutes = Duration.between(start, end).toMinutes();
+        if (!end.isAfter(start)) {
+            minutes += 24 * 60;
+        }
         return minutes > 0 ? minutes : null;
     }
 
@@ -58,7 +80,7 @@ public class ExpectedWorkHoursService {
 
     /** Same calculation as {@link #adjustedExpectedMinutes(Employee, LocalDate)}, given an already-resolved partial-hour leave (or null) — for bulk callers that pre-load the map once per batch instead of once per employee/date. */
     public Long adjustedExpectedMinutes(Employee employee, LocalDate date, LeaveRequest partialHourLeave) {
-        Long shiftMinutes = shiftMinutes(employee);
+        Long shiftMinutes = shiftMinutes(employee, date);
         if (shiftMinutes == null) {
             return null;
         }

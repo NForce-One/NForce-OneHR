@@ -13,6 +13,7 @@ import com.nforce.onehr.repository.EmployeeRepository;
 import com.nforce.onehr.repository.HolidayRepository;
 import com.nforce.onehr.repository.LocationRepository;
 import com.nforce.onehr.repository.ShiftRepository;
+import com.nforce.onehr.repository.WeeklyOffPolicyRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -39,16 +40,21 @@ class OrgServiceLocationTest {
     @Mock private DesignationRepository designationRepo;
     @Mock private LocationRepository locationRepo;
     @Mock private ShiftRepository shiftRepo;
+    @Mock private com.nforce.onehr.repository.ShiftVersionRepository shiftVersionRepository;
+    @Mock private com.nforce.onehr.service.ShiftVersionResolver shiftVersionResolver;
+    @Mock private com.nforce.onehr.service.ShiftWeeklyOffRulesService shiftWeeklyOffRulesService;
+    @Mock private WeeklyOffPolicyRepository weeklyOffPolicyRepo;
     @Mock private EmployeeRepository employeeRepo;
     @Mock private EmployeeManagerHistoryRepository historyRepo;
     @Mock private HolidayRepository holidayRepo;
     @Mock private AssetRepository assetRepo;
+    @Mock private com.nforce.onehr.repository.AttendanceRepository attendanceRepo;
 
     private OrgService service;
 
     @BeforeEach
     void setUp() {
-        service = new OrgService(businessUnitRepo, departmentRepo, designationRepo, locationRepo, shiftRepo, employeeRepo, historyRepo, holidayRepo, assetRepo);
+        service = new OrgService(businessUnitRepo, departmentRepo, designationRepo, locationRepo, shiftRepo, shiftVersionRepository, shiftVersionResolver, shiftWeeklyOffRulesService, weeklyOffPolicyRepo, employeeRepo, historyRepo, holidayRepo, assetRepo, attendanceRepo);
         lenient().when(locationRepo.save(any())).thenAnswer(inv -> inv.getArgument(0));
         lenient().when(employeeRepo.countByLocationId(any())).thenReturn(0L);
     }

@@ -25,6 +25,4 @@ public class TodayAttendanceResponse {
 
     /** Minutes spent on breaks so far today (gaps between closed punch sessions). Null if no record yet. */
     private Integer breakUsedMinutes;
-    /** Always populated from AttendanceProperties, even with no record yet, so the UI can render "0 / N min" immediately. */
-    private int breakBudgetMinutes;
 }

@@ -59,6 +59,10 @@ public class ExceptionService {
     private final AttendancePolicyEngine attendancePolicyEngine;
     private final AttendancePenaltyRepository attendancePenaltyRepository;
     private final AttendancePenaltyService attendancePenaltyService;
+    // Single source of truth for shift-start resolution — see its own Javadoc.
+    private final ShiftDayPolicy shiftDayPolicy;
+    // Resolves a Shift's timing for a SPECIFIC date (Shift Versioning) — see its own Javadoc.
+    private final ShiftVersionResolver shiftVersionResolver;
 
     /**
      * Gap-033/034: every discrepancy type a corrected Attendance record could invalidate — a
@@ -249,8 +253,7 @@ public class ExceptionService {
 
             if (isWorkingDay && record.getLateByMinutes() != null && record.getLateByMinutes() > 0) {
                 Employee employee = employeesById.get(record.getEmployeeUserId());
-                LocalTime expectedShiftStart = employee != null && employee.getShift() != null
-                        ? employee.getShift().getStartTime() : attendanceProperties.getShiftStart();
+                LocalTime expectedShiftStart = shiftDayPolicy.resolveShiftStart(employee, record.getWorkDate());
                 upsertException(record, ExceptionType.LATE_ARRIVAL,
                         expectedShiftStart, record.getCheckInAt().toLocalTime(),
                         record.getLateByMinutes());
@@ -325,8 +328,14 @@ public class ExceptionService {
                     Long expectedMinutes = expectedWorkHoursService.adjustedExpectedMinutes(
                             employee, date, partialHourLeaveByEmployeeDate.get(employee.getUserId() + "|" + date));
                     if (expectedMinutes != null && existing.getWorkedMinutes() < expectedMinutes) {
+                        // Version effective on THIS date, not the employee's current/live shift —
+                        // adjustedExpectedMinutes above already resolved the same date's version
+                        // for the shortage decision itself; this must display the same date's
+                        // version, not whatever the shift has since changed to (see
+                        // ShiftVersionResolver's own Javadoc).
+                        LocalTime expectedShiftEnd = shiftVersionResolver.resolve(employee.getShift(), date).getEndTime();
                         upsertException(existing, ExceptionType.WORK_HOURS_SHORTAGE,
-                                employee.getShift().getEndTime(), existing.getCheckOutAt().toLocalTime(), null);
+                                expectedShiftEnd, existing.getCheckOutAt().toLocalTime(), null);
                     }
                 } else if (missingLogShortageEnabled && existing.isMissingCheckOut()) {
                     // Section 10 (Phase 3): a missing check-out is a candidate shortage day only

@@ -61,9 +61,10 @@ public class PenalisationPolicyManagementService {
 
     /**
      * Section 7/2: read-only — this is a deploy-time config value
-     * ({@code app.attendance.penalization-fallback-strategy}), the same convention as
-     * {@code lateGraceMinutes}/{@code halfDayMaxHours} elsewhere on {@link AttendanceProperties},
-     * not a DB-backed runtime setting. Exposed so the Allocation screen can explain why an
+     * ({@code app.attendance.penalization-fallback-strategy}), not a DB-backed runtime setting
+     * (unlike {@code halfDayMaxHours}/{@code defaultTimezone} on {@code AttendanceRules}, or
+     * {@code lateGraceMinutes} on {@code ShiftVersion} — all three since migrated off
+     * {@link AttendanceProperties}). Exposed so the Allocation screen can explain why an
      * unassigned employee resolves to {@code DEFAULT} vs {@code ALLOCATION_REQUIRED}, without the
      * frontend re-deriving or hardcoding that logic itself.
      */

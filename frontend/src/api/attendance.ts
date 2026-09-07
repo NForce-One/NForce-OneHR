@@ -47,7 +47,6 @@ export interface AttendanceRecord {
   workedMinutes: number | null;
   status: AttendanceStatus | null;
   lateByMinutes: number | null;
-  fullDay: boolean | null;
   source: AttendanceSource | null;
   /** The employee's configured work mode (ONSITE/REMOTE/HYBRID) at query time. */
   workMode: string | null;
@@ -74,7 +73,6 @@ export interface TodayAttendance {
   record: AttendanceRecord | null;
   /** Minutes spent on breaks so far today. Null until the employee has punched in. */
   breakUsedMinutes: number | null;
-  breakBudgetMinutes: number;
 }
 
 /** One side of the Me-vs-My-Team comparison. Null averages mean presentDays === 0. */
@@ -109,9 +107,8 @@ export interface AttendanceConfig {
   /** Null only if the caller has no Shift assigned — every employee is seeded with one, so this is normally always set. */
   shiftEnd: string | null;
   lateGraceMinutes: number;
+  /** Sourced from the persisted, Admin-editable Attendance Rules setting — see orgApi.getAttendanceRules. */
   halfDayMaxHours: number;
-  fullDayMinHours: number;
-  dailyBreakBudgetMinutes: number;
   /** java.time.DayOfWeek names, e.g. ["SATURDAY", "SUNDAY"]. */
   weeklyOffDays: string[];
 }

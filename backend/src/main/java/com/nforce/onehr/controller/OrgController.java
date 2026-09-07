@@ -2,7 +2,9 @@ package com.nforce.onehr.controller;
 
 import com.nforce.onehr.dto.HierarchyNodeDto;
 import com.nforce.onehr.dto.org.*;
+import com.nforce.onehr.service.AttendanceRulesService;
 import com.nforce.onehr.service.OrgService;
+import com.nforce.onehr.service.ShiftWeeklyOffRulesService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
@@ -17,6 +19,8 @@ import java.util.UUID;
 public class OrgController {
 
     private final OrgService orgService;
+    private final ShiftWeeklyOffRulesService shiftWeeklyOffRulesService;
+    private final AttendanceRulesService attendanceRulesService;
 
     // ── Hierarchy ────────────────────────────────────────────────────────────
 
@@ -157,6 +161,12 @@ public class OrgController {
         return orgService.listShiftEmployees(id);
     }
 
+    /** Version history drill-down — same no-role-restriction rationale as listShifts above. */
+    @GetMapping("/shifts/{id}/versions")
+    public List<ShiftVersionResponse> listShiftVersions(@PathVariable UUID id) {
+        return orgService.listShiftVersions(id);
+    }
+
     @PostMapping("/shifts")
     @ResponseStatus(HttpStatus.CREATED)
     public ShiftResponse createShift(@Valid @RequestBody CreateShiftRequest req) {
@@ -177,5 +187,72 @@ public class OrgController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void deleteShift(@PathVariable UUID id) {
         orgService.deleteShift(id);
+    }
+
+    // ── Weekly Off Policies ───────────────────────────────────────────────────
+    // Same Super-Admin-only create/edit/delete pattern as Shifts (enforced in OrgService);
+    // listing is open — the Add/Edit User and bulk-assignment flows need it regardless of role.
+
+    @GetMapping("/weekly-off-policies")
+    public List<WeeklyOffPolicyResponse> listWeeklyOffPolicies() {
+        return orgService.listWeeklyOffPolicies();
+    }
+
+    @PostMapping("/weekly-off-policies")
+    @ResponseStatus(HttpStatus.CREATED)
+    public WeeklyOffPolicyResponse createWeeklyOffPolicy(@Valid @RequestBody CreateWeeklyOffPolicyRequest req) {
+        return orgService.createWeeklyOffPolicy(req);
+    }
+
+    @PutMapping("/weekly-off-policies/{id}")
+    public WeeklyOffPolicyResponse updateWeeklyOffPolicy(@PathVariable UUID id, @Valid @RequestBody UpdateWeeklyOffPolicyRequest req) {
+        return orgService.updateWeeklyOffPolicy(id, req);
+    }
+
+    @DeleteMapping("/weekly-off-policies/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteWeeklyOffPolicy(@PathVariable UUID id) {
+        orgService.deleteWeeklyOffPolicy(id);
+    }
+
+    // ── Shifts & Weekly Off Rules ─────────────────────────────────────────────
+    // Org-level singleton (see ShiftWeeklyOffRules) — P1 holds exactly one setting, Maximum Shift
+    // Day Duration. Read is open (the Shift form's duration warning needs it regardless of role);
+    // update is Super-Admin-only, enforced in ShiftWeeklyOffRulesService.
+
+    @GetMapping("/shift-weekly-off-rules")
+    public ShiftWeeklyOffRulesResponse getShiftWeeklyOffRules() {
+        return shiftWeeklyOffRulesService.getRules();
+    }
+
+    @PutMapping("/shift-weekly-off-rules")
+    public ShiftWeeklyOffRulesResponse updateShiftWeeklyOffRules(@Valid @RequestBody UpdateShiftWeeklyOffRulesRequest req) {
+        return shiftWeeklyOffRulesService.updateMaximumShiftDayDurationHours(req);
+    }
+
+    // ── Attendance Rules ──────────────────────────────────────────────────────
+    // Org-level singleton (see AttendanceRules) — currently holds exactly one setting, Half Day
+    // Max Hours (the absolute-hours HALF_DAY classification threshold, migrated off
+    // app.attendance.half-day-max-hours — see AttendanceRulesService's own Javadoc). Read is open
+    // (attendance status derivation needs it for every employee regardless of role); update is
+    // Super-Admin-only, enforced in AttendanceRulesService.
+
+    @GetMapping("/attendance-rules")
+    public AttendanceRulesResponse getAttendanceRules() {
+        return attendanceRulesService.getRules();
+    }
+
+    @PutMapping("/attendance-rules")
+    public AttendanceRulesResponse updateAttendanceRules(@Valid @RequestBody UpdateAttendanceRulesRequest req) {
+        return attendanceRulesService.updateHalfDayMaxHours(req);
+    }
+
+    // Org-wide fallback timezone (Phase 2 timezone pass) — consulted only when neither an
+    // employee's own Employee.timezone nor their Location.timezone is set. Separate endpoint
+    // from the one above so existing halfDayMaxHours callers are unaffected. Update is
+    // Super-Admin-only, enforced in AttendanceRulesService.updateDefaultTimezone.
+    @PutMapping("/attendance-rules/default-timezone")
+    public AttendanceRulesResponse updateDefaultTimezone(@Valid @RequestBody UpdateDefaultTimezoneRequest req) {
+        return attendanceRulesService.updateDefaultTimezone(req);
     }
 }

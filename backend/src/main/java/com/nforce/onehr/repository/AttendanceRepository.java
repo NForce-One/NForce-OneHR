@@ -61,4 +61,10 @@ public interface AttendanceRepository extends JpaRepository<Attendance, UUID> {
     // a day or two even for the most delayed overnight-shift case — so this never grows into an
     // unbounded full-table scan as the org's attendance history grows.
     List<Attendance> findByStatusInAndWorkDateGreaterThanEqual(Collection<String> statuses, LocalDate from);
+
+    // Backs OrgService#deleteShift's historical-usage guard — a Shift must never be deletable
+    // once ANY Attendance (including historical, already-closed records) references it via its
+    // snapshotted shiftId, or deletion would silently erase that historical context. Deliberately
+    // NOT scoped to "current" anything — this checks every row regardless of age or status.
+    boolean existsByShiftId(UUID shiftId);
 }

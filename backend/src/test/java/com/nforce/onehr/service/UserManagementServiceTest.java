@@ -17,6 +17,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.LinkedHashSet;
 import java.util.HashSet;
 import java.util.List;
@@ -205,6 +206,52 @@ class UserManagementServiceTest {
         assertEquals(activeShift, targetEmployee.getShift());
     }
 
+    // ── Phase 2: Admin-set employee timezone ─────────────────────────────────
+
+    @Test
+    void updateUser_setsAValidTimezone_doesNotForceLogout() {
+        UpdateUserRequest req = new UpdateUserRequest();
+        req.setTimezone("America/New_York");
+
+        userManagementService.updateUser(targetUserId, req, actorEmail);
+
+        assertEquals("America/New_York", targetEmployee.getTimezone());
+        // No JWT claim depends on timezone — unlike role/department/etc., this must not force a logout.
+        verifyNoInteractions(forceLogoutBroadcaster);
+    }
+
+    @Test
+    void updateUser_rejectsAnInvalidTimezone() {
+        UpdateUserRequest req = new UpdateUserRequest();
+        req.setTimezone("Not/A_Real_Zone");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> userManagementService.updateUser(targetUserId, req, actorEmail));
+        assertNull(targetEmployee.getTimezone());
+    }
+
+    @Test
+    void updateUser_blankTimezone_clearsIt_fallingBackToLocationThenOrgDefault() {
+        targetEmployee.setTimezone("Asia/Kolkata");
+        UpdateUserRequest req = new UpdateUserRequest();
+        req.setTimezone("");
+
+        userManagementService.updateUser(targetUserId, req, actorEmail);
+
+        assertNull(targetEmployee.getTimezone());
+    }
+
+    @Test
+    void updateUser_nullTimezone_leavesTheExistingValueUnchanged() {
+        targetEmployee.setTimezone("Asia/Kolkata");
+        UpdateUserRequest req = new UpdateUserRequest();
+        req.setFullName("Renamed Only"); // timezone field left null — not part of this edit
+
+        userManagementService.updateUser(targetUserId, req, actorEmail);
+
+        assertEquals("Asia/Kolkata", targetEmployee.getTimezone(), "null means 'leave unchanged', not 'clear'");
+    }
+
     // Inactive shifts must not be assignable — see UserManagementService.updateUser's own
     // shift-change branch. Only guarded on an actual change (the employee had no shift before),
     // so this also implicitly covers "assigning a genuinely new shift" rather than "re-saving an
@@ -363,6 +410,13 @@ class UserManagementServiceTest {
                 return u;
             });
             lenient().when(employeeRepository.save(any(Employee.class))).thenAnswer(inv -> inv.getArgument(0));
+            // Default-shift lookup (see UserManagementService#createUser) — every employee
+            // created must always end up with a real assigned Shift (product invariant,
+            // ONEHR-108), so tests here that don't care about shift assignment (no shiftId on
+            // the request) get a normal active Regular Shift by default; the one test that
+            // specifically exercises the inactive-default-shift scenario overrides this below.
+            lenient().when(shiftRepository.findByName(Shift.DEFAULT_SHIFT_NAME))
+                    .thenReturn(Optional.of(Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(true).build()));
 
             req = new CreateUserRequest();
             req.setFullName("Jane Smith");
@@ -426,6 +480,38 @@ class UserManagementServiceTest {
             userManagementService.createUser(req, actorEmail);
 
             verify(employeeRepository).save(argThat(e -> activeShift.equals(e.getShift())));
+        }
+
+        /**
+         * No shiftId in the request at all — defaults server-side to the organization's default
+         * shift (Regular Shift), resolved by its stable seeded name, never a hardcoded id. This is
+         * the actual guarantee that an API-created employee can never accidentally end up with no
+         * shift — the frontend preselecting the same shift is only a UX convenience on top of it.
+         */
+        @Test
+        void noShiftSpecified_defaultsToRegularShift() {
+            Shift regularShift = Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(true).build();
+            when(shiftRepository.findByName(Shift.DEFAULT_SHIFT_NAME)).thenReturn(Optional.of(regularShift));
+            when(employeeCodeGenerator.claim(req.getEmployeeCode())).thenReturn("NF-2026-0057");
+
+            userManagementService.createUser(req, actorEmail);
+
+            verify(employeeRepository).save(argThat(e -> regularShift.equals(e.getShift())));
+        }
+
+        /**
+         * An inactive Regular Shift is never silently assigned — same "must be active" rule as an
+         * explicit selection. Every employee having a real assigned Shift is a hard invariant now,
+         * not a tolerated absence — so this fails loudly rather than saving a shift-less employee.
+         */
+        @Test
+        void noShiftSpecified_failsLoudly_whenTheOnlyRegularShiftIsInactive() {
+            Shift inactiveRegularShift = Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(false).build();
+            when(shiftRepository.findByName(Shift.DEFAULT_SHIFT_NAME)).thenReturn(Optional.of(inactiveRegularShift));
+
+            assertThrows(IllegalStateException.class, () -> userManagementService.createUser(req, actorEmail));
+
+            verify(employeeRepository, never()).save(any());
         }
     }
 
