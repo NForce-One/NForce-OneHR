@@ -51,8 +51,7 @@ export const NAV: Record<Role, NavItem[]> = {
     item('assets', 'Assets & Expenses', Package, 1),
     item('performance', 'Performance & Growth', GitBranch, 2),
     item('documents', 'My Documents & Policies', FileText, 1),
-    // TEMPORARY: locked while Phase 1 rolls out — remove `, true` (or set false) to restore normal access. See NavItem.locked doc above.
-    item('help', 'Help & Guidance', HelpCircle, 1, true),
+    item('help', 'Help & Guidance', HelpCircle, 1),
   ],
   Manager: [
     item('dashboard', 'Home', Home, 1),
@@ -69,8 +68,7 @@ export const NAV: Record<Role, NavItem[]> = {
     item('documents', 'My Documents & Policies', FileText, 1),
     item('reports', 'Reports & Analytics', FileText, 2),
     item('audit', 'Audit History', Clock, 1),
-    // TEMPORARY: locked while Phase 1 rolls out — remove `, true` (or set false) to restore normal access. See NavItem.locked doc above.
-    item('help', 'Help & Guidance', HelpCircle, 1, true),
+    item('help', 'Help & Guidance', HelpCircle, 1),
   ],
   'HR Admin': [
     item('dashboard', 'Home', Home, 1),
@@ -88,12 +86,10 @@ export const NAV: Record<Role, NavItem[]> = {
     item('organization', 'Organization Structure', GitBranch, 1),
     item('performance', 'Performance & Engagement', GitBranch, 2),
     item('assets', 'Assets & Expenses', Package, 1),
-    // TEMPORARY: locked while Phase 1 rolls out — remove `, true` (or set false) to restore normal access. See NavItem.locked doc above.
-    item('requests', 'HR Service Requests', HelpCircle, 1, true),
+    item('requests', 'HR Service Requests', HelpCircle, 1),
     item('reports', 'Reports & Analytics', FileText, 2),
     item('audit', 'Audit History', Clock, 1),
-    // TEMPORARY: locked while Phase 1 rolls out — remove `, true` (or set false) to restore normal access. See NavItem.locked doc above.
-    item('help', 'Help & Guidance', HelpCircle, 1, true),
+    item('help', 'Help & Guidance', HelpCircle, 1),
   ],
   'Super Admin': [
     item('dashboard', 'Home', Home, 1),
@@ -106,14 +102,12 @@ export const NAV: Record<Role, NavItem[]> = {
     item('assets', 'Assets & Expenses', Package, 1),
     item('workflows', 'Workflow Studio', GitBranch, 2),
     item('masters', 'Organization Masters', FileText, 1),
-    // TEMPORARY: locked while Phase 1 rolls out — remove `, true` (or set false) to restore normal access. See NavItem.locked doc above.
-    item('requests', 'HR Service Requests', HelpCircle, 1, true),
+    item('requests', 'HR Service Requests', HelpCircle, 1),
     item('integrations', 'Integrations', FileText, 2),
     item('audit', 'Audit & Security', Clock, 1),
     item('featurelab', 'Future Feature Lab', HelpCircle, 2),
     item('reports', 'Reports & Analytics', FileText, 2),
-    // TEMPORARY: locked while Phase 1 rolls out — remove `, true` (or set false) to restore normal access. See NavItem.locked doc above.
-    item('help', 'Help & Guidance', HelpCircle, 1, true),
+    item('help', 'Help & Guidance', HelpCircle, 1),
   ],
 };
 
