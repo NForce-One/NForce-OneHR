@@ -1,0 +1,15 @@
+-- Finalized Location/Timezone model: Employee → Location → Location.timezone, with no
+-- per-employee override. The Admin-settable employees.timezone column added in V166 is removed
+-- entirely rather than kept as a dormant/system-managed field — an audit of the live data
+-- (2026-09-08) found every single employee row had it NULL, i.e. it was never actually used in
+-- production, so dropping it changes zero employees' resolved attendance timezone (each already
+-- fell through to Location.timezone / the org-wide default, exactly as it does now via
+-- AttendanceRulesService#resolveEmployeeZoneId). Keeping an unused, no-longer-writable column
+-- around would only invite exactly the "two independently editable sources of truth" this feature
+-- explicitly rules out.
+--
+-- Existing Attendance rows are completely unaffected: each already snapshots its own resolved
+-- timezone at check-in (attendance_records.timezone, added by V163's sibling migration — see
+-- Attendance.timezone's own doc comment) and never re-reads the employee's timezone after the
+-- fact.
+ALTER TABLE employees DROP COLUMN timezone;

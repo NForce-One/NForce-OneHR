@@ -278,6 +278,16 @@ public class OrgService {
                 .toList();
     }
 
+    // The fixed set of IANA zones a Location may be assigned — Name/City/State/Country stay
+    // freely editable (any number of locations can be created), but the one attendance-relevant
+    // value must always be one of these, never an arbitrary or malformed zone id. Mirrored on the
+    // frontend (OrgSetupPage.tsx's SUPPORTED_LOCATION_TIMEZONES) and DB-enforced independently by
+    // the CHECK constraint added in V169/V170 — the same small-fixed-enum convention already used
+    // for EMPLOYMENT_TYPES/WORK_MODES elsewhere in this codebase rather than a round-tripped API.
+    // Widening this list requires updating both here and that CHECK constraint (a new migration).
+    public static final List<String> SUPPORTED_TIMEZONES =
+            List.of("Asia/Kolkata", "America/New_York", "America/Chicago", "America/Los_Angeles");
+
     @PreAuthorize("hasAnyRole('SUPER_ADMIN', 'HR_ADMIN')")
     @Transactional
     public LocationResponse createLocation(CreateLocationRequest req) {
@@ -311,22 +321,29 @@ public class OrgService {
         loc.setState(req.getState() != null ? req.getState().trim() : null);
         loc.setCountry(req.getCountry() != null ? req.getCountry().trim() : null);
         loc.setHolidayRegion(req.getHolidayRegion() != null ? req.getHolidayRegion().trim() : null);
+        // Changing a Location's timezone here never reinterprets any Attendance row already
+        // snapshotted under the old zone — only future attendance is affected (see
+        // AttendanceRulesService#resolveEmployeeZoneId).
         loc.setTimezone(validatedTimezone(req.getTimezone()));
         long count = employeeRepo.countByLocationId(id);
         return LocationResponse.from(locationRepo.save(loc), count);
     }
 
-    // Null/blank clears it (falls back to the global business zone at read time — see
-    // AttendanceService.zoneIdFor); any non-blank value must be a real IANA zone id, since a
-    // typo here would otherwise only surface later as a confusing ZoneId parse failure deep
-    // inside attendance calculations.
+    /**
+     * Every Location must have exactly one valid timezone, and it must be one of
+     * {@link #SUPPORTED_TIMEZONES} — not just any parseable IANA zone id — so a Location +
+     * Timezone combination that doesn't correspond to one of the business's actual supported
+     * zones (e.g. the pre-existing "Texas" → America/New_York data bug fixed in V169) is no
+     * longer representable. Rejects outright rather than falling back to the org-wide default —
+     * a typo/unsupported zone here should never surface later as a confusing mismatch deep inside
+     * attendance calculations.
+     */
     private String validatedTimezone(String timezone) {
-        if (timezone == null || timezone.isBlank()) return null;
-        String trimmed = timezone.trim();
-        try {
-            java.time.ZoneId.of(trimmed);
-        } catch (Exception e) {
-            throw new IllegalArgumentException("'" + trimmed + "' is not a valid timezone (use an IANA zone id, e.g. Asia/Kolkata)");
+        String trimmed = timezone != null ? timezone.trim() : "";
+        if (!SUPPORTED_TIMEZONES.contains(trimmed)) {
+            throw new IllegalArgumentException(
+                    "'" + timezone + "' is not a supported timezone. Choose one of: "
+                            + String.join(", ", SUPPORTED_TIMEZONES));
         }
         return trimmed;
     }

@@ -585,6 +585,35 @@ class RegularizationServiceTest {
     }
 
     /**
+     * A brand-new Attendance row created via Regularization must also snapshot the employee's
+     * effective (Location-derived) timezone, exactly like a normal Check-In/Web Clock-In does —
+     * see AttendanceRulesService#resolveEmployeeZoneId and Attendance#getTimezone's own doc
+     * comment. Before the finalized Location/Timezone consolidation this snapshot was silently
+     * skipped entirely for a Regularization-created row (Attendance.timezone stayed null).
+     */
+    @Test
+    void approve_createsANewRecord_snapshotsTheEmployeesEffectiveLocationTimezone() {
+        LocalDate date = LocalDate.now();
+        com.nforce.onehr.entity.Location office = com.nforce.onehr.entity.Location.builder()
+                .name("Chicago").timezone("America/Chicago").build();
+        when(employeeRepository.findById(employeeId))
+                .thenReturn(Optional.of(Employee.builder().userId(employeeId).shift(defaultShift).location(office).build()));
+        RegularizationRequest pending = RegularizationRequest.builder().id(UUID.randomUUID())
+                .employeeUserId(employeeId).assignedApproverId(managerId).attendanceDate(date)
+                .requestedCheckIn(date.atTime(9, 0)).requestedCheckOut(date.atTime(18, 0))
+                .reason("Missed punch").status("PENDING").build();
+
+        when(userRepository.findByEmail(managerEmail)).thenReturn(Optional.of(managerUser));
+        when(regularizationRepository.findById(pending.getId())).thenReturn(Optional.of(pending));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, date)).thenReturn(Optional.empty());
+        when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
+
+        regularizationService.approve(pending.getId(), null, managerEmail);
+
+        verify(attendanceRepository).save(argThat(a -> "America/Chicago".equals(a.getTimezone())));
+    }
+
+    /**
      * An EXISTING legacy row (predates the shiftId snapshot column, {@code shiftId == null})
      * cannot be safely recomputed for lateness — this must fail loudly and explicitly rather than
      * substitute the employee's current Shift or present a guessed number as reliable. See

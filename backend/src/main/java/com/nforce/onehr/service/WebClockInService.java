@@ -557,25 +557,14 @@ public class WebClockInService {
     }
 
     /**
-     * Precedence, highest first: the employee's own Employee.timezone (Admin-set, authoritative
-     * once present), then their assigned Location.timezone, then the org-wide default
-     * (AttendanceRulesService.getDefaultZoneId(), Admin-configurable — see V167). Mirrors
-     * AttendanceService.zoneIdFor exactly. Used only when there's no browser-reported (or
-     * session-locked) zone to prefer — see resolveZone.
+     * The employee's Location timezone, else the org-wide default — see
+     * {@link AttendanceRulesService#resolveEmployeeZoneId}, the single shared implementation
+     * (this used to be its own separately-duplicated copy). Used only when there's no
+     * browser-reported (or session-locked) zone to prefer — see resolveZone.
      */
     private ZoneId zoneIdFor(UUID employeeUserId) {
         Employee employee = employeeRepository.findById(employeeUserId).orElse(null);
-        if (employee == null) {
-            return attendanceRulesService.getDefaultZoneId();
-        }
-        String employeeTimezone = employee.getTimezone();
-        if (employeeTimezone != null && !employeeTimezone.isBlank()) {
-            return ZoneId.of(employeeTimezone);
-        }
-        String locationTimezone = employee.getLocation() != null ? employee.getLocation().getTimezone() : null;
-        return (locationTimezone != null && !locationTimezone.isBlank())
-                ? ZoneId.of(locationTimezone)
-                : attendanceRulesService.getDefaultZoneId();
+        return attendanceRulesService.resolveEmployeeZoneId(employee);
     }
 
     /**

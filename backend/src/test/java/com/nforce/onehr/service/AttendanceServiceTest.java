@@ -596,30 +596,18 @@ class AttendanceServiceTest {
         assertEquals("Asia/Kolkata", response.getTimezone());
     }
 
-    // ── Phase 2: employee timezone precedence ────────────────────────────────
+    // ── Finalized Location/Timezone model: Location is the sole source ───────
+    // Employee carries no timezone field of its own (see Employee's class Javadoc) — its
+    // effective attendance zone is ALWAYS its Location's, with the org-wide default only for an
+    // employee who has no Location at all. See AttendanceRulesService#resolveEmployeeZoneId.
 
     @Test
-    void checkIn_employeesOwnTimezone_takesPrecedenceOverLocation() {
+    void checkIn_resolvesFromAssignedLocationTimezone() {
         Location location = Location.builder().name("Office").timezone("America/New_York").build();
-        Employee employeeWithOwnZone = Employee.builder().userId(employeeId).employeeCode("E1").fullName("Test Employee")
-                .shift(defaultShift).location(location).timezone("Asia/Kolkata")
-                .user(User.builder().id(employeeId).active(true).build()).build();
-        when(employeeRepository.findByUser_Email(employeeEmail)).thenReturn(Optional.of(employeeWithOwnZone));
-        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(any(), any())).thenReturn(Optional.empty());
-
-        AttendanceResponse response = service.checkIn(employeeEmail, null);
-
-        assertEquals("Asia/Kolkata", response.getTimezone(),
-                "the employee's own configured timezone must win over their Location's");
-    }
-
-    @Test
-    void checkIn_noEmployeeTimezone_fallsBackToLocation() {
-        Location location = Location.builder().name("Office").timezone("America/New_York").build();
-        Employee employeeWithLocationOnly = Employee.builder().userId(employeeId).employeeCode("E1").fullName("Test Employee")
+        Employee employeeWithLocation = Employee.builder().userId(employeeId).employeeCode("E1").fullName("Test Employee")
                 .shift(defaultShift).location(location)
                 .user(User.builder().id(employeeId).active(true).build()).build();
-        when(employeeRepository.findByUser_Email(employeeEmail)).thenReturn(Optional.of(employeeWithLocationOnly));
+        when(employeeRepository.findByUser_Email(employeeEmail)).thenReturn(Optional.of(employeeWithLocation));
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(any(), any())).thenReturn(Optional.empty());
 
         AttendanceResponse response = service.checkIn(employeeEmail, null);
@@ -628,8 +616,8 @@ class AttendanceServiceTest {
     }
 
     @Test
-    void checkIn_neitherEmployeeNorLocationTimezoneSet_fallsBackToTheOrgWideDefault() {
-        // setUp()'s default employee has no timezone and no Location at all.
+    void checkIn_noLocationAssigned_fallsBackToTheOrgWideDefault() {
+        // setUp()'s default employee has no Location at all.
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(any(), any())).thenReturn(Optional.empty());
 
         AttendanceResponse response = service.checkIn(employeeEmail, null);
@@ -638,10 +626,10 @@ class AttendanceServiceTest {
     }
 
     @Test
-    void checkIn_employeeTimezoneChange_neverReinterpretsAnAlreadyClosedHistoricalRecord() {
+    void checkIn_locationTimezoneChange_neverReinterpretsAnAlreadyClosedHistoricalRecord() {
         // A prior, already-closed Attendance row keeps its own locked-in timezone regardless of
-        // any later change to the employee's configured timezone — see Attendance.timezone's own
-        // write-once semantics. This is a read-only display path (getToday's closed-record
+        // any later change to the employee's Location (or its timezone) — see Attendance.timezone's
+        // own write-once semantics. This is a read-only display path (getToday's closed-record
         // branch), not a recompute, so there is nothing here that COULD reinterpret it.
         Attendance historical = Attendance.builder().id(UUID.randomUUID()).employeeUserId(employeeId)
                 .workDate(LocalDate.now()).checkInAt(LocalDateTime.now().minusHours(9))
@@ -651,7 +639,7 @@ class AttendanceServiceTest {
 
         service.getToday(employeeEmail, null);
 
-        assertEquals("America/New_York", historical.getTimezone(), "an employee timezone change must never rewrite an existing record's own locked-in zone");
+        assertEquals("America/New_York", historical.getTimezone(), "a Location change must never rewrite an existing record's own locked-in zone");
     }
 
     // ── Phase 0.4 / Phase 1: concurrency race -> clean application response ──

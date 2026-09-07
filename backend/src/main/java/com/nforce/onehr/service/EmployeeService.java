@@ -14,8 +14,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.security.SecureRandom;
+import java.time.DateTimeException;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -75,7 +77,6 @@ public class EmployeeService {
                 .employmentType(req.getEmploymentType() != null ? req.getEmploymentType() : "FULL_TIME")
                 .workMode(req.getWorkMode() != null ? req.getWorkMode() : "ONSITE")
                 .joiningDate(req.getJoiningDate())
-                .timezone(normalizeTimezone(req.getTimezone()))
                 .createdBy(actor.getId())
                 .build();
 
@@ -98,9 +99,9 @@ public class EmployeeService {
             emp.setDesignation(desig);
         }
         if (req.getLocationId() != null) {
-            Location loc = locationRepository.findById(req.getLocationId()).orElse(null);
-            if (loc != null && !loc.isActive())
-                throw new IllegalArgumentException("This location is inactive and cannot be assigned. Choose an active location.");
+            Location loc = locationRepository.findById(req.getLocationId())
+                    .orElseThrow(() -> new IllegalArgumentException("Selected location was not found."));
+            validateAssignableLocation(loc);
             emp.setLocation(loc);
         }
         // CreateEmployeeRequest has no shiftId field to pick a specific shift, so this always
@@ -220,18 +221,13 @@ public class EmployeeService {
             }
         }
         if (req.getLocationId() != null) {
-            Location newLocation = locationRepository.findById(req.getLocationId()).orElse(null);
+            Location newLocation = locationRepository.findById(req.getLocationId())
+                    .orElseThrow(() -> new IllegalArgumentException("Selected location was not found."));
             UUID currentLocationId = emp.getLocation() != null ? emp.getLocation().getId() : null;
-            UUID newLocationId = newLocation != null ? newLocation.getId() : null;
-            if (!Objects.equals(currentLocationId, newLocationId)) {
-                if (newLocation != null && !newLocation.isActive())
-                    throw new IllegalArgumentException("This location is inactive and cannot be assigned. Choose an active location.");
+            if (!Objects.equals(currentLocationId, newLocation.getId())) {
+                validateAssignableLocation(newLocation);
                 emp.setLocation(newLocation);
             }
-        }
-
-        if (req.getTimezone() != null) {
-            emp.setTimezone(normalizeTimezone(req.getTimezone()));
         }
 
         emp = employeeRepository.save(emp);
@@ -266,23 +262,35 @@ public class EmployeeService {
         snapshot.put("department", emp.getDepartment() != null ? emp.getDepartment().getName() : null);
         snapshot.put("designation", emp.getDesignation() != null ? emp.getDesignation().getTitle() : null);
         snapshot.put("location", emp.getLocation() != null ? emp.getLocation().getName() : null);
-        snapshot.put("timezone", emp.getTimezone());
         return snapshot;
     }
 
-    /** Blank/null clears the field; otherwise must be a real IANA zone id. */
-    private String normalizeTimezone(String timezone) {
-        if (timezone == null || timezone.isBlank()) {
-            return null;
+    /**
+     * Rejects an inactive Location, or one with no valid IANA timezone, before it's assigned to
+     * an employee — Location is the ONLY source of an employee's effective attendance timezone
+     * (see Employee's own class Javadoc / AttendanceRulesService#resolveEmployeeZoneId), so a
+     * Location that can't resolve to a real zone must never be assignable in the first place.
+     * Should be unreachable for a location created through OrgService (its create/update always
+     * validates the timezone against a fixed supported set — see OrgService#SUPPORTED_TIMEZONES),
+     * but this is the hard backstop this feature explicitly requires.
+     */
+    private void validateAssignableLocation(Location location) {
+        if (!location.isActive()) {
+            throw new IllegalArgumentException("This location is inactive and cannot be assigned. Choose an active location.");
         }
-        String trimmed = timezone.trim();
-        try {
-            java.time.ZoneId.of(trimmed);
-        } catch (java.time.DateTimeException e) {
+        String timezone = location.getTimezone();
+        boolean validTimezone = timezone != null && !timezone.isBlank();
+        if (validTimezone) {
+            try {
+                ZoneId.of(timezone);
+            } catch (DateTimeException e) {
+                validTimezone = false;
+            }
+        }
+        if (!validTimezone) {
             throw new IllegalArgumentException(
-                    "'" + trimmed + "' is not a valid IANA timezone id (e.g. Asia/Kolkata, America/New_York)");
+                    "This location has no valid timezone configured and cannot be assigned. Contact an administrator.");
         }
-        return trimmed;
     }
 
     /**
@@ -609,7 +617,6 @@ public class EmployeeService {
                 .employmentType(emp.getEmploymentType())
                 .workMode(emp.getWorkMode())
                 .joiningDate(emp.getJoiningDate())
-                .timezone(emp.getTimezone())
                 .active(user.isActive())
                 .currentManager(manager)
                 .tempPassword(tempPassword)

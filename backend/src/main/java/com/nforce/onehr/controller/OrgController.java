@@ -123,6 +123,14 @@ public class OrgController {
         return orgService.listLocations();
     }
 
+    // The fixed set of IANA zones a Location's Timezone may be — see OrgService
+    // .SUPPORTED_TIMEZONES — open to any authenticated caller, same as listLocations, since it's
+    // just the menu of options for the Timezone dropdown, not a mutation.
+    @GetMapping("/locations/timezones")
+    public List<String> listSupportedLocationTimezones() {
+        return OrgService.SUPPORTED_TIMEZONES;
+    }
+
     @PostMapping("/locations")
     @ResponseStatus(HttpStatus.CREATED)
     public LocationResponse createLocation(@Valid @RequestBody CreateLocationRequest req) {

@@ -39,8 +39,13 @@ function assignableOptions<T extends { id: string; active?: boolean }>(rows: T[]
 // ─── Creatable Location Select ────────────────────────────────────────────────
 interface Location { id: string; name: string; active?: boolean; }
 
+// Picks from existing, already-created Locations only — a new Location needs a Timezone
+// (required, and constrained to a fixed supported set — see OrgService.SUPPORTED_TIMEZONES on
+// the backend), which doesn't fit this inline assignment picker, so location CREATION happens
+// exclusively via Organization Masters → Locations (see OrgSetupPage). `token` is accepted for
+// signature compatibility with call sites, even though this component no longer calls the API.
 function CreatableLocationSelect({
-  locations, value, onChange, token,
+  locations, value, onChange,
 }: {
   locations: Location[];
   value: string | undefined;
@@ -49,7 +54,6 @@ function CreatableLocationSelect({
 }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
-  const [creating, setCreating] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
   const currentName = value ? (locations.find(l => l.id === value)?.name ?? '') : '';
@@ -69,27 +73,13 @@ function CreatableLocationSelect({
   const filtered = query.trim()
     ? locations.filter(l => l.name.toLowerCase().includes(query.toLowerCase()))
     : locations;
-  const exactMatch = locations.some(l => l.name.toLowerCase() === query.trim().toLowerCase());
-  const showCreate = query.trim().length > 0 && !exactMatch;
-
-  async function handleCreate() {
-    setCreating(true);
-    try {
-      const newLoc = await orgApi.createLocation(token, { name: query.trim() });
-      locations.push(newLoc);
-      onChange(newLoc.id);
-      setOpen(false);
-    } finally {
-      setCreating(false);
-    }
-  }
 
   return (
     <div ref={ref} style={{ position: 'relative' }}>
       <div style={{ position: 'relative' }}>
         <input
           style={{ ...inputStyle, paddingRight: 32 }}
-          placeholder="Select or type a new location…"
+          placeholder="Select a location…"
           value={open ? query : currentName}
           onFocus={() => { setOpen(true); setQuery(currentName); }}
           onChange={e => { setQuery(e.target.value); setOpen(true); if (!e.target.value) onChange(undefined); }}
@@ -97,9 +87,11 @@ function CreatableLocationSelect({
         <ChevronDown size={14} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--txt-dim)', pointerEvents: 'none' }} />
       </div>
       {open && (
-        <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4, background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 7, boxShadow: '0 8px 24px rgba(0,0,0,.3)', zIndex: 100, maxHeight: 200, overflowY: 'auto' }}>
-          {filtered.length === 0 && !showCreate && (
-            <div style={{ padding: '10px 14px', fontSize: 13, color: 'var(--txt-dim)' }}>No locations found</div>
+        <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4, background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 7, boxShadow: '0 8px 24px rgba(0,0,0,.3)', zIndex: 100, maxHeight: 240, overflowY: 'auto' }}>
+          {filtered.length === 0 && (
+            <div style={{ padding: '10px 14px', fontSize: 13, color: 'var(--txt-dim)' }}>
+              No locations found. Add one under Organization Masters → Locations.
+            </div>
           )}
           {filtered.map(l => (
             <div key={l.id}
@@ -111,14 +103,6 @@ function CreatableLocationSelect({
               {l.name}
             </div>
           ))}
-          {showCreate && (
-            <div
-              onMouseDown={creating ? undefined : handleCreate}
-              style={{ padding: '9px 14px', fontSize: 13, color: '#4C8DD6', borderTop: filtered.length > 0 ? '1px solid var(--line)' : 'none', cursor: creating ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}
-            >
-              <span style={{ fontWeight: 700 }}>+</span> {creating ? 'Creating…' : `Create "${query.trim()}"`}
-            </div>
-          )}
           <div
             onMouseDown={() => { onChange(undefined); setQuery(''); setOpen(false); }}
             style={{ padding: '9px 14px', fontSize: 12, color: 'var(--txt-dim)', borderTop: '1px solid var(--line)', cursor: 'pointer' }}
@@ -141,7 +125,6 @@ function EditModal({ emp, onClose, onUpdated, token }: { emp: EmployeeRecord; on
     locationId: emp.locationId ?? undefined,
     employmentType: emp.employmentType,
     workMode: emp.workMode ?? 'ONSITE',
-    timezone: emp.timezone ?? '',
   });
   const [opts, setOpts] = useState<{ businessUnits: any[]; departments: any[]; designations: any[]; locations: any[] }>({ businessUnits: [], departments: [], designations: [], locations: [] });
   const [submitting, setSubmitting] = useState(false);
@@ -217,35 +200,9 @@ function EditModal({ emp, onClose, onUpdated, token }: { emp: EmployeeRecord; on
               />
             </Field>
           </div>
-          <div style={{ gridColumn: '1/-1' }}>
-            <Field label="Timezone (overrides Location)">
-              <input
-                style={inputStyle}
-                value={form.timezone ?? ''}
-                onChange={e => setForm(f => ({ ...f, timezone: e.target.value }))}
-                placeholder="e.g. Asia/Kolkata"
-                list="nf-employee-iana-timezones"
-              />
-              <datalist id="nf-employee-iana-timezones">
-                <option value="Asia/Kolkata" />
-                <option value="America/New_York" />
-                <option value="America/Los_Angeles" />
-                <option value="America/Chicago" />
-                <option value="Europe/London" />
-                <option value="Australia/Sydney" />
-                <option value="Asia/Singapore" />
-                <option value="Asia/Dubai" />
-                <option value="Pacific/Auckland" />
-                <option value="Asia/Kathmandu" />
-                <option value="Asia/Chittagong" />
-              </datalist>
-              <span style={{ fontSize: 11, color: 'var(--txt-mut)', marginTop: 3, display: 'block' }}>
-                IANA zone id — takes precedence over this employee's Location timezone for their check-in/out, lateness, and shift-day calculations. Leave blank to inherit from Location.
-              </span>
-            </Field>
-          </div>
           <div style={{ gridColumn: '1/-1', fontSize: 11, color: 'var(--txt-dim)' }}>
-            Manager &amp; Role are managed by Super Admin only.
+            Manager &amp; Role are managed by Super Admin only. Attendance timezone is derived
+            automatically from Location — see the Locations tab under Organization Masters.
           </div>
           {isInactive && (
             <InactiveFieldsConfirm checked={confirmInactiveEdit} onChange={setConfirmInactiveEdit} fields="Department, Designation, or Employment Type" />

@@ -252,9 +252,10 @@ public class AttendanceService {
         WeeklyOffPolicy weeklyOffPolicy = employee.getWeeklyOffPolicy();
         // A live "what applies today" display, not tied to any specific historical Attendance
         // record — resolves the Shift Version effective right now, same as the Shifts tab itself.
-        // Resolved in THIS employee's own zone (see zoneIdFor) — not the bare org-wide default —
-        // so the displayed shift start/end matches what their own Check-In would actually compute.
-        LocalDate configDay = LocalDate.now(zoneIdFor(employee));
+        // Resolved in THIS employee's own zone (see AttendanceRulesService.resolveEmployeeZoneId)
+        // — not the bare org-wide default — so the displayed shift start/end matches what their
+        // own Check-In would actually compute.
+        LocalDate configDay = LocalDate.now(attendanceRulesService.resolveEmployeeZoneId(employee));
 
         return AttendanceConfigResponse.builder()
                 .shiftName(shift != null ? shift.getName() : null)
@@ -1315,38 +1316,17 @@ public class AttendanceService {
      * Clock for a specific employee's own self-service actions and history — check-in/out,
      * "today" status, worked-hours/late-arrival math, and shift-day attribution are all computed
      * in THIS employee's own configured timezone, not the single global business zone. See
-     * {@link #zoneIdFor} for the precedence chain.
+     * {@link AttendanceRulesService#resolveEmployeeZoneId} for the resolution chain.
      */
     private LocalDateTime now(Employee employee) {
-        return LocalDateTime.now(zoneIdFor(employee));
-    }
-
-    /**
-     * Precedence, highest first: (1) the employee's own {@link Employee#getTimezone()} — Admin-
-     * set, authoritative once present, and the ONLY way an employee's attendance clock differs
-     * from the org default (their own browser-reported zone is never consulted — see
-     * {@link #resolveZone(String, Employee)}'s doc comment); (2) their assigned
-     * {@link Location#getTimezone()}, unchanged fallback behavior for any employee HR hasn't set
-     * an explicit timezone for; (3) the org-wide default — {@link AttendanceRulesService
-     * #getDefaultZoneId()}, an Admin-configurable singleton (migrated off {@code
-     * app.attendance.zone} — see V167's migration comment for why only the Attendance/Web-Clock/
-     * Regularization flow reads it from here rather than straight from YAML).
-     */
-    private ZoneId zoneIdFor(Employee employee) {
-        String employeeTimezone = employee.getTimezone();
-        if (employeeTimezone != null && !employeeTimezone.isBlank()) {
-            return ZoneId.of(employeeTimezone);
-        }
-        String locationTimezone = employee.getLocation() != null ? employee.getLocation().getTimezone() : null;
-        return (locationTimezone != null && !locationTimezone.isBlank())
-                ? ZoneId.of(locationTimezone)
-                : attendanceRulesService.getDefaultZoneId();
+        return LocalDateTime.now(attendanceRulesService.resolveEmployeeZoneId(employee));
     }
 
     /**
      * Parses an IANA zone id (e.g. from the browser's {@code Intl.DateTimeFormat()
-     * .resolvedOptions().timeZone}), or null if it's missing/blank/not a real zone — callers
-     * fall back to {@link #zoneIdFor} rather than fail the request over a malformed value.
+     * .resolvedOptions().timeZone}), or null if it's missing/blank/not a real zone — callers fall
+     * back to {@link AttendanceRulesService#resolveEmployeeZoneId} rather than fail the request
+     * over a malformed value.
      */
     private ZoneId parseZone(String candidate) {
         if (candidate == null || candidate.isBlank()) return null;
@@ -1359,7 +1339,7 @@ public class AttendanceService {
 
     /**
      * Zone for a fresh Check-In/Web Clock-In click: ALWAYS resolved server-side via
-     * {@link #zoneIdFor}'s precedence chain (employee's own timezone, then Location, then the
+     * {@link AttendanceRulesService#resolveEmployeeZoneId} (the employee's Location, then the
      * org-wide default). {@code clientTimezone} (the browser-reported zone, still sent by the
      * frontend on every punch) is deliberately never consulted here: per explicit requirement,
      * the employee's own configured timezone is the ONLY authoritative source for their
@@ -1368,19 +1348,20 @@ public class AttendanceService {
      * {@link Attendance#getTimezone()} for the rest of that session's lifetime.
      */
     private ZoneId resolveZone(String clientTimezone, Employee employee) {
-        return zoneIdFor(employee);
+        return attendanceRulesService.resolveEmployeeZoneId(employee);
     }
 
     /**
      * Zone for an EXISTING session — its own {@link Attendance#getTimezone()}, locked in at
-     * Check-In (itself already resolved via {@link #zoneIdFor}'s precedence chain) governs
-     * Check-Out/grace-window/worked-minutes math for as long as it's open. Falls back to
-     * {@link #zoneIdFor} only for a record predating this column; {@code clientTimezoneFallback}
-     * is likewise never consulted, for the same reason as above.
+     * Check-In (itself already resolved via {@link AttendanceRulesService#resolveEmployeeZoneId})
+     * governs Check-Out/grace-window/worked-minutes math for as long as it's open. Falls back to
+     * {@link AttendanceRulesService#resolveEmployeeZoneId} only for a record predating this
+     * column; {@code clientTimezoneFallback} is likewise never consulted, for the same reason as
+     * above.
      */
     private ZoneId resolveZone(Attendance record, Employee employee, String clientTimezoneFallback) {
         ZoneId stored = parseZone(record.getTimezone());
-        return stored != null ? stored : zoneIdFor(employee);
+        return stored != null ? stored : attendanceRulesService.resolveEmployeeZoneId(employee);
     }
 
     private ZoneId resolveZone(Attendance record, Employee employee) {

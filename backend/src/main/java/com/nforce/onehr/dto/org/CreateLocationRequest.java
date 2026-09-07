@@ -22,9 +22,12 @@ public class CreateLocationRequest {
     @Pattern(regexp = "^([A-Za-z]{2})?$", message = "Region must contain exactly 2 letters (e.g. TN)")
     private String holidayRegion;
 
-    // IANA zone id (e.g. "Asia/Kolkata", "America/New_York") — every employee assigned to this
-    // location uses it as their effective timezone for attendance (see AttendanceService
-    // .zoneIdFor). Optional: null/blank falls back to the global business zone at read time.
+    // Required — every Location must have exactly one valid timezone. Must be one of
+    // OrgService's fixed SUPPORTED_TIMEZONES, not just any IANA zone id — so Name/City/State/
+    // Country stay freely editable (any number of locations can be added) while the one
+    // attendance-relevant value here can never be an arbitrary or inconsistent one. See
+    // OrgService#validatedTimezone.
+    @NotBlank(message = "Timezone is required")
     @Size(max = 50)
     private String timezone;
 }

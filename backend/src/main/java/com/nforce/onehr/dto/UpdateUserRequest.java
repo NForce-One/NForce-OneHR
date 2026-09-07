@@ -27,7 +27,5 @@ public class UpdateUserRequest {
     // sends this field is always treated as unconfirmed.
     private boolean confirmInactiveEdit;
 
-    // Admin-set only — this endpoint is Super-Admin-only (see class comment). Three states
-    // (null/blank/value) — see UpdateEmployeeRequest's identical field for the full convention.
-    private String timezone;
+    // Deliberately NO timezone field — see UpdateEmployeeRequest's identical comment.
 }

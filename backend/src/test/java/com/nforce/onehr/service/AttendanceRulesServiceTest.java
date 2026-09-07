@@ -4,6 +4,8 @@ import com.nforce.onehr.dto.org.AttendanceRulesResponse;
 import com.nforce.onehr.dto.org.UpdateAttendanceRulesRequest;
 import com.nforce.onehr.dto.org.UpdateDefaultTimezoneRequest;
 import com.nforce.onehr.entity.AttendanceRules;
+import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.Location;
 import com.nforce.onehr.repository.AttendanceRulesRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -149,5 +151,34 @@ class AttendanceRulesServiceTest {
         service.updateDefaultTimezone(req);
 
         assertEquals("Europe/London", rules.getDefaultTimezone());
+    }
+
+    // ── Finalized Location/Timezone model: resolveEmployeeZoneId ─────────────
+    // The single shared implementation of "what timezone does this employee's attendance run
+    // in" — Location is the ONLY source; Employee itself carries no timezone field of its own.
+
+    @Test
+    void resolveEmployeeZoneId_usesTheAssignedLocationsTimezone() {
+        Location office = Location.builder().name("Chicago").timezone("America/Chicago").build();
+        Employee employee = Employee.builder().location(office).build();
+
+        assertEquals(java.time.ZoneId.of("America/Chicago"), service.resolveEmployeeZoneId(employee));
+    }
+
+    @Test
+    void resolveEmployeeZoneId_noLocationAssigned_fallsBackToTheOrgWideDefault() {
+        when(repository.findBySingletonTrue()).thenReturn(Optional.of(
+                AttendanceRules.builder().halfDayMaxHours(BigDecimal.valueOf(3.5)).defaultTimezone("Asia/Kolkata").build()));
+        Employee employee = Employee.builder().location(null).build();
+
+        assertEquals(java.time.ZoneId.of("Asia/Kolkata"), service.resolveEmployeeZoneId(employee));
+    }
+
+    @Test
+    void resolveEmployeeZoneId_nullEmployee_fallsBackToTheOrgWideDefault() {
+        when(repository.findBySingletonTrue()).thenReturn(Optional.of(
+                AttendanceRules.builder().halfDayMaxHours(BigDecimal.valueOf(3.5)).defaultTimezone("Asia/Kolkata").build()));
+
+        assertEquals(java.time.ZoneId.of("Asia/Kolkata"), service.resolveEmployeeZoneId(null));
     }
 }

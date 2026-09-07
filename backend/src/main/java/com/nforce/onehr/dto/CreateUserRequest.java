@@ -45,8 +45,6 @@ public class CreateUserRequest {
 
     private UUID managerId;
 
-    // Admin-set only — this endpoint is Super-Admin-only (see class comment). IANA zone id, e.g.
-    // "Asia/Kolkata"; null/blank leaves it unset, falling back to Location.timezone then the
-    // org-wide default — see AttendanceService.resolveZone.
-    private String timezone;
+    // Deliberately NO timezone field — see CreateEmployeeRequest's identical comment. locationId
+    // above (mandatory here) is the only timezone-relevant input.
 }

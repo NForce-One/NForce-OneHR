@@ -145,11 +145,17 @@ export const orgApi = {
   listLocations: (token: string) =>
     fetch(`${BASE}/locations`, { headers: authHeaders(token) }).then(r => handle<LocationRow[]>(r)),
 
-  createLocation: (token: string, payload: { name: string; city?: string; state?: string; country?: string; holidayRegion?: string; timezone?: string }) =>
+  // The fixed set of IANA zones a Location's Timezone may be — City/State/Country stay freely
+  // editable, but the dropdown for this one field must only ever offer these (see OrgService
+  // .SUPPORTED_TIMEZONES on the backend, which independently enforces the same set).
+  listSupportedLocationTimezones: (token: string) =>
+    fetch(`${BASE}/locations/timezones`, { headers: authHeaders(token) }).then(r => handle<string[]>(r)),
+
+  createLocation: (token: string, payload: { name: string; city?: string; state?: string; country?: string; holidayRegion?: string; timezone: string }) =>
     fetch(`${BASE}/locations`, { method: 'POST', headers: authHeaders(token), body: JSON.stringify(payload) })
       .then(r => handle<LocationRow>(r)),
 
-  updateLocation: (token: string, id: string, payload: { name: string; city?: string; state?: string; country?: string; holidayRegion?: string; timezone?: string }) =>
+  updateLocation: (token: string, id: string, payload: { name: string; city?: string; state?: string; country?: string; holidayRegion?: string; timezone: string }) =>
     fetch(`${BASE}/locations/${id}`, { method: 'PUT', headers: authHeaders(token), body: JSON.stringify(payload) })
       .then(r => handle<LocationRow>(r)),
 

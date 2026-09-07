@@ -94,8 +94,8 @@ class UserManagementServiceTest {
         newDepartment = Department.builder().id(newDepartmentId).name("Finance").build();
         currentDesignation = Designation.builder().id(currentDesignationId).title("Analyst").build();
         newDesignation = Designation.builder().id(newDesignationId).title("Senior Analyst").build();
-        currentLocation = Location.builder().id(currentLocationId).name("Hyderabad").build();
-        newLocation = Location.builder().id(newLocationId).name("Bengaluru").build();
+        currentLocation = Location.builder().id(currentLocationId).name("Hyderabad").timezone("Asia/Kolkata").build();
+        newLocation = Location.builder().id(newLocationId).name("Bengaluru").timezone("Asia/Kolkata").build();
         targetEmployee = Employee.builder().userId(targetUserId).user(targetUser)
                 .fullName("Target User").employmentType("FULL_TIME").workMode("ONSITE")
                 .department(currentDepartment).designation(currentDesignation).location(currentLocation)
@@ -206,51 +206,11 @@ class UserManagementServiceTest {
         assertEquals(activeShift, targetEmployee.getShift());
     }
 
-    // ── Phase 2: Admin-set employee timezone ─────────────────────────────────
-
-    @Test
-    void updateUser_setsAValidTimezone_doesNotForceLogout() {
-        UpdateUserRequest req = new UpdateUserRequest();
-        req.setTimezone("America/New_York");
-
-        userManagementService.updateUser(targetUserId, req, actorEmail);
-
-        assertEquals("America/New_York", targetEmployee.getTimezone());
-        // No JWT claim depends on timezone — unlike role/department/etc., this must not force a logout.
-        verifyNoInteractions(forceLogoutBroadcaster);
-    }
-
-    @Test
-    void updateUser_rejectsAnInvalidTimezone() {
-        UpdateUserRequest req = new UpdateUserRequest();
-        req.setTimezone("Not/A_Real_Zone");
-
-        assertThrows(IllegalArgumentException.class,
-                () -> userManagementService.updateUser(targetUserId, req, actorEmail));
-        assertNull(targetEmployee.getTimezone());
-    }
-
-    @Test
-    void updateUser_blankTimezone_clearsIt_fallingBackToLocationThenOrgDefault() {
-        targetEmployee.setTimezone("Asia/Kolkata");
-        UpdateUserRequest req = new UpdateUserRequest();
-        req.setTimezone("");
-
-        userManagementService.updateUser(targetUserId, req, actorEmail);
-
-        assertNull(targetEmployee.getTimezone());
-    }
-
-    @Test
-    void updateUser_nullTimezone_leavesTheExistingValueUnchanged() {
-        targetEmployee.setTimezone("Asia/Kolkata");
-        UpdateUserRequest req = new UpdateUserRequest();
-        req.setFullName("Renamed Only"); // timezone field left null — not part of this edit
-
-        userManagementService.updateUser(targetUserId, req, actorEmail);
-
-        assertEquals("Asia/Kolkata", targetEmployee.getTimezone(), "null means 'leave unchanged', not 'clear'");
-    }
+    // Employee no longer carries a timezone field at all — the finalized Location/Timezone model
+    // (see Employee's own class Javadoc) makes Location the sole source of an employee's
+    // effective attendance timezone, so there is nothing left here to admin-set/reject/clear.
+    // See LocationValidationTest for the create/update rejection of an invalid/inactive/
+    // timezone-less Location, and AttendanceRulesServiceTest for the resolution chain itself.
 
     // Inactive shifts must not be assignable — see UserManagementService.updateUser's own
     // shift-change branch. Only guarded on an actual change (the employee had no shift before),

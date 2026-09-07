@@ -25,11 +25,6 @@ public class UpdateEmployeeRequest {
     // sends this field is always treated as unconfirmed.
     private boolean confirmInactiveEdit;
 
-    // Admin-set only — this endpoint is already HR_ADMIN/SUPER_ADMIN-gated (see
-    // EmployeeController). Distinct from the self-service ProfileController/UpdateProfileRequest
-    // path, which deliberately has no timezone field at all. Three states, since JSON can't
-    // otherwise distinguish "omitted" from "explicitly null" once deserialized: null = leave
-    // unchanged; "" (blank) = clear it, falling back to Location.timezone/org default; anything
-    // else = set it — see EmployeeService#updateEmployee.
-    private String timezone;
+    // Deliberately NO timezone field — see CreateEmployeeRequest's own comment. locationId above
+    // is the only timezone-relevant input this request accepts.
 }

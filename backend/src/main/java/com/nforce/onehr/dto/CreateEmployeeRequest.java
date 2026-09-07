@@ -36,9 +36,9 @@ public class CreateEmployeeRequest {
 
     private UUID managerId;
 
-    // Admin-set only — this endpoint is already HR_ADMIN/SUPER_ADMIN-gated (see
-    // EmployeeController). IANA zone id, e.g. "Asia/Kolkata"; null/blank leaves it unset, falling
-    // back to the employee's Location.timezone then the org-wide default — see
-    // AttendanceService.resolveZone.
-    private String timezone;
+    // Deliberately NO timezone field — the finalized Location/Timezone model derives an
+    // employee's effective attendance timezone entirely from their assigned Location (see
+    // Employee's own class Javadoc). locationId above is the only timezone-relevant input; an
+    // invalid, inactive, or timezone-less Location is rejected server-side rather than silently
+    // falling back to something else — see EmployeeService#validateAssignableLocation.
 }

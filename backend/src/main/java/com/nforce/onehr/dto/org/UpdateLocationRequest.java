@@ -30,9 +30,8 @@ public class UpdateLocationRequest {
     @Pattern(regexp = "^([A-Za-z]{2})?$", message = "Region must contain exactly 2 letters (e.g. TN)")
     private String holidayRegion;
 
-    // IANA zone id (e.g. "Asia/Kolkata", "America/New_York") — every employee assigned to this
-    // location uses it as their effective timezone for attendance (see AttendanceService
-    // .zoneIdFor). Optional: null/blank falls back to the global business zone at read time.
+    // Required — see CreateLocationRequest's identical field comment.
+    @NotBlank(message = "Timezone is required")
     @Size(max = 50)
     private String timezone;
 }

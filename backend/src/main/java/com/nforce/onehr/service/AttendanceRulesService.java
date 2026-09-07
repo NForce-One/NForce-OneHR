@@ -4,6 +4,7 @@ import com.nforce.onehr.dto.org.AttendanceRulesResponse;
 import com.nforce.onehr.dto.org.UpdateAttendanceRulesRequest;
 import com.nforce.onehr.dto.org.UpdateDefaultTimezoneRequest;
 import com.nforce.onehr.entity.AttendanceRules;
+import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.repository.AttendanceRulesRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -78,6 +79,40 @@ public class AttendanceRulesService {
         AttendanceRules rules = loadSingleton();
         rules.setDefaultTimezone(zoneId);
         return AttendanceRulesResponse.from(repository.save(rules));
+    }
+
+    /**
+     * The single, shared implementation of "what timezone does this employee's attendance run
+     * in" — {@link Employee#getLocation()}'s {@code timezone} if the employee has a Location,
+     * else this org's {@link #getDefaultZoneId()} (for the employees onboarded before a Location
+     * was required — see V97/CreateEmployeeRequest's own history). Employee itself carries no
+     * timezone field of its own (see Employee's class Javadoc) — Location is the ONLY source of
+     * an employee's effective timezone, so there is exactly one resolution chain, used
+     * identically by AttendanceService, WebClockInService, and RegularizationService (previously
+     * three separately-duplicated copies of this same logic — RegularizationService's copy was
+     * missing entirely, a gap this consolidation also closes: a Regularization-created Attendance
+     * row now always gets a real timezone snapshot instead of none at all).
+     *
+     * <p>Calling this NEVER reinterprets an existing Attendance row — every row already
+     * snapshots its own resolved zone at creation time (see {@code Attendance#getTimezone()}) and
+     * that snapshot is never recomputed from an employee's current Location. This method is only
+     * ever consulted for a FRESH resolution: a brand-new Check-In/Web Clock-In, or a brand-new
+     * Regularization-created row.
+     */
+    @Transactional(readOnly = true)
+    public ZoneId resolveEmployeeZoneId(Employee employee) {
+        String locationTimezone = employee != null && employee.getLocation() != null
+                ? employee.getLocation().getTimezone() : null;
+        if (locationTimezone != null && !locationTimezone.isBlank()) {
+            try {
+                return ZoneId.of(locationTimezone);
+            } catch (DateTimeException e) {
+                // Should be unreachable now that Location.timezone is DB-constrained to a fixed,
+                // valid set (see V170) — falls back rather than failing a check-in/check-out
+                // outright over a Location data problem HR should fix on the Location record.
+            }
+        }
+        return getDefaultZoneId();
     }
 
     private AttendanceRules loadSingleton() {
