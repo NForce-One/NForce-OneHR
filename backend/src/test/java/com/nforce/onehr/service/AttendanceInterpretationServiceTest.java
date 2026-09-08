@@ -287,6 +287,42 @@ class AttendanceInterpretationServiceTest {
         assertEquals(LocalDateTime.of(workDate, LocalTime.of(18, 0)), window.end());
     }
 
+    /**
+     * resolveScheduledWindow must also resolve the record's logical WORKDAY window (never
+     * calendar midnight) alongside its scheduled shift window — the Attendance timeline positions
+     * its whole track against workdayStart/workdayEnd, not 00:00-24:00.
+     */
+    @Test
+    void resolveScheduledWindow_alsoResolvesTheWorkdayWindow_neverCalendarMidnight() {
+        // 10:00-19:00, 18h max: workday start 04:00, workday end 04:00 next day — the exact
+        // worked example from the Attendance UI correction spec.
+        Shift shiftA = shift("Shift A", LocalTime.of(10, 0), LocalTime.of(19, 0), LocalDate.MIN, true);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        Attendance record = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(9, 25)))
+                .shiftId(shiftA.getId()).build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(record);
+
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(4, 0)), window.workdayStart());
+        assertEquals(LocalDateTime.of(workDate.plusDays(1), LocalTime.of(4, 0)), window.workdayEnd());
+    }
+
+    @Test
+    void resolveScheduledWindow_overnightShift_workdayWindowDerivedTheSameWay_neverHardCoded() {
+        Shift overnight = shift("Overnight", LocalTime.of(22, 0), LocalTime.of(6, 0), LocalDate.MIN, true);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        Attendance record = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(22, 10)))
+                .shiftId(overnight.getId()).build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(record);
+
+        // 22:00 + 18h = 16:00 the next day.
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(16, 0)), window.workdayStart());
+        assertEquals(LocalDateTime.of(workDate.plusDays(1), LocalTime.of(16, 0)), window.workdayEnd());
+    }
+
     @Test
     void resolveScheduledWindow_actualExtendsBeyondScheduledEnd_windowStillReflectsTheShift_notTheActualPunch() {
         // Example from the Attendance Log marker design: shift 09:00-18:00, actual 09:30-18:15 —
@@ -371,6 +407,76 @@ class AttendanceInterpretationServiceTest {
         assertEquals(AttendanceInterpretationService.ScheduledShiftWindow.EMPTY, window);
         assertNull(window.start());
         assertNull(window.end());
+        assertNull(window.workdayStart());
+        assertNull(window.workdayEnd());
+    }
+
+    // ── belongsToWorkday/resolveWorkdayWindowFor: the RegularizationService validation seam ────
+
+    @Test
+    void belongsToWorkday_newRecord_usesTheEmployeesCurrentShift() {
+        // No existing Attendance row for this date — resolves against the employee's CURRENT
+        // shift, exactly like interpretForKnownWorkDate does.
+        Shift shiftA = shift("Shift A", LocalTime.of(10, 0), LocalTime.of(19, 0), LocalDate.MIN, true);
+        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        LocalDate workDate = LocalDate.of(2026, 9, 8);
+
+        // The spec's own worked example: 12:21 AM/3:30 AM the NEXT calendar day still belong to
+        // this workday (04:00 -> 04:00 next day); 4:00 AM onward already belongs to the next one.
+        assertTrue(service.belongsToWorkday(employee, null, workDate, LocalDateTime.of(workDate.plusDays(1), LocalTime.of(0, 21))));
+        assertTrue(service.belongsToWorkday(employee, null, workDate, LocalDateTime.of(workDate.plusDays(1), LocalTime.of(3, 30))));
+        assertFalse(service.belongsToWorkday(employee, null, workDate, LocalDateTime.of(workDate.plusDays(1), LocalTime.of(4, 0))),
+                "exactly the workday-end boundary already belongs to the NEXT workday");
+        assertFalse(service.belongsToWorkday(employee, null, workDate, LocalDateTime.of(workDate.plusDays(1), LocalTime.of(5, 0))));
+        assertTrue(service.belongsToWorkday(employee, null, workDate, LocalDateTime.of(workDate, LocalTime.of(9, 25))),
+                "an ordinary same-day timestamp belongs to its own workday");
+    }
+
+    @Test
+    void belongsToWorkday_existingRecord_usesItsOwnSnapshottedShift_notTheEmployeesCurrentOne() {
+        Shift shiftA = shift("Shift A (9-18)", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true); // workday boundary 03:00
+        Shift shiftB = shift("Shift B (10-19)", LocalTime.of(10, 0), LocalTime.of(19, 0), LocalDate.MIN, true); // workday boundary 04:00
+        Employee currentEmployee = Employee.builder().userId(UUID.randomUUID()).shift(shiftB).build(); // reassigned since
+        LocalDate workDate = LocalDate.of(2026, 9, 8);
+        Attendance existingRecord = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(9, 25)))
+                .shiftId(shiftA.getId()).build();
+
+        // 03:30 AM the next day is PAST Shift A's own 03:00 boundary (the record's own snapshot),
+        // even though it would still be within Shift B's 04:00 one — proves the record's own
+        // shift governs, never the employee's current one.
+        LocalDateTime threeThirtyAm = LocalDateTime.of(workDate.plusDays(1), LocalTime.of(3, 30));
+        assertFalse(service.belongsToWorkday(currentEmployee, existingRecord, workDate, threeThirtyAm));
+    }
+
+    @Test
+    void belongsToWorkday_legacyRecordWithNoShiftSnapshot_failsOpen() {
+        Attendance legacyRecord = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(LocalDate.of(2025, 1, 1)).checkInAt(LocalDateTime.of(2025, 1, 1, 9, 5))
+                .shiftId(null).build();
+
+        assertTrue(service.belongsToWorkday(null, legacyRecord, LocalDate.of(2025, 1, 1),
+                LocalDateTime.of(2025, 1, 2, 12, 0)), "a legacy row with no shift snapshot is not this validation's job to reject");
+    }
+
+    @Test
+    void resolveWorkdayWindowFor_newRecord_matchesTheSpecWorkedExample() {
+        Shift shiftA = shift("Shift A", LocalTime.of(10, 0), LocalTime.of(19, 0), LocalDate.MIN, true);
+        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        LocalDate workDate = LocalDate.of(2026, 9, 8);
+
+        AttendanceInterpretationService.WorkdayWindow window = service.resolveWorkdayWindowFor(employee, null, workDate);
+
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(4, 0)), window.start());
+        assertEquals(LocalDateTime.of(workDate.plusDays(1), LocalTime.of(4, 0)), window.end());
+    }
+
+    @Test
+    void resolveWorkdayWindowFor_legacyRecordWithNoShiftSnapshot_returnsNull() {
+        Attendance legacyRecord = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(LocalDate.of(2025, 1, 1)).shiftId(null).build();
+
+        assertNull(service.resolveWorkdayWindowFor(null, legacyRecord, LocalDate.of(2025, 1, 1)));
     }
 
     @Test

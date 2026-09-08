@@ -63,6 +63,15 @@ export interface AttendanceRecord {
   /** Scheduled shift end for this row's own workDate — see {@link shiftStartAt}. Rolls onto the
    * next calendar day for an overnight shift. Null for a legacy record. */
   shiftEndAt: string | null;
+  /** Start of this row's logical WORKDAY (never calendar midnight) — see
+   * ShiftDayPolicy#workdayStartAt on the backend. The Attendance timeline's whole track spans
+   * workdayStartAt..workdayEndAt, not 00:00-24:00, so a punch after midnight still positions
+   * correctly relative to the shift it actually belongs to. Null for a legacy record predating
+   * the shiftId snapshot, same as shiftStartAt/shiftEndAt. */
+  workdayStartAt: string | null;
+  /** End of this row's logical WORKDAY — see {@link workdayStartAt} / ShiftDayPolicy#workdayEndAt.
+   * Null for a legacy record. */
+  workdayEndAt: string | null;
 }
 
 export interface Punch {

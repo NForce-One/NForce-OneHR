@@ -1501,6 +1501,8 @@ public class AttendanceService {
                 .timezone(record.getTimezone())
                 .shiftStartAt(scheduledWindow.start())
                 .shiftEndAt(scheduledWindow.end())
+                .workdayStartAt(scheduledWindow.workdayStart())
+                .workdayEndAt(scheduledWindow.workdayEnd())
                 .build();
     }
 }

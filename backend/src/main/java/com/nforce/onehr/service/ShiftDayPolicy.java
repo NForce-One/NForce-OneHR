@@ -174,6 +174,32 @@ public class ShiftDayPolicy {
     }
 
     /**
+     * Start of the logical workday that {@code day} (an {@code Attendance.workDate}) denotes —
+     * i.e. the earliest instant {@link #shiftDayOf} attributes to {@code day} rather than to
+     * {@code day.minusDays(1)}. By {@link #shiftDayOf}'s own Rule 2, that is exactly the
+     * PREVIOUS day's own {@link #maximumAttendanceBoundary}: a timestamp at or after it, and
+     * before {@code day}'s own shift start, already belongs to {@code day}. Named separately
+     * from {@link #maximumAttendanceBoundary} purely so a caller that needs the WHOLE workday
+     * window (e.g. the attendance timeline, which must span workday-start to workday-end rather
+     * than calendar midnight to midnight) can ask for both ends without re-deriving the
+     * "yesterday's boundary" relationship itself. Requires an assigned shift, exactly like every
+     * other method here.
+     */
+    public LocalDateTime workdayStartAt(Employee employee, LocalDate day) {
+        return maximumAttendanceBoundary(employee, day.minusDays(1));
+    }
+
+    /**
+     * End of the logical workday that {@code day} denotes — an alias for
+     * {@link #maximumAttendanceBoundary}, named to read naturally alongside
+     * {@link #workdayStartAt} at call sites that need the full window rather than just the reset
+     * instant.
+     */
+    public LocalDateTime workdayEndAt(Employee employee, LocalDate day) {
+        return maximumAttendanceBoundary(employee, day);
+    }
+
+    /**
      * The logical workday {@code timestamp} belongs to — see this class's own Javadoc for the
      * full algorithm and worked examples (including the Shift-Version-boundary case). Only
      * decides date ATTRIBUTION; it is not consulted for, and does not perform, staleness/closure/

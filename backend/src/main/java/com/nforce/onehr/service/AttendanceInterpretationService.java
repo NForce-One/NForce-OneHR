@@ -192,6 +192,13 @@ public class AttendanceInterpretationService {
      * already in (see {@code Attendance.timezone}), so a caller can compare them directly without
      * any zone conversion of its own.
      *
+     * <p>Also resolves the record's logical WORKDAY window ({@code workdayStart}/{@code
+     * workdayEnd}, via {@link ShiftDayPolicy#workdayStartAt}/{@link ShiftDayPolicy#workdayEndAt})
+     * alongside the scheduled shift window — the single source of truth the Attendance timeline
+     * positions its whole track against (workday-start to workday-end), never calendar midnight
+     * to midnight. Same snapshotted-shift/workDate basis as the shift window, so both are always
+     * mutually consistent for one record.
+     *
      * <p>Returns {@link ScheduledShiftWindow#EMPTY} for a legacy row ({@code shiftId == null}) —
      * never guessed, exactly like {@link #interpretExistingSession}'s own
      * {@link InterpretationOutcome#LEGACY_UNRESOLVED} handling.
@@ -204,12 +211,74 @@ public class AttendanceInterpretationService {
         }
         LocalDateTime start = shiftDayPolicy.shiftStartAt(shiftContext, record.getWorkDate());
         LocalDateTime end = shiftDayPolicy.shiftEndAt(shiftContext, record.getWorkDate());
-        return new ScheduledShiftWindow(start, end);
+        LocalDateTime workdayStart = shiftDayPolicy.workdayStartAt(shiftContext, record.getWorkDate());
+        LocalDateTime workdayEnd = shiftDayPolicy.workdayEndAt(shiftContext, record.getWorkDate());
+        return new ScheduledShiftWindow(start, end, workdayStart, workdayEnd);
     }
 
-    /** Scheduled shift start/end resolved for one Attendance row — see {@link #resolveScheduledWindow}. */
-    public record ScheduledShiftWindow(LocalDateTime start, LocalDateTime end) {
-        public static final ScheduledShiftWindow EMPTY = new ScheduledShiftWindow(null, null);
+    /**
+     * Scheduled shift start/end, plus the logical workday start/end, resolved for one Attendance
+     * row — see {@link #resolveScheduledWindow}.
+     */
+    public record ScheduledShiftWindow(LocalDateTime start, LocalDateTime end,
+                                        LocalDateTime workdayStart, LocalDateTime workdayEnd) {
+        public static final ScheduledShiftWindow EMPTY = new ScheduledShiftWindow(null, null, null, null);
+    }
+
+    /** Plain workday start/end pair — see {@link #resolveWorkdayWindowFor}/{@link #belongsToWorkday}. */
+    public record WorkdayWindow(LocalDateTime start, LocalDateTime end) {}
+
+    /**
+     * Whether {@code timestamp} belongs to the logical workday {@code workDate} denotes — i.e.
+     * {@link ShiftDayPolicy#shiftDayOf} resolves {@code timestamp} to exactly {@code workDate},
+     * never a bare "same calendar date" comparison. Used by {@code RegularizationService} to
+     * validate a corrected check-in/check-out: a shift running 10:00-19:00 with an 18h maximum
+     * workday duration spans workday 04:00 -> 04:00 the NEXT calendar day, so a corrected punch at
+     * 12:21 AM or 3:30 AM the next calendar day can still legitimately belong to {@code workDate}'s
+     * attendance.
+     *
+     * <p>Resolves the shift context the exact same existing-vs-new way
+     * {@link #interpretExistingRecordLateness}/{@link #interpretForKnownWorkDate} already do
+     * elsewhere in this class: {@code existingRecordOrNull}'s own snapshotted {@code shiftId} when
+     * an Attendance row already exists for this date (never the employee's current Shift — the
+     * exact "reassigned since this record's date" drift this class exists to prevent), or {@code
+     * employee}'s CURRENT Shift for a brand-new correction with no prior row to preserve context
+     * from.
+     *
+     * <p>Fails OPEN (returns {@code true}) only for a legacy existing row with no {@code shiftId}
+     * snapshot — exactly like every other legacy row this class encounters (see "Legacy rows"
+     * above): this is a pre-submission sanity check, not the final authority, and {@link
+     * #interpretExistingRecordLateness} already throws its own clear, explicit error for a legacy
+     * row at APPROVAL time.
+     */
+    @Transactional(readOnly = true)
+    public boolean belongsToWorkday(Employee employee, Attendance existingRecordOrNull, LocalDate workDate, LocalDateTime timestamp) {
+        Employee shiftContext = resolveShiftContextForValidation(employee, existingRecordOrNull);
+        if (shiftContext == null) {
+            return true;
+        }
+        return shiftDayPolicy.shiftDayOf(shiftContext, timestamp).equals(workDate);
+    }
+
+    /**
+     * The workday window (start/end) {@link #belongsToWorkday} validates a timestamp against —
+     * exposed separately purely so a caller can phrase a helpful validation message ("must fall
+     * between X and Y") instead of a bare rejection. Same shift-context resolution as {@link
+     * #belongsToWorkday}; returns {@code null} in the exact same legacy-row case that method fails
+     * open for.
+     */
+    @Transactional(readOnly = true)
+    public WorkdayWindow resolveWorkdayWindowFor(Employee employee, Attendance existingRecordOrNull, LocalDate workDate) {
+        Employee shiftContext = resolveShiftContextForValidation(employee, existingRecordOrNull);
+        if (shiftContext == null) {
+            return null;
+        }
+        return new WorkdayWindow(shiftDayPolicy.workdayStartAt(shiftContext, workDate),
+                shiftDayPolicy.workdayEndAt(shiftContext, workDate));
+    }
+
+    private Employee resolveShiftContextForValidation(Employee employee, Attendance existingRecordOrNull) {
+        return existingRecordOrNull != null ? resolveShiftContextOrNull(existingRecordOrNull) : employee;
     }
 
     /**
