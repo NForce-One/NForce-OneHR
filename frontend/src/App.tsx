@@ -16,7 +16,7 @@ import ProfilePage from './pages/ProfilePage';
 import NotificationsPage from './pages/NotificationsPage';
 import DirectoryPage from './pages/DirectoryPage';
 import HierarchyPage from './pages/HierarchyPage';
-import LeavePage from './pages/LeavePage';
+import LeaveHolidaysPage from './pages/LeaveHolidaysPage';
 import MyTeamPage from './pages/MyTeamPage';
 import ApprovalsPage from './pages/ApprovalsPage';
 import MyRequestsPage from './pages/MyRequestsPage';
@@ -116,7 +116,7 @@ export default function App() {
           <Route path="/dashboard"    element={<DashboardPage />} />
           <Route path="/attendance"   element={<AttendancePage />} />
           <Route path="/attendance/regularization/all" element={<SuperAdminRegularizationPage />} />
-          <Route path="/leave"        element={<LeavePage />} />
+          <Route path="/leave"        element={<LeaveHolidaysPage />} />
           <Route path="/my-team"      element={<MyTeamPage />} />
           <Route path="/help"         element={<HelpDeskPage />} />
           <Route path="/approvals"    element={<ApprovalsPage />} />
