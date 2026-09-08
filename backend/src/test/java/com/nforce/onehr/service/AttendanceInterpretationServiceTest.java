@@ -267,6 +267,112 @@ class AttendanceInterpretationServiceTest {
 
     // ── Phase 3: per-Shift-Version grace period ──────────────────────────────
 
+    // ── resolveScheduledWindow: powers the Attendance Log's shift-boundary markers ───────────
+
+    @Test
+    void resolveScheduledWindow_normalShift_returnsExactStartAndEnd() {
+        Shift shiftA = shift("Shift A", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        // Late check-in (09:30) and early checkout (17:45 the actual, via checkOutAt) must not
+        // affect the SCHEDULED window at all — it is resolved purely from the Shift Version and
+        // workDate, never from the record's own actual punch times.
+        Attendance record = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(9, 30)))
+                .checkOutAt(LocalDateTime.of(workDate, LocalTime.of(17, 45)))
+                .shiftId(shiftA.getId()).build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(record);
+
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(9, 0)), window.start());
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(18, 0)), window.end());
+    }
+
+    @Test
+    void resolveScheduledWindow_actualExtendsBeyondScheduledEnd_windowStillReflectsTheShift_notTheActualPunch() {
+        // Example from the Attendance Log marker design: shift 09:00-18:00, actual 09:30-18:15 —
+        // the end marker must stay at 18:00 even though the employee actually checked out later.
+        Shift shiftA = shift("Shift A", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        Attendance record = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(9, 30)))
+                .checkOutAt(LocalDateTime.of(workDate, LocalTime.of(18, 15)))
+                .shiftId(shiftA.getId()).build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(record);
+
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(18, 0)), window.end(),
+                "scheduled end must stay 18:00 regardless of the actual (later) checkout");
+    }
+
+    @Test
+    void resolveScheduledWindow_overnightShift_endRollsToTheNextCalendarDay() {
+        Shift overnight = shift("Overnight", LocalTime.of(22, 0), LocalTime.of(6, 0), LocalDate.MIN, true);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        Attendance record = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(22, 10)))
+                .checkOutAt(LocalDateTime.of(workDate.plusDays(1), LocalTime.of(6, 5)))
+                .shiftId(overnight.getId()).build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(record);
+
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(22, 0)), window.start());
+        assertEquals(LocalDateTime.of(workDate.plusDays(1), LocalTime.of(6, 0)), window.end(),
+                "overnight scheduled end must roll onto workDate+1, matching shiftEndAt's own overnight rule");
+    }
+
+    @Test
+    void resolveScheduledWindow_employeeReassignedSince_historicalRecordStillUsesItsOwnSnapshottedShift() {
+        // The same reassignment regression interpretExistingSession already guards against, but
+        // for the marker-window resolution: an employee checked in under Shift A (9-18), was
+        // later reassigned to Shift B (14-22) — a historical record's markers must keep showing
+        // Shift A's window, never Shift B's, no matter what the employee is assigned to today.
+        Shift shiftA = shift("Shift A (9-18)", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true);
+        shift("Shift B (14-22)", LocalTime.of(14, 0), LocalTime.of(22, 0), LocalDate.MIN, true); // reassigned-to shift
+        LocalDate workDate = LocalDate.of(2025, 6, 1);
+        Attendance record = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(9, 5)))
+                .checkOutAt(LocalDateTime.of(workDate, LocalTime.of(18, 5)))
+                .shiftId(shiftA.getId()).build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(record);
+
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(9, 0)), window.start(), "must stay Shift A's start, never Shift B's");
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(18, 0)), window.end(), "must stay Shift A's end, never Shift B's");
+    }
+
+    @Test
+    void resolveScheduledWindow_shiftTimingChangedForTheFuture_historicalWindowStaysOnTheOldVersion() {
+        // A new ShiftVersion effective far in the future must never leak into a historical
+        // record's marker window — mirrors interpretExistingSession's own equivalent test above.
+        Shift shiftA = shift("Shift A", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.of(2020, 1, 1), true);
+        shiftVersions.add(ShiftVersion.builder().shift(shiftA).startTime(LocalTime.of(10, 0)).endTime(LocalTime.of(19, 0))
+                .lateGraceMinutes(DEFAULT_TEST_GRACE_MINUTES).effectiveFrom(LocalDate.of(2030, 1, 1)).build());
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        Attendance record = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(workDate).checkInAt(LocalDateTime.of(workDate, LocalTime.of(9, 5)))
+                .shiftId(shiftA.getId()).build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(record);
+
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(9, 0)), window.start(),
+                "must still use the OLD (9-18) version effective on 2026-03-10, not the future 10-19 one");
+        assertEquals(LocalDateTime.of(workDate, LocalTime.of(18, 0)), window.end());
+    }
+
+    @Test
+    void resolveScheduledWindow_legacyNullShiftId_returnsEmpty_neverSubstitutesAnyShift() {
+        Attendance legacyRecord = Attendance.builder().id(UUID.randomUUID()).employeeUserId(UUID.randomUUID())
+                .workDate(LocalDate.of(2025, 1, 1)).checkInAt(LocalDateTime.of(2025, 1, 1, 9, 5))
+                .shiftId(null)
+                .build();
+
+        AttendanceInterpretationService.ScheduledShiftWindow window = service.resolveScheduledWindow(legacyRecord);
+
+        assertEquals(AttendanceInterpretationService.ScheduledShiftWindow.EMPTY, window);
+        assertNull(window.start());
+        assertNull(window.end());
+    }
+
     @Test
     void interpretForKnownWorkDate_usesTheShiftsOwnGracePeriod_notAGlobalOne() {
         // 30-minute grace: a check-in 20 minutes late must be forgiven (not LATE), unlike the

@@ -115,7 +115,7 @@ class MultiPolicyAssignmentIsolationTest {
                 .thenReturn(false);
         lenient().when(attendanceExceptionRepository.countByEmployeeUserIdAndExceptionTypeAndExceptionDateBetween(any(), any(), any(), any()))
                 .thenReturn(0L);
-        lenient().when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        lenient().when(attendancePenaltyRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         lenient().when(employeeRepository.findAllByIdWithScheduleDetails(any())).thenReturn(List.of());
         // Every employee() built below carries this same Shift, so the LATE_ARRIVAL path's
         // shiftDayPolicy.resolveShiftStart(...) call never hits the no-shift invariant guard —
@@ -136,10 +136,14 @@ class MultiPolicyAssignmentIsolationTest {
                 .joiningDate(date.minusYears(1)).penalisationPolicy(policy).shift(shift).build();
     }
 
+    // Unified-grace model: Attendance.status is the sole "genuinely late" signal ExceptionService's
+    // detectExceptions gates on (see its own comment) — lateByMinutes alone no longer creates a
+    // LATE_ARRIVAL exception, so every fixture representing a genuine late arrival must also carry
+    // status LATE, exactly as AttendanceInterpretationService/AttendanceService would have set it.
     private Attendance lateAttendance(UUID employeeId, int lateByMinutes) {
         return Attendance.builder().employeeUserId(employeeId).workDate(date)
                 .checkInAt(date.atTime(9, 30).plusMinutes(lateByMinutes)).checkOutAt(date.atTime(18, 0))
-                .lateByMinutes(lateByMinutes).build();
+                .status("LATE").lateByMinutes(lateByMinutes).build();
     }
 
     @Test
@@ -162,24 +166,28 @@ class MultiPolicyAssignmentIsolationTest {
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(anyList(), eq(date), eq(date)))
                 .thenReturn(List.of(lateAttendance(employeeAId, 20), lateAttendance(employeeBId, 20)));
 
-        // Policy A: strict — 5 min grace, 1 day deduction. Policy B: lenient — 60 min grace.
+        // Policy A: Late Arrival enabled, 1 day deduction. Policy B: Late Arrival section disabled
+        // outright — both employees are equally, genuinely late (status LATE against their shared
+        // shift grace; there is no separate policy-level grace left to differ by), so this
+        // deliberately isolates the assertion to "each employee's OWN assigned policy governs" —
+        // never grace arithmetic, which the unified-grace model no longer lets a policy override.
         PenalizationPolicyVersion versionA = PenalizationPolicyVersion.builder()
                 .id(UUID.randomUUID()).policyId(policyAId).version(1)
                 .effectiveFrom(date.minusMonths(1).atStartOfDay())
-                .lateArrivalEnabled(true).laGracePeriodMinutes(5).laDeductionDays(BigDecimal.ONE).build();
+                .lateArrivalEnabled(true).laDeductionDays(BigDecimal.ONE).build();
         PenalizationPolicyVersion versionB = PenalizationPolicyVersion.builder()
                 .id(UUID.randomUUID()).policyId(policyBId).version(1)
                 .effectiveFrom(date.minusMonths(1).atStartOfDay())
-                .lateArrivalEnabled(true).laGracePeriodMinutes(60).laDeductionDays(new BigDecimal("2")).build();
+                .lateArrivalEnabled(false).build();
         when(versionRepository.findVersionsEffectiveAtForPolicy(policyAId, date.atStartOfDay())).thenReturn(List.of(versionA));
         when(versionRepository.findVersionsEffectiveAtForPolicy(policyBId, date.atStartOfDay())).thenReturn(List.of(versionB));
 
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
-        // Only Employee A's lateness (20 > 5 min grace) breaches their own policy; Employee B's
-        // identical lateness is within THEIR policy's more lenient 60-minute grace.
+        // Only Employee A's policy has Late Arrival enabled; Employee B's identical lateness is
+        // evaluated against THEIR OWN policy, which has the section disabled.
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, times(1)).saveAndFlush(captor.capture());
         AttendancePenalty penalty = captor.getValue();
         assertEquals(employeeAId, penalty.getEmployeeUserId());
         assertEquals(policyAId, penalty.getPolicyId());
@@ -214,7 +222,7 @@ class MultiPolicyAssignmentIsolationTest {
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, times(1)).saveAndFlush(captor.capture());
         assertEquals(policyAId, captor.getValue().getPolicyId(), "unassigned employee resolves to the deterministic org default, not an arbitrary policy");
         // Still never falls through to the ambiguous unscoped lookup.
         verify(versionRepository, never()).findVersionsEffectiveAt(any());

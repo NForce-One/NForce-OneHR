@@ -185,7 +185,7 @@ class ExceptionServiceTest {
                 .workDate(LocalDate.now().minusDays(1))
                 .checkInAt(LocalDateTime.now().minusDays(1).withHour(10).withMinute(0))
                 .checkOutAt(LocalDateTime.now().minusDays(1).withHour(18).withMinute(0))
-                .lateByMinutes(15)
+                .status("LATE").lateByMinutes(15)
                 .build();
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), from, to))
                 .thenReturn(List.of(lateRecord));
@@ -297,7 +297,7 @@ class ExceptionServiceTest {
                 .workDate(LocalDate.now().minusDays(1))
                 .checkInAt(LocalDateTime.now().minusDays(1).withHour(10).withMinute(0))
                 .checkOutAt(LocalDateTime.now().minusDays(1).withHour(18).withMinute(0))
-                .lateByMinutes(30)
+                .status("LATE").lateByMinutes(30)
                 .build();
         AttendanceException existing = AttendanceException.builder()
                 .id(UUID.randomUUID())

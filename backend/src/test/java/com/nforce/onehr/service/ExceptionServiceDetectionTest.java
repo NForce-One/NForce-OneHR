@@ -146,7 +146,7 @@ class ExceptionServiceDetectionTest {
                 .thenReturn(false);
         lenient().when(attendanceExceptionRepository.countByEmployeeUserIdAndExceptionTypeAndExceptionDateBetween(any(), any(), any(), any()))
                 .thenReturn(0L);
-        lenient().when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        lenient().when(attendancePenaltyRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         lenient().when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee(null)));
     }
 
@@ -179,7 +179,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository).save(captor.capture());
+        verify(attendancePenaltyRepository).saveAndFlush(captor.capture());
         assertEquals(ExceptionType.NO_ATTENDANCE, captor.getValue().getDiscrepancyType());
         assertEquals(employeeId, captor.getValue().getEmployeeUserId());
         assertEquals(targetDate, captor.getValue().getIncidentDate());
@@ -197,7 +197,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     // ── WORK_HOURS_SHORTAGE: previously "reserved"/undetectable — a completed day short of the
@@ -225,7 +225,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository).save(captor.capture());
+        verify(attendancePenaltyRepository).saveAndFlush(captor.capture());
         assertEquals(ExceptionType.WORK_HOURS_SHORTAGE, captor.getValue().getDiscrepancyType());
         assertEquals(new java.math.BigDecimal("0.5"), captor.getValue().getDeductionDays());
     }
@@ -242,7 +242,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     // ── Weekly cycle (Section 34): exempt-count window follows the configured cycle, not always
@@ -306,7 +306,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, before, after);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(3)).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(3)).saveAndFlush(captor.capture());
         assertTrue(captor.getAllValues().stream()
                 .anyMatch(p -> p.getIncidentDate().equals(holidayDate) && p.getDiscrepancyType().equals(ExceptionType.NO_ATTENDANCE)),
                 "the holiday date itself must also be penalised as NO_ATTENDANCE");
@@ -344,7 +344,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, before, after);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).saveAndFlush(captor.capture());
         assertEquals(before, captor.getValue().getIncidentDate(), "only the unattended 'before' day is penalised");
         assertNotEquals(holidayDate, captor.getValue().getIncidentDate());
     }
@@ -384,7 +384,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, before, after);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(2)).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(2)).saveAndFlush(captor.capture());
         assertTrue(captor.getAllValues().stream().anyMatch(p -> p.getIncidentDate().equals(holidayDate)),
                 "BEFORE condition penalises the holiday even though the 'after' day was attended");
     }
@@ -422,7 +422,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, thursday, friday);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).saveAndFlush(captor.capture());
         LocalDate fridayFinal = friday;
         assertTrue(captor.getAllValues().stream().anyMatch(p -> p.getIncidentDate().equals(fridayFinal)),
                 "Friday (the employee's own configured week-off, not Saturday/Sunday) must be penalised too");
@@ -482,7 +482,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, thursday, saturday);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).saveAndFlush(captor.capture());
         assertTrue(captor.getAllValues().stream().anyMatch(p -> p.getIncidentDate().equals(friday)),
                 "AFTER condition must penalise the week-off itself when the day right after it is unattended");
     }
@@ -501,7 +501,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, thursday, saturday);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     @Test
@@ -519,7 +519,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, thursday, saturday);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).saveAndFlush(captor.capture());
         assertTrue(captor.getAllValues().stream().anyMatch(p -> p.getIncidentDate().equals(friday)),
                 "ANY must trigger when only the day before the week-off is unattended");
     }
@@ -539,7 +539,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, thursday, saturday);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).saveAndFlush(captor.capture());
         assertTrue(captor.getAllValues().stream().anyMatch(p -> p.getIncidentDate().equals(friday)),
                 "ANY must trigger when only the day after the week-off is unattended");
     }
@@ -558,7 +558,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, thursday, saturday);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     // ── Half-day leave (Section 14): must be genuinely configurable, not hardcoded either way ──
@@ -598,7 +598,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, before, after);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).saveAndFlush(captor.capture());
         assertFalse(captor.getAllValues().stream().anyMatch(p -> p.getIncidentDate().equals(holidayDate)),
                 "a half-day leave, when configured to be ignored, breaks the sandwich — the holiday must NOT be penalised");
     }
@@ -637,7 +637,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, before, after);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.atLeastOnce()).saveAndFlush(captor.capture());
         assertTrue(captor.getAllValues().stream().anyMatch(p -> p.getIncidentDate().equals(holidayDate)),
                 "when half-day leave is configured to count, the sandwich is satisfied and the holiday IS penalised");
     }
@@ -715,7 +715,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository).save(captor.capture());
+        verify(attendancePenaltyRepository).saveAndFlush(captor.capture());
         assertEquals(ExceptionType.NO_ATTENDANCE, captor.getValue().getDiscrepancyType());
     }
 
@@ -761,7 +761,7 @@ class ExceptionServiceDetectionTest {
 
         // 5 days * 480 worked = 2400; 5 days * 540 expected = 2700 -> 88.9%, below the 90% tier.
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).saveAndFlush(captor.capture());
         assertEquals(ExceptionType.WORK_HOURS_SHORTAGE, captor.getValue().getDiscrepancyType());
         assertEquals(sunday, captor.getValue().getIncidentDate(), "the week's single penalty must be dated on the cycle's own last day");
         assertEquals(new java.math.BigDecimal("1"), captor.getValue().getDeductionDays());
@@ -793,7 +793,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, monday, sunday);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     @Test
@@ -823,7 +823,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, monthStart, monthEnd);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).saveAndFlush(captor.capture());
         assertEquals(monthEnd, captor.getValue().getIncidentDate(), "the month's single penalty must be dated on the calendar month's last day");
     }
 
@@ -863,7 +863,7 @@ class ExceptionServiceDetectionTest {
         // (missing, i.e. absent-from-the-map) contribution been wrongly excluded-as-zero rather
         // than genuinely excluded, or had the version's own start not been honored, this would
         // have come out below the tier instead.
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     // ── Phase 3: Missing Logs -> Work Hours Shortage linkage ────────────────────────────────
@@ -884,7 +884,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     @Test
@@ -909,7 +909,7 @@ class ExceptionServiceDetectionTest {
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).saveAndFlush(captor.capture());
         assertEquals(ExceptionType.WORK_HOURS_SHORTAGE, captor.getValue().getDiscrepancyType());
         assertEquals(new java.math.BigDecimal("0.5"), captor.getValue().getDeductionDays());
     }
@@ -944,7 +944,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).saveAndFlush(any());
     }
 
     @Test
@@ -969,7 +969,7 @@ class ExceptionServiceDetectionTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, targetDate, targetDate);
 
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
     }
 
     /**
@@ -1012,7 +1012,7 @@ class ExceptionServiceDetectionTest {
         // The displayed "expected" time is also the OLD version's own end (18:00), not the new
         // version's 13:00 — see ExceptionService's own comment on this exact line.
         assertEquals(java.time.LocalTime.of(18, 0), excCaptor.getValue().getExpectedTime());
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).saveAndFlush(any());
     }
 
     private static LocalDate priorMidWeekday() {

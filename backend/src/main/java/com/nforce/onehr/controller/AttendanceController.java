@@ -248,6 +248,7 @@ public class AttendanceController {
 
     /** Edit a still-pending request — owner only, PENDING only (enforced in the service). */
     @PatchMapping("/regularization/{id}")
+    @PreAuthorize("hasRole('EMPLOYEE')")
     public RegularizationResponse updateRegularization(@PathVariable UUID id,
                                                         @Valid @RequestBody CreateRegularizationRequest req,
                                                         Principal principal) {

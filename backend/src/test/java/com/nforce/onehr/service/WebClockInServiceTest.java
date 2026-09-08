@@ -593,6 +593,131 @@ class WebClockInServiceTest {
                 "LATE".equals(a.getStatus()) && a.getLateByMinutes() != null && a.getLateByMinutes() > 200));
     }
 
+    // ── Unified-grace model (2026-09-08 audit): the shift's own allowed-late privilege is the
+    // sole grace, for Web Clock-In exactly as it already was for the normal Check-In path.
+    // Deterministic-"now" helper mirrors submit_computesLatenessCorrectly_...'s own technique. ──
+
+    /** Builds the deterministic ZoneOffset so LocalDateTime.now() reads as exactly {@code time} local, regardless of when this test actually runs. */
+    private ZoneOffset offsetForNow(LocalTime time) {
+        LocalDateTime utcNow = LocalDateTime.now(ZoneOffset.UTC);
+        int targetSecondOfDay = time.toSecondOfDay();
+        int offsetSeconds = targetSecondOfDay - utcNow.toLocalTime().toSecondOfDay();
+        if (offsetSeconds > 18 * 3600) offsetSeconds -= 24 * 3600;
+        if (offsetSeconds < -18 * 3600) offsetSeconds += 24 * 3600;
+        return ZoneOffset.ofTotalSeconds(offsetSeconds);
+    }
+
+    private void useDayShiftEmployee(String employeeEmail, ZoneOffset offset) {
+        com.nforce.onehr.entity.Location location = com.nforce.onehr.entity.Location.builder()
+                .name("Test Location").timezone(offset.getId()).build();
+        com.nforce.onehr.entity.Shift dayShift = shift("Day Shift", LocalTime.of(9, 0), LocalTime.of(18, 0));
+        com.nforce.onehr.entity.Employee employee = com.nforce.onehr.entity.Employee.builder()
+                .userId(employeeId).employeeCode("E1").fullName("Test Employee").shift(dayShift).location(location).build();
+        when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee));
+        lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser(employeeEmail)));
+    }
+
+    @Test
+    void submit_at0905_withinTenMinuteGrace_staysPresent() {
+        String employeeEmail = "employee@test.com";
+        useDayShiftEmployee(employeeEmail, offsetForNow(LocalTime.of(9, 5)));
+
+        WebClockInResponse resp = service.submit(
+                CreateWebClockInRequest.builder().reason("Remote start").timezone(null).build(), employeeEmail);
+
+        assertEquals("PENDING", resp.getStatus());
+        verify(attendanceRepository).saveAndFlush(argThat(a -> "PRESENT".equals(a.getStatus())));
+    }
+
+    /**
+     * The grace boundary itself (10 minutes) is still accepted, not rejected. Targets 09:09:59
+     * rather than exactly 09:10:00: the deadline itself
+     * ({@code shiftStart(09:00:00) + 10min = 09:10:00.000000000} exactly) is a single nanosecond
+     * instant a real wall-clock read can never reliably land ON (this offset trick only aligns to
+     * whole seconds — the real nanosecond-of-second component is whatever it naturally is) — one
+     * second of margin is the finest precision available without flaking, and still exercises
+     * "right at the edge of the window," never the safely-inside-grace 09:05 case above.
+     */
+    @Test
+    void submit_at0909_59_rightAtTheGraceBoundary_staysPresent() {
+        String employeeEmail = "employee@test.com";
+        useDayShiftEmployee(employeeEmail, offsetForNow(LocalTime.of(9, 9, 59)));
+
+        WebClockInResponse resp = service.submit(
+                CreateWebClockInRequest.builder().reason("Remote start").timezone(null).build(), employeeEmail);
+
+        assertEquals("PENDING", resp.getStatus());
+        verify(attendanceRepository).saveAndFlush(argThat(a -> "PRESENT".equals(a.getStatus())));
+    }
+
+    @Test
+    void submit_at0911_pastGrace_isLate() {
+        String employeeEmail = "employee@test.com";
+        useDayShiftEmployee(employeeEmail, offsetForNow(LocalTime.of(9, 11)));
+
+        WebClockInResponse resp = service.submit(
+                CreateWebClockInRequest.builder().reason("Remote start").timezone(null).build(), employeeEmail);
+
+        assertEquals("PENDING", resp.getStatus());
+        verify(attendanceRepository).saveAndFlush(argThat(a -> "LATE".equals(a.getStatus())));
+    }
+
+    /**
+     * The confirmed defect this fix addresses: checkOut()'s own status finalization used to
+     * recompute LATE/PRESENT from the raw {@code lateByMinutes > 0} figure — ignoring the shift's
+     * allowed-late privilege entirely — silently flipping an already-correctly-graced PRESENT
+     * Web-only day to LATE the moment the shift naturally ended. A LATE flip here would then
+     * (correctly, per ExceptionService's own status-gated detection) create a genuine
+     * LATE_ARRIVAL incident on the next dashboard load for an arrival that was never actually
+     * late — this test proves checkOut() itself can no longer produce that false incident's
+     * root cause. Check-in at 09:05 against a 09:00 shift with a 10-minute privilege is
+     * genuinely NOT late (lateByMinutes stays 5, the raw, no-forgiveness display figure) — a
+     * full day worked past the shift's own end must still finalize as PRESENT, not LATE.
+     */
+    @Test
+    void checkOut_afterShiftEnd_checkInWithinGrace_remainsPresent_neverFlipsToLateFromRawLateByMinutes() {
+        String employeeEmail = "employee@test.com";
+        ZoneOffset offset = offsetForNow(LocalTime.of(18, 5));
+        lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser(employeeEmail)));
+        com.nforce.onehr.entity.Shift dayShift = shift("Day Shift", LocalTime.of(9, 0), LocalTime.of(18, 0));
+
+        LocalDate workDate = LocalDate.now(ZoneId.of(offset.getId()));
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(9, 5));
+        WebClockInRequest req = WebClockInRequest.builder()
+                .id(UUID.randomUUID())
+                .employeeUserId(employeeId)
+                .workDate(workDate)
+                .requestedCheckIn(checkInAt)
+                .status("APPROVED")
+                .build();
+        when(webClockInRepository.findFirstByEmployeeUserIdAndCheckedOutAtIsNullOrderByWorkDateDesc(employeeId))
+                .thenReturn(Optional.of(req));
+
+        Attendance record = Attendance.builder()
+                .id(UUID.randomUUID())
+                .employeeUserId(employeeId)
+                .workDate(workDate)
+                .checkInAt(checkInAt)
+                .sessionStartedAt(checkInAt)
+                .lateByMinutes(5)
+                .status("PRESENT")
+                .timezone(offset.getId())
+                .shiftId(dayShift.getId())
+                .build();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, workDate))
+                .thenReturn(Optional.of(record));
+        // Full day worked, comfortably above the half-day threshold — the branch under test
+        // (workedMinutes >= half-day threshold) is the one that recomputes LATE/PRESENT.
+        when(attendanceService.recomputeCombinedWorkedMinutes(eq(employeeId), eq(record.getId()), eq(workDate), any()))
+                .thenReturn(530);
+
+        service.checkOut(employeeEmail, null);
+
+        assertEquals("PRESENT", record.getStatus(),
+                "5 minutes late is within the shift's 10-minute allowed-late privilege — must stay "
+                        + "PRESENT even once the shift naturally ends, never flip to LATE from raw lateByMinutes");
+    }
+
     /**
      * The actual reported bug: an employee Web Clock-Out then Web Clock-In again the same shift
      * BEFORE HR has reviewed the first (still-PENDING) request. The second cycle must mirror that

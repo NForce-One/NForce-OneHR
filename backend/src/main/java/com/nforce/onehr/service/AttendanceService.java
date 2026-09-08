@@ -519,10 +519,22 @@ public class AttendanceService {
         // resolved — see AttendanceInterpretationService) is never finalized here either: there
         // is no reliable "has the shift ended" signal to finalize against, so status is left
         // exactly as check-in set it rather than guessed.
+        //
+        // Re-derived via interpretExistingRecordLateness (the same shift-grace-aware formula
+        // check-in itself used, against THIS record's own snapshotted Shift/workDate) rather than
+        // a bare `lateByMinutes > 0` — lateByMinutes is the raw, no-forgiveness display figure, so
+        // using it directly here would silently flip an already-correctly-graced PRESENT arrival
+        // (e.g. 5 minutes late against a 10-minute allowed-late privilege) to LATE the moment the
+        // day's shift naturally ends, contradicting the grace decision check-in already made.
+        // Never LEGACY_UNRESOLVED here: workedMinutesCapAt is only ever non-null when this exact
+        // record's shiftId already resolved via the identical resolveShiftContextOrNull check
+        // inside checkOut's own interpretExistingSession call just above in the call chain.
         if (workedMinutesCapAt != null && !actualCheckOut.isBefore(workedMinutesCapAt)) {
+            boolean isLate = attendanceInterpretationService
+                    .interpretExistingRecordLateness(record, record.getCheckInAt()).getIsLate();
             record.setStatus(workedMinutes < attendanceRulesService.getHalfDayMaxHours() * 60
                     ? STATUS_HALF_DAY
-                    : (record.getLateByMinutes() > 0 ? STATUS_LATE : STATUS_PRESENT));
+                    : (isLate ? STATUS_LATE : STATUS_PRESENT));
         }
 
         return attendanceRepository.save(record);
@@ -641,9 +653,24 @@ public class AttendanceService {
      * judged stale. A legacy pre-snapshot record ({@code shiftId == null}) cannot be safely
      * evaluated at all — rather than substituting the employee's current Shift, this leaves it
      * untouched (not flagged) until it's resolved some other way (e.g. Regularization).
+     *
+     * <p>{@code record.getCheckOutAt() == null} alone is NOT the same thing as "this day is still
+     * open" — {@link WebClockInService#checkOut} deliberately never writes this column (that field
+     * is reserved exclusively for the normal Check-In/Check-Out session — see its own Javadoc), so
+     * a day whose ONLY punches were Web Clock-In/Out has a permanently-null
+     * {@code checkOutAt} even once fully, correctly completed. Without the
+     * {@link #hasAnyOpenSession} guard below, the org-wide sweep ({@link
+     * #flagAllStaleOpenSessionsAsMissingCheckout}, whose candidate query is exactly
+     * {@code checkOutAt IS NULL}) would silently overwrite that already-correct PRESENT/LATE/
+     * HALF_DAY status with MISSING_CHECKOUT on every such day, the very next sweep after its
+     * workday boundary passed — this bug is why the guard exists. The per-employee lazy callers
+     * ({@link #getToday}/{@link #checkIn}/{@link #checkOut}) are unaffected either way — they only
+     * ever pass a record already known to have a genuinely open normal punch (via {@link
+     * #findOpenNormalAttendance}), so this guard is a no-op (always true) for them.
      */
     private boolean flagMissingCheckoutIfStale(Attendance record, LocalDateTime now) {
         if (record.getCheckOutAt() != null) return false;
+        if (!hasAnyOpenSession(record)) return false;
         if (STATUS_MISSING_CHECKOUT.equals(record.getStatus())) return true;
         AttendanceInterpretation interpretation = attendanceInterpretationService.interpretExistingSession(record, now);
         if (interpretation.isLegacyUnresolved()) {
@@ -663,6 +690,22 @@ public class AttendanceService {
         String after = auditSnapshot.toJson(Map.of("status", STATUS_MISSING_CHECKOUT));
         auditService.log(record.getEmployeeUserId(), "ATTENDANCE_MISSING_CHECKOUT", saved.getId(), before, after);
         return true;
+    }
+
+    /**
+     * Is EITHER of this record's two independent session mechanisms — the normal Check-In/Out
+     * session (an open {@link AttendancePunch}) or a Web Clock-In session (an open {@link
+     * WebClockInRequest} for this employee/workDate) — still genuinely open? See {@link
+     * #flagMissingCheckoutIfStale}'s own Javadoc for why {@code Attendance.checkOutAt == null}
+     * alone cannot answer this question: Web Clock-Out never sets that column, even for a fully,
+     * correctly completed day.
+     */
+    private boolean hasAnyOpenSession(Attendance record) {
+        if (attendancePunchRepository.existsByAttendanceRecordIdAndCheckOutAtIsNull(record.getId())) {
+            return true;
+        }
+        return webClockInRequestRepository.existsByEmployeeUserIdAndWorkDateAndCheckedOutAtIsNull(
+                record.getEmployeeUserId(), record.getWorkDate());
     }
 
     /**
@@ -746,9 +789,16 @@ public class AttendanceService {
                 continue; // shift hasn't ended yet — still resumable, leave it for a later sweep
             }
             int workedMinutes = record.getWorkedMinutes() != null ? record.getWorkedMinutes() : 0;
+            // Same shift-grace-aware recompute as closeSession, and for the same reason: a bare
+            // `lateByMinutes > 0` would flip an already-correctly-graced PRESENT arrival (within
+            // the shift's own allowed-late privilege) to LATE the moment this sweep finalizes the
+            // day, contradicting the grace decision check-in already made. Never LEGACY_UNRESOLVED
+            // here — already `continue`d above via the identical shiftId resolution.
+            boolean isLate = attendanceInterpretationService
+                    .interpretExistingRecordLateness(record, record.getCheckInAt()).getIsLate();
             String finalStatus = workedMinutes < attendanceRulesService.getHalfDayMaxHours() * 60
                     ? STATUS_HALF_DAY
-                    : (record.getLateByMinutes() != null && record.getLateByMinutes() > 0 ? STATUS_LATE : STATUS_PRESENT);
+                    : (isLate ? STATUS_LATE : STATUS_PRESENT);
             if (!finalStatus.equals(record.getStatus())) {
                 record.setStatus(finalStatus);
                 try {
@@ -1429,6 +1479,11 @@ public class AttendanceService {
 
     private AttendanceResponse toResponse(Attendance record, Employee employee) {
         Integer worked = record.getWorkedMinutes();
+        // Resolved against THIS ROW's own snapshotted shiftId (never employee's current Shift) —
+        // see AttendanceInterpretationService#resolveScheduledWindow's own Javadoc. Powers the
+        // Attendance Log's shift-boundary markers only.
+        AttendanceInterpretationService.ScheduledShiftWindow scheduledWindow =
+                attendanceInterpretationService.resolveScheduledWindow(record);
         return AttendanceResponse.builder()
                 .id(record.getId())
                 .employeeUserId(record.getEmployeeUserId())
@@ -1444,6 +1499,8 @@ public class AttendanceService {
                 .source(record.getSource())
                 .workMode(employee.getWorkMode())
                 .timezone(record.getTimezone())
+                .shiftStartAt(scheduledWindow.start())
+                .shiftEndAt(scheduledWindow.end())
                 .build();
     }
 }

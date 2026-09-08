@@ -73,6 +73,18 @@ public class RegularizationRequest {
     @Column(name = "updated_at", nullable = false)
     private LocalDateTime updatedAt;
 
+    // Concurrent approve() and reject() calls on the same still-PENDING/PARTIALLY_APPROVED
+    // request otherwise race with nothing coordinating between them: both read-modify-write this
+    // same row (status, reviewedBy/At, approvedBy/At or finalApprovedBy/At) with only an in-memory
+    // status check guarding either — the loser's save() would silently overwrite the winner's
+    // decision, leaving the Attendance mutation one branch already applied (approve()) alongside a
+    // REJECTED status and notification from the other, with no rollback of either. @Version turns
+    // that into an ObjectOptimisticLockingFailureException (translated to a clean 409 by
+    // GlobalExceptionHandler) instead — see V171's migration comment. Mirrors Attendance's
+    // identical fix (V164) for the same class of read-modify-write race.
+    @Version
+    private Long version;
+
     @PrePersist
     protected void onCreate() {
         createdAt = updatedAt = LocalDateTime.now();
