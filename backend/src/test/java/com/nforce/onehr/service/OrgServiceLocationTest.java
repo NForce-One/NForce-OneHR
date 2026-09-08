@@ -31,7 +31,15 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
-/** Location name capitalization normalization on create/update, and preserved validation/duplicate behavior. */
+/**
+ * Location name/city/state/country/holiday-region stay freely editable (any number of Locations
+ * can be created) — the same capitalization normalization and duplicate-name protection as
+ * before. Timezone, however, is the one field that's NOT freely editable: it must be one of
+ * {@link OrgService#SUPPORTED_TIMEZONES}, never an arbitrary or malformed IANA zone id, so a
+ * Location + Timezone combination that doesn't correspond to one of the business's actual
+ * supported zones (e.g. the pre-existing "Texas" → America/New_York data bug fixed in V169) is no
+ * longer representable.
+ */
 @ExtendWith(MockitoExtension.class)
 class OrgServiceLocationTest {
 
@@ -59,6 +67,13 @@ class OrgServiceLocationTest {
         lenient().when(employeeRepo.countByLocationId(any())).thenReturn(0L);
     }
 
+    private CreateLocationRequest createReq(String name, String timezone) {
+        CreateLocationRequest req = new CreateLocationRequest();
+        req.setName(name);
+        req.setTimezone(timezone);
+        return req;
+    }
+
     @ParameterizedTest
     @CsvSource({
             "hyderabad, Hyderabad",
@@ -71,10 +86,7 @@ class OrgServiceLocationTest {
             "'hyderabad city office', 'Hyderabad City Office'"
     })
     void createLocation_normalizesNameCasing(String input, String expected) {
-        CreateLocationRequest req = new CreateLocationRequest();
-        req.setName(input);
-
-        LocationResponse response = service.createLocation(req);
+        LocationResponse response = service.createLocation(createReq(input, "Asia/Kolkata"));
 
         assertEquals(expected, response.getName());
         ArgumentCaptor<Location> captor = ArgumentCaptor.forClass(Location.class);
@@ -83,13 +95,46 @@ class OrgServiceLocationTest {
     }
 
     @Test
+    void createLocation_acceptsAnySupportedTimezone() {
+        for (String tz : OrgService.SUPPORTED_TIMEZONES) {
+            reset(locationRepo);
+            lenient().when(locationRepo.save(any())).thenAnswer(inv -> inv.getArgument(0));
+
+            LocationResponse response = service.createLocation(createReq("Austin", tz));
+
+            assertEquals(tz, response.getTimezone());
+        }
+    }
+
+    @Test
+    void createLocation_rejectsATimezoneNotInTheSupportedSet() {
+        // A real, validly-parseable IANA zone (Europe/London) that just isn't one of the four
+        // this business currently supports — must still be rejected, not merely "invalid syntax".
+        CreateLocationRequest req = createReq("Austin", "Europe/London");
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> service.createLocation(req));
+        assertTrue(ex.getMessage().contains("Europe/London"));
+        assertTrue(ex.getMessage().contains("Asia/Kolkata"), "should list the supported options");
+        verify(locationRepo, never()).save(any());
+    }
+
+    @Test
+    void createLocation_rejectsAMalformedTimezone() {
+        CreateLocationRequest req = createReq("Austin", "Not/A_Real_Zone");
+
+        assertThrows(IllegalArgumentException.class, () -> service.createLocation(req));
+        verify(locationRepo, never()).save(any());
+    }
+
+    @Test
     void updateLocation_normalizesNameCasing() {
         UUID id = UUID.randomUUID();
-        Location existing = Location.builder().id(id).name("Hyderabad").build();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
         when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
 
         UpdateLocationRequest req = new UpdateLocationRequest();
         req.setName("nEW yORK");
+        req.setTimezone("America/New_York");
 
         LocationResponse response = service.updateLocation(id, req);
 
@@ -98,25 +143,40 @@ class OrgServiceLocationTest {
     }
 
     @Test
+    void updateLocation_rejectsATimezoneNotInTheSupportedSet() {
+        UUID id = UUID.randomUUID();
+        // Simulates correcting a wrongly-configured Location (e.g. the real "Texas" ->
+        // America/New_York data bug fixed by V169) — but only onto a SUPPORTED zone.
+        Location existing = Location.builder().id(id).name("Texas").timezone("America/New_York").build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Texas");
+        req.setTimezone("Australia/Sydney");
+
+        assertThrows(IllegalArgumentException.class, () -> service.updateLocation(id, req));
+        assertEquals("America/New_York", existing.getTimezone(), "must not be mutated on a rejected update");
+        verify(locationRepo, never()).save(any());
+    }
+
+    @Test
     void createLocation_duplicateCheckIsCaseInsensitiveAgainstNormalizedName() {
         when(locationRepo.existsByNameIgnoreCase("New York")).thenReturn(true);
 
-        CreateLocationRequest req = new CreateLocationRequest();
-        req.setName("nEW yORK");
-
-        assertThrows(IllegalArgumentException.class, () -> service.createLocation(req));
+        assertThrows(IllegalArgumentException.class, () -> service.createLocation(createReq("nEW yORK", "America/New_York")));
         verify(locationRepo, never()).save(any());
     }
 
     @Test
     void updateLocation_duplicateCheckIsCaseInsensitiveAgainstNormalizedName() {
         UUID id = UUID.randomUUID();
-        Location existing = Location.builder().id(id).name("Hyderabad").build();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
         when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
         when(locationRepo.existsByNameIgnoreCase("New York")).thenReturn(true);
 
         UpdateLocationRequest req = new UpdateLocationRequest();
         req.setName("nEW yORK");
+        req.setTimezone("America/New_York");
 
         assertThrows(IllegalArgumentException.class, () -> service.updateLocation(id, req));
         verify(locationRepo, never()).save(any());
@@ -125,11 +185,12 @@ class OrgServiceLocationTest {
     @Test
     void updateLocation_allowsSavingSameNameRegardlessOfCasing() {
         UUID id = UUID.randomUUID();
-        Location existing = Location.builder().id(id).name("Hyderabad").build();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
         when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
 
         UpdateLocationRequest req = new UpdateLocationRequest();
         req.setName("HYDERABAD");
+        req.setTimezone("Asia/Kolkata");
 
         LocationResponse response = service.updateLocation(id, req);
 

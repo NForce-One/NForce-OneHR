@@ -252,9 +252,10 @@ public class AttendanceService {
         WeeklyOffPolicy weeklyOffPolicy = employee.getWeeklyOffPolicy();
         // A live "what applies today" display, not tied to any specific historical Attendance
         // record — resolves the Shift Version effective right now, same as the Shifts tab itself.
-        // Resolved in THIS employee's own zone (see zoneIdFor) — not the bare org-wide default —
-        // so the displayed shift start/end matches what their own Check-In would actually compute.
-        LocalDate configDay = LocalDate.now(zoneIdFor(employee));
+        // Resolved in THIS employee's own zone (see AttendanceRulesService.resolveEmployeeZoneId)
+        // — not the bare org-wide default — so the displayed shift start/end matches what their
+        // own Check-In would actually compute.
+        LocalDate configDay = LocalDate.now(attendanceRulesService.resolveEmployeeZoneId(employee));
 
         return AttendanceConfigResponse.builder()
                 .shiftName(shift != null ? shift.getName() : null)
@@ -518,10 +519,22 @@ public class AttendanceService {
         // resolved — see AttendanceInterpretationService) is never finalized here either: there
         // is no reliable "has the shift ended" signal to finalize against, so status is left
         // exactly as check-in set it rather than guessed.
+        //
+        // Re-derived via interpretExistingRecordLateness (the same shift-grace-aware formula
+        // check-in itself used, against THIS record's own snapshotted Shift/workDate) rather than
+        // a bare `lateByMinutes > 0` — lateByMinutes is the raw, no-forgiveness display figure, so
+        // using it directly here would silently flip an already-correctly-graced PRESENT arrival
+        // (e.g. 5 minutes late against a 10-minute allowed-late privilege) to LATE the moment the
+        // day's shift naturally ends, contradicting the grace decision check-in already made.
+        // Never LEGACY_UNRESOLVED here: workedMinutesCapAt is only ever non-null when this exact
+        // record's shiftId already resolved via the identical resolveShiftContextOrNull check
+        // inside checkOut's own interpretExistingSession call just above in the call chain.
         if (workedMinutesCapAt != null && !actualCheckOut.isBefore(workedMinutesCapAt)) {
+            boolean isLate = attendanceInterpretationService
+                    .interpretExistingRecordLateness(record, record.getCheckInAt()).getIsLate();
             record.setStatus(workedMinutes < attendanceRulesService.getHalfDayMaxHours() * 60
                     ? STATUS_HALF_DAY
-                    : (record.getLateByMinutes() > 0 ? STATUS_LATE : STATUS_PRESENT));
+                    : (isLate ? STATUS_LATE : STATUS_PRESENT));
         }
 
         return attendanceRepository.save(record);
@@ -640,9 +653,24 @@ public class AttendanceService {
      * judged stale. A legacy pre-snapshot record ({@code shiftId == null}) cannot be safely
      * evaluated at all — rather than substituting the employee's current Shift, this leaves it
      * untouched (not flagged) until it's resolved some other way (e.g. Regularization).
+     *
+     * <p>{@code record.getCheckOutAt() == null} alone is NOT the same thing as "this day is still
+     * open" — {@link WebClockInService#checkOut} deliberately never writes this column (that field
+     * is reserved exclusively for the normal Check-In/Check-Out session — see its own Javadoc), so
+     * a day whose ONLY punches were Web Clock-In/Out has a permanently-null
+     * {@code checkOutAt} even once fully, correctly completed. Without the
+     * {@link #hasAnyOpenSession} guard below, the org-wide sweep ({@link
+     * #flagAllStaleOpenSessionsAsMissingCheckout}, whose candidate query is exactly
+     * {@code checkOutAt IS NULL}) would silently overwrite that already-correct PRESENT/LATE/
+     * HALF_DAY status with MISSING_CHECKOUT on every such day, the very next sweep after its
+     * workday boundary passed — this bug is why the guard exists. The per-employee lazy callers
+     * ({@link #getToday}/{@link #checkIn}/{@link #checkOut}) are unaffected either way — they only
+     * ever pass a record already known to have a genuinely open normal punch (via {@link
+     * #findOpenNormalAttendance}), so this guard is a no-op (always true) for them.
      */
     private boolean flagMissingCheckoutIfStale(Attendance record, LocalDateTime now) {
         if (record.getCheckOutAt() != null) return false;
+        if (!hasAnyOpenSession(record)) return false;
         if (STATUS_MISSING_CHECKOUT.equals(record.getStatus())) return true;
         AttendanceInterpretation interpretation = attendanceInterpretationService.interpretExistingSession(record, now);
         if (interpretation.isLegacyUnresolved()) {
@@ -662,6 +690,22 @@ public class AttendanceService {
         String after = auditSnapshot.toJson(Map.of("status", STATUS_MISSING_CHECKOUT));
         auditService.log(record.getEmployeeUserId(), "ATTENDANCE_MISSING_CHECKOUT", saved.getId(), before, after);
         return true;
+    }
+
+    /**
+     * Is EITHER of this record's two independent session mechanisms — the normal Check-In/Out
+     * session (an open {@link AttendancePunch}) or a Web Clock-In session (an open {@link
+     * WebClockInRequest} for this employee/workDate) — still genuinely open? See {@link
+     * #flagMissingCheckoutIfStale}'s own Javadoc for why {@code Attendance.checkOutAt == null}
+     * alone cannot answer this question: Web Clock-Out never sets that column, even for a fully,
+     * correctly completed day.
+     */
+    private boolean hasAnyOpenSession(Attendance record) {
+        if (attendancePunchRepository.existsByAttendanceRecordIdAndCheckOutAtIsNull(record.getId())) {
+            return true;
+        }
+        return webClockInRequestRepository.existsByEmployeeUserIdAndWorkDateAndCheckedOutAtIsNull(
+                record.getEmployeeUserId(), record.getWorkDate());
     }
 
     /**
@@ -745,9 +789,16 @@ public class AttendanceService {
                 continue; // shift hasn't ended yet — still resumable, leave it for a later sweep
             }
             int workedMinutes = record.getWorkedMinutes() != null ? record.getWorkedMinutes() : 0;
+            // Same shift-grace-aware recompute as closeSession, and for the same reason: a bare
+            // `lateByMinutes > 0` would flip an already-correctly-graced PRESENT arrival (within
+            // the shift's own allowed-late privilege) to LATE the moment this sweep finalizes the
+            // day, contradicting the grace decision check-in already made. Never LEGACY_UNRESOLVED
+            // here — already `continue`d above via the identical shiftId resolution.
+            boolean isLate = attendanceInterpretationService
+                    .interpretExistingRecordLateness(record, record.getCheckInAt()).getIsLate();
             String finalStatus = workedMinutes < attendanceRulesService.getHalfDayMaxHours() * 60
                     ? STATUS_HALF_DAY
-                    : (record.getLateByMinutes() != null && record.getLateByMinutes() > 0 ? STATUS_LATE : STATUS_PRESENT);
+                    : (isLate ? STATUS_LATE : STATUS_PRESENT);
             if (!finalStatus.equals(record.getStatus())) {
                 record.setStatus(finalStatus);
                 try {
@@ -1315,38 +1366,17 @@ public class AttendanceService {
      * Clock for a specific employee's own self-service actions and history — check-in/out,
      * "today" status, worked-hours/late-arrival math, and shift-day attribution are all computed
      * in THIS employee's own configured timezone, not the single global business zone. See
-     * {@link #zoneIdFor} for the precedence chain.
+     * {@link AttendanceRulesService#resolveEmployeeZoneId} for the resolution chain.
      */
     private LocalDateTime now(Employee employee) {
-        return LocalDateTime.now(zoneIdFor(employee));
-    }
-
-    /**
-     * Precedence, highest first: (1) the employee's own {@link Employee#getTimezone()} — Admin-
-     * set, authoritative once present, and the ONLY way an employee's attendance clock differs
-     * from the org default (their own browser-reported zone is never consulted — see
-     * {@link #resolveZone(String, Employee)}'s doc comment); (2) their assigned
-     * {@link Location#getTimezone()}, unchanged fallback behavior for any employee HR hasn't set
-     * an explicit timezone for; (3) the org-wide default — {@link AttendanceRulesService
-     * #getDefaultZoneId()}, an Admin-configurable singleton (migrated off {@code
-     * app.attendance.zone} — see V167's migration comment for why only the Attendance/Web-Clock/
-     * Regularization flow reads it from here rather than straight from YAML).
-     */
-    private ZoneId zoneIdFor(Employee employee) {
-        String employeeTimezone = employee.getTimezone();
-        if (employeeTimezone != null && !employeeTimezone.isBlank()) {
-            return ZoneId.of(employeeTimezone);
-        }
-        String locationTimezone = employee.getLocation() != null ? employee.getLocation().getTimezone() : null;
-        return (locationTimezone != null && !locationTimezone.isBlank())
-                ? ZoneId.of(locationTimezone)
-                : attendanceRulesService.getDefaultZoneId();
+        return LocalDateTime.now(attendanceRulesService.resolveEmployeeZoneId(employee));
     }
 
     /**
      * Parses an IANA zone id (e.g. from the browser's {@code Intl.DateTimeFormat()
-     * .resolvedOptions().timeZone}), or null if it's missing/blank/not a real zone — callers
-     * fall back to {@link #zoneIdFor} rather than fail the request over a malformed value.
+     * .resolvedOptions().timeZone}), or null if it's missing/blank/not a real zone — callers fall
+     * back to {@link AttendanceRulesService#resolveEmployeeZoneId} rather than fail the request
+     * over a malformed value.
      */
     private ZoneId parseZone(String candidate) {
         if (candidate == null || candidate.isBlank()) return null;
@@ -1359,7 +1389,7 @@ public class AttendanceService {
 
     /**
      * Zone for a fresh Check-In/Web Clock-In click: ALWAYS resolved server-side via
-     * {@link #zoneIdFor}'s precedence chain (employee's own timezone, then Location, then the
+     * {@link AttendanceRulesService#resolveEmployeeZoneId} (the employee's Location, then the
      * org-wide default). {@code clientTimezone} (the browser-reported zone, still sent by the
      * frontend on every punch) is deliberately never consulted here: per explicit requirement,
      * the employee's own configured timezone is the ONLY authoritative source for their
@@ -1368,19 +1398,20 @@ public class AttendanceService {
      * {@link Attendance#getTimezone()} for the rest of that session's lifetime.
      */
     private ZoneId resolveZone(String clientTimezone, Employee employee) {
-        return zoneIdFor(employee);
+        return attendanceRulesService.resolveEmployeeZoneId(employee);
     }
 
     /**
      * Zone for an EXISTING session — its own {@link Attendance#getTimezone()}, locked in at
-     * Check-In (itself already resolved via {@link #zoneIdFor}'s precedence chain) governs
-     * Check-Out/grace-window/worked-minutes math for as long as it's open. Falls back to
-     * {@link #zoneIdFor} only for a record predating this column; {@code clientTimezoneFallback}
-     * is likewise never consulted, for the same reason as above.
+     * Check-In (itself already resolved via {@link AttendanceRulesService#resolveEmployeeZoneId})
+     * governs Check-Out/grace-window/worked-minutes math for as long as it's open. Falls back to
+     * {@link AttendanceRulesService#resolveEmployeeZoneId} only for a record predating this
+     * column; {@code clientTimezoneFallback} is likewise never consulted, for the same reason as
+     * above.
      */
     private ZoneId resolveZone(Attendance record, Employee employee, String clientTimezoneFallback) {
         ZoneId stored = parseZone(record.getTimezone());
-        return stored != null ? stored : zoneIdFor(employee);
+        return stored != null ? stored : attendanceRulesService.resolveEmployeeZoneId(employee);
     }
 
     private ZoneId resolveZone(Attendance record, Employee employee) {
@@ -1448,6 +1479,11 @@ public class AttendanceService {
 
     private AttendanceResponse toResponse(Attendance record, Employee employee) {
         Integer worked = record.getWorkedMinutes();
+        // Resolved against THIS ROW's own snapshotted shiftId (never employee's current Shift) —
+        // see AttendanceInterpretationService#resolveScheduledWindow's own Javadoc. Powers the
+        // Attendance Log's shift-boundary markers only.
+        AttendanceInterpretationService.ScheduledShiftWindow scheduledWindow =
+                attendanceInterpretationService.resolveScheduledWindow(record);
         return AttendanceResponse.builder()
                 .id(record.getId())
                 .employeeUserId(record.getEmployeeUserId())
@@ -1463,6 +1499,8 @@ public class AttendanceService {
                 .source(record.getSource())
                 .workMode(employee.getWorkMode())
                 .timezone(record.getTimezone())
+                .shiftStartAt(scheduledWindow.start())
+                .shiftEndAt(scheduledWindow.end())
                 .build();
     }
 }

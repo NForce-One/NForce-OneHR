@@ -465,9 +465,21 @@ public class WebClockInService {
         // null cutoff (legacy pre-snapshot record) is never finalized here either — see
         // AttendanceService.closeSession's identical null-cutoff handling.
         if (!STATUS_MISSING_CHECKOUT.equals(record.getStatus()) && cutoff != null && !now.isBefore(cutoff)) {
+            // Re-derived via interpretExistingRecordLateness (the same shift-grace-aware formula
+            // check-in itself used, against THIS record's own snapshotted Shift/workDate) rather
+            // than a bare `lateByMinutes > 0` — lateByMinutes is the raw, no-forgiveness display
+            // figure, so using it directly here would silently flip an already-correctly-graced
+            // PRESENT arrival (e.g. 5 minutes late against a 10-minute allowed-late privilege) to
+            // LATE the moment the shift naturally ends, contradicting the grace decision check-in
+            // already made. Mirrors AttendanceService.closeSession's identical fix. Never
+            // LEGACY_UNRESOLVED here: cutoff is only ever non-null once this exact record's
+            // shiftId already resolved via the identical resolveShiftContextOrNull check inside
+            // interpretExistingSession just above in this same method.
+            boolean isLate = attendanceInterpretationService
+                    .interpretExistingRecordLateness(record, record.getCheckInAt()).getIsLate();
             record.setStatus(workedMinutes < attendanceRulesService.getHalfDayMaxHours() * 60
                     ? STATUS_HALF_DAY
-                    : (record.getLateByMinutes() > 0 ? STATUS_LATE : STATUS_PRESENT));
+                    : (isLate ? STATUS_LATE : STATUS_PRESENT));
         }
         attendanceRepository.save(record);
 
@@ -557,25 +569,14 @@ public class WebClockInService {
     }
 
     /**
-     * Precedence, highest first: the employee's own Employee.timezone (Admin-set, authoritative
-     * once present), then their assigned Location.timezone, then the org-wide default
-     * (AttendanceRulesService.getDefaultZoneId(), Admin-configurable — see V167). Mirrors
-     * AttendanceService.zoneIdFor exactly. Used only when there's no browser-reported (or
-     * session-locked) zone to prefer — see resolveZone.
+     * The employee's Location timezone, else the org-wide default — see
+     * {@link AttendanceRulesService#resolveEmployeeZoneId}, the single shared implementation
+     * (this used to be its own separately-duplicated copy). Used only when there's no
+     * browser-reported (or session-locked) zone to prefer — see resolveZone.
      */
     private ZoneId zoneIdFor(UUID employeeUserId) {
         Employee employee = employeeRepository.findById(employeeUserId).orElse(null);
-        if (employee == null) {
-            return attendanceRulesService.getDefaultZoneId();
-        }
-        String employeeTimezone = employee.getTimezone();
-        if (employeeTimezone != null && !employeeTimezone.isBlank()) {
-            return ZoneId.of(employeeTimezone);
-        }
-        String locationTimezone = employee.getLocation() != null ? employee.getLocation().getTimezone() : null;
-        return (locationTimezone != null && !locationTimezone.isBlank())
-                ? ZoneId.of(locationTimezone)
-                : attendanceRulesService.getDefaultZoneId();
+        return attendanceRulesService.resolveEmployeeZoneId(employee);
     }
 
     /**

@@ -36,6 +36,7 @@ import { useAuthStore } from '../store/authStore';
 import { useToast } from '../context/ToastContext';
 import { toShellRole } from '../lib/nav.config';
 import { TimeFormatProvider, useTimeFormat } from '../context/TimeFormatContext';
+import { minutesSinceMidnight, shiftMarkerPositions, segmentBarPosition, breakMarkerPosition } from '../utils/shiftMarkers';
 
 // ─── Formatting helpers ───────────────────────────────────────────────────────
 // Server timestamps are wall-clock strings in the business timezone (no offset), so they are
@@ -47,13 +48,9 @@ import { TimeFormatProvider, useTimeFormat } from '../context/TimeFormatContext'
 /** Index-aligned with JS Date#getDay() (0=Sunday) → java.time.DayOfWeek name, for weeklyOffDays. */
 const DOW_NAMES = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
 
-/** Minutes since local midnight, parsed the same zone-less way as formatTime (no Date object). */
-function minutesSinceMidnight(iso: string): number | null {
-  const time = iso.slice(11, 16);
-  if (time.length < 5) return null;
-  const [h, m] = time.split(':').map(Number);
-  return h * 60 + m;
-}
+// minutesSinceMidnight now lives in ../utils/shiftMarkers (shared with the shift-boundary-marker
+// positioning it also backs) — re-exported here via the import above so every existing call site
+// on this page is unaffected.
 
 function formatDay(isoDate: string): string {
   const [y, m, d] = isoDate.split('-').map(Number);
@@ -2709,6 +2706,64 @@ function BreakTimelineMarker({ breakStart, breakEnd, leftPct, widthPct }: {
   );
 }
 
+/**
+ * One scheduled-shift-boundary marker (start or end) — a small, subtle triangle sitting on top of
+ * the same 24-hour track the actual-attendance bar is drawn on (see AttendanceTimeline), so an
+ * employee can compare "when I was scheduled" against "when I actually showed up" at a glance.
+ * Purely an overlay: it never redraws, resizes, or replaces the actual-attendance TimelineBar
+ * itself. `leftPct` comes from shiftMarkerPositions, the exact same 0-1440-minute basis TimelineBar
+ * itself is positioned on, so the two always line up correctly. Hover shows a small "Shift start/
+ * end HH:MM" tooltip, mirroring TimelineBar's own tooltip mechanics.
+ */
+function ShiftBoundaryMarker({ label, leftPct }: { label: string; leftPct: number }) {
+  const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
+  const markerRef = useRef<HTMLDivElement>(null);
+
+  function show() {
+    const rect = markerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setCoords({ top: rect.top - 6, left: rect.left + rect.width / 2 });
+  }
+  function hide() {
+    setCoords(null);
+  }
+
+  return (
+    <>
+      <div
+        ref={markerRef}
+        onMouseEnter={show}
+        onMouseLeave={hide}
+        style={{
+          position: 'absolute', left: `${leftPct}%`, top: -3, transform: 'translateX(-50%)',
+          width: 0, height: 0,
+          borderLeft: '3.5px solid transparent', borderRight: '3.5px solid transparent',
+          borderTop: '5px solid var(--txt-dim)', opacity: 0.85,
+        }}
+      />
+      {coords && createPortal(
+        <div
+          role="tooltip"
+          style={{
+            position: 'fixed', top: coords.top, left: coords.left, transform: 'translate(-50%, -100%)',
+            background: 'var(--raised2)', color: 'var(--txt)', border: '1px solid var(--line2)', borderRadius: 6,
+            padding: '5px 9px', fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap',
+            boxShadow: '0 6px 18px rgba(0,0,0,.35)', zIndex: 1000, pointerEvents: 'none',
+          }}
+        >
+          {label}
+          <div style={{
+            position: 'absolute', bottom: -4, left: '50%', transform: 'translateX(-50%)',
+            width: 0, height: 0, borderLeft: '4px solid transparent', borderRight: '4px solid transparent',
+            borderTop: '4px solid var(--raised2)',
+          }} />
+        </div>,
+        document.body,
+      )}
+    </>
+  );
+}
+
 /** Compact, column-filling 24-hour presence timeline. Bars are proportional to actual login/logout duration; hovering a bar shows a small tooltip (see TimelineBar). No day-details content lives here — that's behind the row's View button. */
 // Width pinned via ATTENDANCE_VISUAL_COL_WIDTH (the <th>/<td> below) so every row in the column
 // — bars or placeholder text — occupies the same footprint and lines up under the "Attendance
@@ -2726,6 +2781,7 @@ const attendanceVisualPlaceholderStyle: React.CSSProperties = {
 function AttendanceTimeline({ info, punches, punchesLoading }: {
   info: DayInfo; punches: Punch[] | undefined; punchesLoading: boolean;
 }) {
+  const { formatTime } = useTimeFormat();
   if (info.holidayName) {
     return (
       <div style={attendanceVisualPlaceholderStyle}>
@@ -2758,6 +2814,10 @@ function AttendanceTimeline({ info, punches, punchesLoading }: {
       ? punches.map((p) => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt }))
       : [{ key: info.iso, checkInAt: record.checkInAt, checkOutAt: record.checkOutAt }];
 
+  // Scheduled shift start/end markers — null for a legacy record predating the shift snapshot
+  // (see AttendanceResponse.shiftStartAt's own doc comment), in which case none are drawn.
+  const markers = shiftMarkerPositions(record.shiftStartAt, record.shiftEndAt);
+
   return (
     <div style={{ position: 'relative', height: ATTENDANCE_VISUAL_HEIGHT, width: '100%' }}>
       <div style={{ position: 'absolute', left: 0, right: 0, top: 5, height: 4, background: 'var(--raised2)', borderRadius: 2 }} />
@@ -2765,15 +2825,10 @@ function AttendanceTimeline({ info, punches, punchesLoading }: {
         <div key={i} style={{ position: 'absolute', left: `${(i / 24) * 100}%`, top: 2, width: 1, height: 10, background: 'var(--line2)', opacity: i % 6 === 0 ? 0.8 : 0.35 }} />
       ))}
       {segments.map((seg, i) => {
-        const inMin = minutesSinceMidnight(seg.checkInAt);
-        if (inMin == null) return null;
-        const outMin = seg.checkOutAt ? minutesSinceMidnight(seg.checkOutAt) : null;
-        const leftPct = (inMin / 1440) * 100;
-        // Width is strictly proportional to the actual session duration out of the 24h track,
-        // with a small floor so a very short/still-open session stays visible and hoverable.
-        const widthPct = Math.max(0.6, (((outMin ?? inMin + 10) - inMin) / 1440) * 100);
+        const position = segmentBarPosition(seg.checkInAt, seg.checkOutAt);
+        if (!position) return null;
         return (
-          <TimelineBar key={seg.key ?? i} leftPct={leftPct} widthPct={widthPct} checkInAt={seg.checkInAt} checkOutAt={seg.checkOutAt} />
+          <TimelineBar key={seg.key ?? i} leftPct={position.leftPct} widthPct={position.widthPct} checkInAt={seg.checkInAt} checkOutAt={seg.checkOutAt} />
         );
       })}
       {/* Breaks — the gap between one session's checkOutAt and the next session's checkInAt,
@@ -2783,19 +2838,27 @@ function AttendanceTimeline({ info, punches, punchesLoading }: {
       {segments.slice(0, -1).map((seg, i) => {
         const next = segments[i + 1];
         if (!seg.checkOutAt || !next?.checkInAt) return null;
-        const breakStartMin = minutesSinceMidnight(seg.checkOutAt);
-        const breakEndMin = minutesSinceMidnight(next.checkInAt);
-        if (breakStartMin == null || breakEndMin == null || breakEndMin <= breakStartMin) return null;
+        const position = breakMarkerPosition(seg.checkOutAt, next.checkInAt);
+        if (!position) return null;
         return (
           <BreakTimelineMarker
             key={`break-${seg.key}`}
             breakStart={seg.checkOutAt}
             breakEnd={next.checkInAt}
-            leftPct={(breakStartMin / 1440) * 100}
-            widthPct={((breakEndMin - breakStartMin) / 1440) * 100}
+            leftPct={position.leftPct}
+            widthPct={position.widthPct}
           />
         );
       })}
+      {/* Scheduled shift start/end — small triangle markers overlaid on the same track, so the
+          actual-attendance bar(s) above can be compared at a glance against when the shift was
+          actually scheduled. Never redraws or replaces the bar itself. */}
+      {markers && (
+        <>
+          <ShiftBoundaryMarker label={`Shift start ${formatTime(record.shiftStartAt!) ?? '—'}`} leftPct={markers.startPct} />
+          <ShiftBoundaryMarker label={`Shift end ${formatTime(record.shiftEndAt!) ?? '—'}`} leftPct={markers.endPct} />
+        </>
+      )}
     </div>
   );
 }

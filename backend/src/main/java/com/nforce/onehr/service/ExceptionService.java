@@ -33,6 +33,11 @@ public class ExceptionService {
 
     private static final Set<String> HR_ROLES = Set.of("HR_ADMIN", "SUPER_ADMIN");
     private static final Set<String> PENDING_REGULARIZATION_STATUSES = Set.of("PENDING", "PARTIALLY_APPROVED");
+    // The one allowed-late privilege: ShiftVersion.lateGraceMinutes, already folded into this by
+    // AttendanceInterpretationService/AttendanceService/RegularizationService when they compute
+    // Attendance.status. Never re-derive "genuinely late" from the raw, no-forgiveness
+    // lateByMinutes figure here — see detectExceptions' own comment on why.
+    private static final String STATUS_LATE = "LATE";
 
     // Still detected and evaluated against the Penalization Policy exactly as before (see
     // detectExceptions/runScheduledPenaltyEvaluation) — these three just no longer surface as
@@ -251,7 +256,15 @@ public class ExceptionService {
             WorkingDaySchedule schedule = workingDaySchedules.get(record.getEmployeeUserId());
             boolean isWorkingDay = schedule != null && schedule.getWorkingDates().contains(record.getWorkDate());
 
-            if (isWorkingDay && record.getLateByMinutes() != null && record.getLateByMinutes() > 0) {
+            // Gated on Attendance.status == LATE, NOT `lateByMinutes > 0`. There is exactly one
+            // allowed-late privilege — ShiftVersion.lateGraceMinutes — and it is already folded
+            // into `status` by AttendanceInterpretationService's isLate formula (shiftStart +
+            // grace). `lateByMinutes` is deliberately left as the raw, no-forgiveness minutes
+            // (an employee-facing display/audit figure only — see its own Javadoc); gating on it
+            // directly would create a LATE_ARRIVAL incident, and count it toward the "every 3rd
+            // late arrival" threshold, for an arrival still within the employee's allowed-late
+            // privilege, contradicting that privilege's whole purpose.
+            if (isWorkingDay && STATUS_LATE.equals(record.getStatus())) {
                 Employee employee = employeesById.get(record.getEmployeeUserId());
                 LocalTime expectedShiftStart = shiftDayPolicy.resolveShiftStart(employee, record.getWorkDate());
                 upsertException(record, ExceptionType.LATE_ARRIVAL,
@@ -654,8 +667,18 @@ public class ExceptionService {
         // for a cycle change (the window is derived from exceptionDate itself, not "now").
         LocalDate[] laPeriod = cyclePeriod(exceptionDate, version != null ? version.getLaExemptPeriod() : null);
         LocalDate[] mlPeriod = cyclePeriod(exceptionDate, version != null ? version.getMlExemptPeriod() : null);
-        int lateArrivalCount = (int) attendanceExceptionRepository.countByEmployeeUserIdAndExceptionTypeAndExceptionDateBetween(
-                employeeUserId, ExceptionType.LATE_ARRIVAL, laPeriod[0], laPeriod[1]);
+        // Counted straight off Attendance.status == LATE (live), NOT off the AttendanceException
+        // snapshot rows upsertException wrote — the same query LatePenaltyService has always used
+        // for its own "every 3rd late this month" count (see AttendanceRepository's Javadoc on
+        // this method). AttendanceException rows are an append-only, never-deleted detection
+        // audit trail (see upsertException) — counting them directly would keep a date counted
+        // forever even after a regularization corrects that day's Attendance back to PRESENT.
+        // Attendance.status, by contrast, IS corrected in place by RegularizationService.approve
+        // (see its own applyInterpretation), so counting it here means a regularized late arrival
+        // stops contributing to this and every later occurrence's threshold automatically, with
+        // no second, independently-maintained "is this incident still valid" flag to keep in sync.
+        int lateArrivalCount = (int) attendanceRepository.countByEmployeeUserIdAndWorkDateBetweenAndStatus(
+                employeeUserId, laPeriod[0], laPeriod[1], STATUS_LATE);
         int missingLogCount = (int) attendanceExceptionRepository.countByEmployeeUserIdAndExceptionTypeAndExceptionDateBetween(
                 employeeUserId, ExceptionType.MISSING_PUNCH, mlPeriod[0], mlPeriod[1]);
 
@@ -673,6 +696,13 @@ public class ExceptionService {
                 .existsByEmployeeUserIdAndExceptionDateAndExceptionType(
                         employeeUserId, exceptionDate.minusDays(1), ExceptionType.MISSING_PUNCH);
 
+        // NOT unified with the NUMBER_OF_INCIDENTS basis above: the "Total Late Hours in Shift"
+        // basis (Section 25/29/31) is a distinct, separately-configured Penalization Policy mode —
+        // an org running THIS basis instead is choosing to measure cumulative lateness minutes
+        // against its own configured allowed-hours/tiers, not "every Nth incident" at all, so
+        // laGracePeriodMinutes here is this mode's own threshold input, not a second copy of the
+        // shift's allowed-late privilege. Left unchanged by this fix (which targets the
+        // NUMBER_OF_INCIDENTS basis exercised by every acceptance scenario in this change).
         Integer lateMinutesTotalInPeriod = null;
         if (version != null && "TOTAL_HOURS".equals(version.getLaBasis())) {
             int grace = version.getLaGracePeriodMinutes() != null ? version.getLaGracePeriodMinutes() : 0;
@@ -761,8 +791,11 @@ public class ExceptionService {
     private boolean isDiscrepancyStillActive(String discrepancyType, Employee employee, LocalDate date,
                                               Attendance record, PenalizationPolicyVersion version, LocalDate today) {
         return switch (discrepancyType) {
-            case ExceptionType.LATE_ARRIVAL -> record != null && record.getLateByMinutes() != null
-                    && record.getLateByMinutes() > 0
+            // Same STATUS_LATE gate detectExceptions itself uses, not a bare lateByMinutes check —
+            // a regularization that corrects this record's status away from LATE (see
+            // RegularizationService#applyInterpretation) must make this discrepancy inactive here
+            // too, for exactly the same reason it must never have been counted in the first place.
+            case ExceptionType.LATE_ARRIVAL -> record != null && STATUS_LATE.equals(record.getStatus())
                     && engineStillAppliesPenalty(discrepancyType, record);
             case ExceptionType.MISSING_PUNCH -> record != null && record.isMissingCheckOut() && date.isBefore(today)
                     && engineStillAppliesPenalty(discrepancyType, record);

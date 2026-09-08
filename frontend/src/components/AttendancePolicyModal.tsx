@@ -58,10 +58,13 @@ function lateArrivalBlocks(policy: PenalizationPolicy): PolicyBlock[] {
     return [{ type: 'heading', text: 'Late Arrival' }, { type: 'text', text: 'Not currently enabled under your policy.' }];
   }
   const blocks: PolicyBlock[] = [{ type: 'heading', text: 'Late Arrival' }];
-  if (la.gracePeriodMinutes != null) {
-    blocks.push({ type: 'callout', text: `You have a grace period of ${la.gracePeriodMinutes} minute(s) beyond which your arrival is considered late.` });
-  }
   if (la.basis === 'TOTAL_HOURS') {
+    // Only this basis still consults the policy's own grace period server-side — the
+    // NUMBER_OF_INCIDENTS basis below is governed entirely by the employee's assigned Shift's own
+    // allowed-late privilege (there is exactly one allowed-late grace now, not a second one here).
+    if (la.gracePeriodMinutes != null) {
+      blocks.push({ type: 'callout', text: `You have a grace period of ${la.gracePeriodMinutes} minute(s) beyond which your arrival is considered late.` });
+    }
     blocks.push({ type: 'text', text: `Once your total late minutes in a ${la.exemptPeriod.toLowerCase()} exceed ${la.allowedHours ?? '—'} hour(s), a penalty applies based on the tier your total falls into:` });
     if (la.lateHoursTiers.length > 0) {
       blocks.push({ type: 'bullets', items: la.lateHoursTiers.map(t => `More than ${t.thresholdHours} total hour(s) late: ${t.deductionDays} day(s) penalty`) });

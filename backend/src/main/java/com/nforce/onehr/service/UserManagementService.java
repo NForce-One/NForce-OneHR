@@ -79,7 +79,6 @@ public class UserManagementService {
                 .employmentType(req.getEmploymentType() != null ? req.getEmploymentType() : "FULL_TIME")
                 .workMode(req.getWorkMode() != null ? req.getWorkMode() : "ONSITE")
                 .joiningDate(req.getJoiningDate())
-                .timezone(normalizeTimezone(req.getTimezone()))
                 .createdBy(actor.getId())
                 .build();
 
@@ -100,9 +99,9 @@ public class UserManagementService {
             emp.setDesignation(desig);
         }
         if (req.getLocationId() != null) {
-            Location loc = locationRepository.findById(req.getLocationId()).orElse(null);
-            if (loc != null && !loc.isActive())
-                throw new IllegalArgumentException("This location is inactive and cannot be assigned. Choose an active location.");
+            Location loc = locationRepository.findById(req.getLocationId())
+                    .orElseThrow(() -> new IllegalArgumentException("Selected location was not found."));
+            validateAssignableLocation(loc);
             emp.setLocation(loc);
         }
         if (req.getShiftId() != null) {
@@ -250,11 +249,6 @@ public class UserManagementService {
             emp.setWorkMode(req.getWorkMode());
             forceLogoutRequired = true;
         }
-        // Three states (null/blank/value) — see UpdateUserRequest's own doc comment. Doesn't
-        // force logout: unlike role/department/etc., no JWT claim depends on it.
-        if (req.getTimezone() != null) {
-            emp.setTimezone(normalizeTimezone(req.getTimezone()));
-        }
         if (req.getBusinessUnitId() != null) {
             BusinessUnit newBusinessUnit = businessUnitRepository.findById(req.getBusinessUnitId()).orElse(null);
             UUID currentBusinessUnitId = emp.getBusinessUnit() != null ? emp.getBusinessUnit().getId() : null;
@@ -290,12 +284,11 @@ public class UserManagementService {
             }
         }
         if (req.getLocationId() != null) {
-            Location newLocation = locationRepository.findById(req.getLocationId()).orElse(null);
+            Location newLocation = locationRepository.findById(req.getLocationId())
+                    .orElseThrow(() -> new IllegalArgumentException("Selected location was not found."));
             UUID currentLocationId = emp.getLocation() != null ? emp.getLocation().getId() : null;
-            UUID newLocationId = newLocation != null ? newLocation.getId() : null;
-            if (!Objects.equals(currentLocationId, newLocationId)) {
-                if (newLocation != null && !newLocation.isActive())
-                    throw new IllegalArgumentException("This location is inactive and cannot be assigned. Choose an active location.");
+            if (!Objects.equals(currentLocationId, newLocation.getId())) {
+                validateAssignableLocation(newLocation);
                 emp.setLocation(newLocation);
                 forceLogoutRequired = true;
             }
@@ -440,7 +433,6 @@ public class UserManagementService {
         snapshot.put("designation", emp.getDesignation() != null ? emp.getDesignation().getTitle() : null);
         snapshot.put("location", emp.getLocation() != null ? emp.getLocation().getName() : null);
         snapshot.put("shift", emp.getShift() != null ? emp.getShift().getName() : null);
-        snapshot.put("timezone", emp.getTimezone());
         snapshot.put("role", RoleUtils.primaryRoleCode(user.getRoles(), null));
         UUID managerId = historyRepository.findByEmployeeUserIdAndEffectiveToIsNull(emp.getUserId())
                 .map(EmployeeManagerHistory::getManagerUserId).orElse(null);
@@ -448,19 +440,27 @@ public class UserManagementService {
         return snapshot;
     }
 
-    /** Blank/null clears the field; otherwise must be a real IANA zone id. Mirrors EmployeeService's identical helper. */
-    private String normalizeTimezone(String timezone) {
-        if (timezone == null || timezone.isBlank()) {
-            return null;
+    /**
+     * Rejects an inactive Location, or one with no valid IANA timezone, before it's assigned.
+     * Mirrors EmployeeService's identical helper — see its own Javadoc for the full rationale.
+     */
+    private void validateAssignableLocation(Location location) {
+        if (!location.isActive()) {
+            throw new IllegalArgumentException("This location is inactive and cannot be assigned. Choose an active location.");
         }
-        String trimmed = timezone.trim();
-        try {
-            java.time.ZoneId.of(trimmed);
-        } catch (java.time.DateTimeException e) {
+        String timezone = location.getTimezone();
+        boolean validTimezone = timezone != null && !timezone.isBlank();
+        if (validTimezone) {
+            try {
+                java.time.ZoneId.of(timezone);
+            } catch (java.time.DateTimeException e) {
+                validTimezone = false;
+            }
+        }
+        if (!validTimezone) {
             throw new IllegalArgumentException(
-                    "'" + trimmed + "' is not a valid IANA timezone id (e.g. Asia/Kolkata, America/New_York)");
+                    "This location has no valid timezone configured and cannot be assigned. Contact an administrator.");
         }
-        return trimmed;
     }
 
     /** Best-effort display name for a user id — employee's full name, falling back to email, null if no id. */
@@ -641,7 +641,6 @@ public class UserManagementService {
                 .employmentType(emp.getEmploymentType())
                 .workMode(emp.getWorkMode())
                 .joiningDate(emp.getJoiningDate())
-                .timezone(emp.getTimezone())
                 .active(user.isActive())
                 .currentManager(manager)
                 .tempPassword(tempPassword)

@@ -53,6 +53,16 @@ export interface AttendanceRecord {
   /** IANA zone id the browser reported at Check-In/Web Clock-In (e.g. "Australia/Adelaide") —
    * null for records predating this field, or where none was supplied. */
   timezone: string | null;
+  /** Scheduled shift start for this row's own workDate, resolved server-side against THIS ROW's
+   * own snapshotted Shift (never the employee's current one) — see
+   * AttendanceInterpretationService#resolveScheduledWindow. Same zone-less wall-clock basis as
+   * checkInAt/checkOutAt. Null for a legacy record predating the shiftId snapshot. Powers the
+   * Attendance Log's shift-boundary markers only (see AttendanceTimeline) — never used for any
+   * lateness/cutoff computation, which has its own dedicated backend resolution path. */
+  shiftStartAt: string | null;
+  /** Scheduled shift end for this row's own workDate — see {@link shiftStartAt}. Rolls onto the
+   * next calendar day for an overnight shift. Null for a legacy record. */
+  shiftEndAt: string | null;
 }
 
 export interface Punch {

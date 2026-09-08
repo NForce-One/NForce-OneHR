@@ -34,6 +34,14 @@ public interface AttendancePunchRepository extends JpaRepository<AttendancePunch
     // is always the one an in-progress checkOut actually means to close.
     Optional<AttendancePunch> findFirstByAttendanceRecordIdAndCheckOutAtIsNullOrderByCheckInAtDesc(UUID attendanceRecordId);
 
+    // Backs AttendanceService.flagMissingCheckoutIfStale's "is this record ACTUALLY still open"
+    // guard — Attendance.checkOutAt is null for every Web-Clock-In-only day (by design, see
+    // WebClockInService.checkOut's own comment: it never touches that column), so the org-wide
+    // stale sweep's candidate query (Attendance.checkOutAt IS NULL) alone cannot tell a genuinely
+    // forgotten normal check-in apart from an already-fully-closed Web-only day. This is the
+    // normal-session half of that check.
+    boolean existsByAttendanceRecordIdAndCheckOutAtIsNull(UUID attendanceRecordId);
+
     // Backs the "Frequent Breaks" negligence panel (ONEHR-107) — pulls every session for a
     // batch of attendance records (already scoped to a manager's team + date range) in one
     // query, grouped/aggregated in the service layer since punches carry no employeeUserId/workDate.

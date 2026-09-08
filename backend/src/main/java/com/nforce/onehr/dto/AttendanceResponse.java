@@ -32,4 +32,14 @@ public class AttendanceResponse {
     /** IANA zone id the browser/device reported at Check-In — see Attendance.timezone. Null for
      * records predating this field or where none was supplied (Location.timezone was used). */
     private String timezone;
+    /** Scheduled shift start for this row's own workDate, resolved against THAT ROW's own
+     * snapshotted Shift (never the employee's current one) — see
+     * AttendanceInterpretationService#resolveScheduledWindow. Same wall-clock basis as
+     * checkInAt/checkOutAt. Null for a legacy row predating the shiftId snapshot. Powers the
+     * Attendance Log's shift-boundary markers only — never used for lateness/cutoff math, which
+     * has its own dedicated resolution path. */
+    private LocalDateTime shiftStartAt;
+    /** Scheduled shift end for this row's own workDate — see {@link #shiftStartAt}. Rolls to the
+     * next calendar day for an overnight shift (end not after start). Null for a legacy row. */
+    private LocalDateTime shiftEndAt;
 }

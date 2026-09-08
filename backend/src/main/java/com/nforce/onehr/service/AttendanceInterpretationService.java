@@ -177,6 +177,42 @@ public class AttendanceInterpretationService {
     }
 
     /**
+     * The scheduled shift start/end for an ALREADY EXISTING Attendance row — resolved against
+     * THAT ROW's own snapshotted {@code shiftId} and its own {@code workDate}, never the
+     * employee's current Shift (same rule as {@link #interpretExistingSession}/
+     * {@link #interpretExistingRecordLateness}). Powers the Attendance Log's shift-boundary
+     * markers so they keep comparing an old record against the shift it was ACTUALLY worked
+     * under, even after the employee is later reassigned or that Shift's timing changes for the
+     * future — see {@link ShiftDayPolicy}'s own "Shift Versions" Javadoc section.
+     *
+     * <p>Reuses {@link ShiftDayPolicy#shiftStartAt}/{@link #shiftEndAt}, so it inherits the same
+     * overnight handling (end rolls to {@code workDate + 1} when the effective version's end time
+     * is not after its start) — both returned as plain {@link LocalDateTime}s in the record's own
+     * historical wall-clock basis, i.e. the same basis {@code checkInAt}/{@code checkOutAt} are
+     * already in (see {@code Attendance.timezone}), so a caller can compare them directly without
+     * any zone conversion of its own.
+     *
+     * <p>Returns {@link ScheduledShiftWindow#EMPTY} for a legacy row ({@code shiftId == null}) —
+     * never guessed, exactly like {@link #interpretExistingSession}'s own
+     * {@link InterpretationOutcome#LEGACY_UNRESOLVED} handling.
+     */
+    @Transactional(readOnly = true)
+    public ScheduledShiftWindow resolveScheduledWindow(Attendance record) {
+        Employee shiftContext = resolveShiftContextOrNull(record);
+        if (shiftContext == null) {
+            return ScheduledShiftWindow.EMPTY;
+        }
+        LocalDateTime start = shiftDayPolicy.shiftStartAt(shiftContext, record.getWorkDate());
+        LocalDateTime end = shiftDayPolicy.shiftEndAt(shiftContext, record.getWorkDate());
+        return new ScheduledShiftWindow(start, end);
+    }
+
+    /** Scheduled shift start/end resolved for one Attendance row — see {@link #resolveScheduledWindow}. */
+    public record ScheduledShiftWindow(LocalDateTime start, LocalDateTime end) {
+        public static final ScheduledShiftWindow EMPTY = new ScheduledShiftWindow(null, null);
+    }
+
+    /**
      * Resolves {@code record.getShiftId()} into a minimal stand-in {@link Employee} carrying ONLY
      * that snapshotted {@link Shift} — {@link ShiftDayPolicy}'s methods read nothing else off
      * {@code Employee} (see its own class Javadoc: {@code shiftOf(employee)} is its only

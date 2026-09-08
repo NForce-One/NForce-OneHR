@@ -18,6 +18,14 @@ public interface WebClockInRequestRepository extends JpaRepository<WebClockInReq
 
     List<WebClockInRequest> findByEmployeeUserIdOrderByCreatedAtDesc(UUID employeeUserId);
 
+    // Backs AttendanceService.flagMissingCheckoutIfStale's "is this record ACTUALLY still open"
+    // guard — the Web-session half of that check (see AttendancePunchRepository
+    // .existsByAttendanceRecordIdAndCheckOutAtIsNull's identical-purpose comment for the normal-
+    // session half). A day with no open Web session either (checkedOutAt already set on every
+    // request for it) is NOT stale merely because the shared Attendance.checkOutAt column
+    // — which Web Clock-Out deliberately never writes — happens to be null.
+    boolean existsByEmployeeUserIdAndWorkDateAndCheckedOutAtIsNull(UUID employeeUserId, LocalDate workDate);
+
     // Backs audit-log target search — resolves which web clock-in requests belong to a set of employees.
     @Query("SELECT r.id FROM WebClockInRequest r WHERE r.employeeUserId IN :employeeUserIds")
     Set<UUID> findIdsByEmployeeUserIdIn(Collection<UUID> employeeUserIds);

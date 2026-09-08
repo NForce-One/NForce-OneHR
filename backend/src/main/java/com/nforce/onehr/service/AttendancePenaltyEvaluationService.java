@@ -8,6 +8,8 @@ import com.nforce.onehr.entity.AttendancePenalty;
 import com.nforce.onehr.entity.AttendancePenaltyStatus;
 import com.nforce.onehr.repository.AttendancePenaltyRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -37,6 +39,7 @@ import java.util.UUID;
  */
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class AttendancePenaltyEvaluationService {
 
     private static final DateTimeFormatter NOTIFICATION_DATE_FMT = DateTimeFormatter.ofPattern("d MMM yyyy");
@@ -75,7 +78,23 @@ public class AttendancePenaltyEvaluationService {
         // Resolves the configured deduction-days amount into an actual leave-balance debit
         // and/or Loss-of-Pay amount, mutating `penalty` in place before its one save below.
         penaltyDeductionService.apply(penalty, decision.getDeductionMethod(), decision.getLeavePriorityOrder());
-        AttendancePenalty saved = attendancePenaltyRepository.save(penalty);
+        AttendancePenalty saved;
+        try {
+            // saveAndFlush (not save) + catch, mirroring AttendanceService.checkIn's identical
+            // duplicate-row race handling: the existsBy... check above is only a defensive first
+            // line (see this class's own Javadoc) — the real guarantee is the DB unique index
+            // (V156, on employee_user_id/incident_date/discrepancy_type). Without this catch, the
+            // losing side of two concurrent evaluations of the same discrepancy (two dashboard
+            // loads, or a dashboard load racing the nightly scheduler) surfaced as an unhandled
+            // 500 instead of a graceful no-op — the DB prevented the duplicate row, but not the
+            // error.
+            saved = attendancePenaltyRepository.saveAndFlush(penalty);
+        } catch (DataIntegrityViolationException e) {
+            log.info("AttendancePenaltyEvaluationService: lost a concurrent evaluation race for employee {} / {} / {} "
+                            + "— a penalty was already created by another request",
+                    context.getEmployeeUserId(), context.getAttendanceDate(), context.getDiscrepancyType());
+            return Optional.empty();
+        }
         // Guarded by the duplicate-evaluation check above — fires exactly once per genuinely new
         // penalty row, never once per re-evaluation of an already-recorded discrepancy.
         notifyPenaltyApplied(saved);

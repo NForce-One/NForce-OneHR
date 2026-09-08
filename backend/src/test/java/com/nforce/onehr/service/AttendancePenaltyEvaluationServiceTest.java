@@ -84,7 +84,7 @@ class AttendancePenaltyEvaluationServiceTest {
         UUID policyId = UUID.randomUUID();
         when(policyEngine.evaluate(any())).thenReturn(PolicyDecision.builder()
                 .type(PolicyDecisionType.APPLY_PENALTY).policyId(policyId).policyVersion(2).build());
-        when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(attendancePenaltyRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         Optional<AttendancePenalty> result = service.evaluate(PolicyEvaluationContext.builder()
                 .employeeUserId(employeeId).attendanceDate(date).discrepancyType(ExceptionType.LATE_ARRIVAL).build());
@@ -95,7 +95,7 @@ class AttendancePenaltyEvaluationServiceTest {
         assertEquals(policyId, result.get().getPolicyId());
         assertEquals(2, result.get().getPolicyVersion());
         assertNotNull(result.get().getEvaluatedAt());
-        verify(attendancePenaltyRepository).save(any());
+        verify(attendancePenaltyRepository).saveAndFlush(any());
     }
 
     /** Gap-038: penalty creation must be traceable from the audit log, not just the row itself. */
@@ -106,7 +106,7 @@ class AttendancePenaltyEvaluationServiceTest {
         UUID policyId = UUID.randomUUID();
         when(policyEngine.evaluate(any())).thenReturn(PolicyDecision.builder()
                 .type(PolicyDecisionType.APPLY_PENALTY).policyId(policyId).policyVersion(2).build());
-        when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(attendancePenaltyRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         Optional<AttendancePenalty> result = service.evaluate(PolicyEvaluationContext.builder()
                 .employeeUserId(employeeId).attendanceDate(date).discrepancyType(ExceptionType.LATE_ARRIVAL).build());
@@ -128,7 +128,7 @@ class AttendancePenaltyEvaluationServiceTest {
                 .employeeUserId(employeeId).attendanceDate(date).discrepancyType(ExceptionType.LATE_ARRIVAL).build());
 
         assertTrue(result.isEmpty());
-        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.never()).saveAndFlush(any());
         // The duplicate guard short-circuits BEFORE deduction is even attempted — an already-
         // recorded penalty must never trigger a second leave-balance debit.
         verifyNoInteractions(penaltyDeductionService);
@@ -144,7 +144,7 @@ class AttendancePenaltyEvaluationServiceTest {
         when(policyEngine.evaluate(any())).thenReturn(PolicyDecision.builder()
                 .type(PolicyDecisionType.APPLY_PENALTY).policyId(UUID.randomUUID()).policyVersion(1)
                 .deductionDays(new java.math.BigDecimal("1")).deductionMethod("PAID_LEAVE").build());
-        when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(attendancePenaltyRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         // First call: nothing recorded yet. Second call: the repository now reflects the row the
         // first call persisted — simulating two sequential runs against the same underlying state
         // (e.g. a dashboard reload, or the scheduler running twice for the same date).
@@ -156,8 +156,37 @@ class AttendancePenaltyEvaluationServiceTest {
 
         assertTrue(first.isPresent(), "first evaluation creates the penalty");
         assertTrue(second.isEmpty(), "second evaluation of the identical occurrence is a no-op");
-        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).save(any());
+        verify(attendancePenaltyRepository, org.mockito.Mockito.times(1)).saveAndFlush(any());
         verify(penaltyDeductionService, org.mockito.Mockito.times(1)).apply(any(), any(), any());
+    }
+
+    /**
+     * The existsBy... guard is only a defensive first line (see this class's own Javadoc) — the
+     * real guarantee against a duplicate row is the DB unique index (V156). Two concurrent
+     * evaluations of the identical occurrence can both pass that check before either commits; the
+     * loser's insert must fail with a DB constraint violation, which this must translate into a
+     * graceful no-op — never an unhandled exception — and must never send a notification or audit
+     * a penalty that was never actually persisted.
+     */
+    @Test
+    void concurrentEvaluationRace_loserGetsAGracefulNoOp_notAnUnhandledException() {
+        UUID employeeId = UUID.randomUUID();
+        LocalDate date = LocalDate.of(2026, 8, 3);
+        when(policyEngine.evaluate(any())).thenReturn(PolicyDecision.builder()
+                .type(PolicyDecisionType.APPLY_PENALTY).policyId(UUID.randomUUID()).policyVersion(1).build());
+        // Both concurrent calls pass the existsBy... pre-check (neither has committed yet)...
+        when(attendancePenaltyRepository.existsByEmployeeUserIdAndIncidentDateAndDiscrepancyType(
+                employeeId, date, ExceptionType.LATE_ARRIVAL)).thenReturn(false);
+        // ...but the DB unique index (V156) rejects the losing insert.
+        when(attendancePenaltyRepository.saveAndFlush(any()))
+                .thenThrow(new org.springframework.dao.DataIntegrityViolationException("duplicate key"));
+
+        Optional<AttendancePenalty> result = assertDoesNotThrow(() -> service.evaluate(PolicyEvaluationContext.builder()
+                .employeeUserId(employeeId).attendanceDate(date).discrepancyType(ExceptionType.LATE_ARRIVAL).build()));
+
+        assertTrue(result.isEmpty(), "the losing side of the race must be a no-op, not a thrown exception");
+        verifyNoInteractions(notificationService);
+        verify(auditService, org.mockito.Mockito.never()).log(any(), any(), any(), any(), any());
     }
 
     // ── Section 19: penalty-applied notification ─────────────────────────────────────────────
@@ -168,7 +197,7 @@ class AttendancePenaltyEvaluationServiceTest {
         LocalDate date = LocalDate.of(2026, 8, 3);
         when(policyEngine.evaluate(any())).thenReturn(PolicyDecision.builder()
                 .type(PolicyDecisionType.APPLY_PENALTY).policyId(UUID.randomUUID()).policyVersion(1).build());
-        when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(attendancePenaltyRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
         service.evaluate(PolicyEvaluationContext.builder()
                 .employeeUserId(employeeId).attendanceDate(date).discrepancyType(ExceptionType.LATE_ARRIVAL).build());

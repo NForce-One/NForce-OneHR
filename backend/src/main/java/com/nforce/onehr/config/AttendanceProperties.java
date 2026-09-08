@@ -26,10 +26,12 @@ public class AttendanceProperties {
      * Attendance/Web-Clock-In/Regularization flow specifically — that flow now reads {@link
      * com.nforce.onehr.service.AttendanceRulesService#getDefaultZoneId()} instead, an
      * Admin-configurable singleton seeded from this same value (see V167's migration comment),
-     * which in turn only applies once an employee has neither their own {@code
-     * Employee.timezone} nor a {@code Location.timezone} set. Deliberately left un-migrated here
-     * for its other, non-attendance consumers — migrating those is a separate, unrelated
-     * refactor this pass did not undertake.
+     * which in turn only applies once an employee's assigned {@code Location.timezone} is unset
+     * (an employee with no Location at all — see {@link
+     * com.nforce.onehr.service.AttendanceRulesService#resolveEmployeeZoneId}; Employee itself
+     * carries no timezone field of its own as of the finalized Location/Timezone model, V169).
+     * Deliberately left un-migrated here for its other, non-attendance consumers — migrating
+     * those is a separate, unrelated refactor this pass did not undertake.
      */
     private String zone = "Asia/Kolkata";
 

@@ -227,6 +227,7 @@ interface AddEditModalProps {
 
 function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalProps) {
   const isEdit = !!editRow;
+  const isLocations = tab === 'locations';
   const primaryLabel = tab === 'designations' ? 'Title' : 'Name';
   const modalTitle = isEdit ? `Edit ${TABS[tab].label.slice(0, -1)}` : TABS[tab].addLabel;
 
@@ -236,18 +237,24 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
   });
   const [grade, setGrade] = useState(() => (editRow && tab === 'designations' ? ((editRow as DesignationRow).grade ?? '') : ''));
   const [level, setLevel] = useState(() => (editRow && tab === 'designations' ? ((editRow as DesignationRow).level ?? '') : ''));
-  const [city, setCity] = useState(() => (editRow && tab === 'locations' ? ((editRow as LocationRow).city ?? '') : ''));
-  const [state, setState] = useState(() => (editRow && tab === 'locations' ? ((editRow as LocationRow).state ?? '') : ''));
-  const [country, setCountry] = useState(() => (editRow && tab === 'locations' ? ((editRow as LocationRow).country ?? '') : ''));
-  const [holidayRegion, setHolidayRegion] = useState(() => (editRow && tab === 'locations' ? ((editRow as LocationRow).holidayRegion ?? '') : ''));
-  // IANA zone id (e.g. "Asia/Kolkata") -- every employee assigned to this location uses it as
-  // their effective timezone for attendance check-in/out, lateness, and shift-day calculations.
-  const [timezone, setTimezone] = useState(() => (editRow && tab === 'locations' ? ((editRow as LocationRow).timezone ?? '') : ''));
+  const [city, setCity] = useState(() => (editRow && isLocations ? ((editRow as LocationRow).city ?? '') : ''));
+  const [state, setState] = useState(() => (editRow && isLocations ? ((editRow as LocationRow).state ?? '') : ''));
+  const [country, setCountry] = useState(() => (editRow && isLocations ? ((editRow as LocationRow).country ?? '') : ''));
+  const [holidayRegion, setHolidayRegion] = useState(() => (editRow && isLocations ? ((editRow as LocationRow).holidayRegion ?? '') : ''));
+  // Unlike Name/City/State/Country (freely editable, any number of Locations can be created),
+  // Timezone must be one of a fixed, supported set — see OrgService.SUPPORTED_TIMEZONES on the
+  // backend, which independently enforces the same set regardless of what this dropdown offers.
+  const [timezone, setTimezone] = useState(() => (editRow && isLocations ? ((editRow as LocationRow).timezone ?? '') : ''));
+  const [supportedTimezones, setSupportedTimezones] = useState<string[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const firstRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { firstRef.current?.focus(); }, []);
+  useEffect(() => {
+    if (!isLocations) return;
+    orgApi.listSupportedLocationTimezones(token).then(setSupportedTimezones).catch(() => {});
+  }, [isLocations, token]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -267,7 +274,7 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
         setError('Grade/Band must contain exactly 1 letter followed by 1 number (e.g. L1)');
         return;
       }
-    } else if (tab === 'locations') {
+    } else if (isLocations) {
       // Location names are alphabetic only — letters and spaces (for multi-word names like
       // "Chennai HQ"), no digits, no hyphens, no other special characters.
       if (!/^[A-Za-z]+( [A-Za-z]+)*$/.test(trimmed)) {
@@ -281,7 +288,7 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
       setError(`${primaryLabel} must contain letters and cannot contain numbers or be made up of special characters only`);
       return;
     }
-    if (tab === 'locations') {
+    if (isLocations) {
       if (/\d/.test(city.trim())) { setError('City cannot contain numbers'); return; }
       if (/\d/.test(state.trim())) { setError('State / Province cannot contain numbers'); return; }
       if (/\d/.test(country.trim())) { setError('Country cannot contain numbers'); return; }
@@ -290,6 +297,7 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
         setError('Region must contain exactly 2 letters (e.g. TN)');
         return;
       }
+      if (!timezone.trim()) { setError('Timezone is required'); return; }
     }
     setLoading(true);
     try {
@@ -307,7 +315,7 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
             name: trimmed,
             city: city.trim() || undefined, state: state.trim() || undefined,
             country: country.trim() || undefined, holidayRegion: holidayRegion.trim() || undefined,
-            timezone: timezone.trim() || undefined,
+            timezone: timezone.trim(),
           });
         }
       } else {
@@ -322,7 +330,7 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
             name: trimmed,
             city: city.trim() || undefined, state: state.trim() || undefined,
             country: country.trim() || undefined, holidayRegion: holidayRegion.trim() || undefined,
-            timezone: timezone.trim() || undefined,
+            timezone: timezone.trim(),
           });
         }
       }
@@ -377,8 +385,8 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
               placeholder={
                 tab === 'designations' ? 'e.g. Senior Software Engineer'
                 : tab === 'departments' ? 'e.g. Engineering'
-                : tab === 'businessunits' ? 'e.g. Operations'
-                : 'e.g. Chennai HQ'
+                : isLocations ? 'e.g. Chennai HQ'
+                : 'e.g. Operations'
               }
               style={inputStyle}
             />
@@ -402,7 +410,7 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
             </>
           )}
 
-          {tab === 'locations' && (
+          {isLocations && (
             <>
               <div className="nf-grid-2col-collapse" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                 <label style={labelStyle}>
@@ -425,27 +433,21 @@ function AddEditModal({ tab, editRow, onClose, onSaved, token }: AddEditModalPro
                 </label>
               </div>
               <label style={labelStyle}>
-                <span style={labelTextStyle}>Timezone</span>
-                <input
-                  value={timezone} onChange={e => setTimezone(e.target.value)}
-                  placeholder="e.g. Asia/Kolkata" list="nf-iana-timezones" style={inputStyle}
-                />
-                <span style={{ fontSize: 11, color: 'var(--txt-mut)', marginTop: 3 }}>
-                  IANA zone id — every employee assigned to this location uses it for check-in/out, lateness, and shift-day calculations. Leave blank to use the default business timezone.
+                <span style={labelTextStyle}>
+                  Timezone <span style={{ color: 'var(--risk)' }}>*</span>
                 </span>
-                <datalist id="nf-iana-timezones">
-                  <option value="Asia/Kolkata" />
-                  <option value="America/New_York" />
-                  <option value="America/Los_Angeles" />
-                  <option value="America/Chicago" />
-                  <option value="Europe/London" />
-                  <option value="Australia/Sydney" />
-                  <option value="Asia/Singapore" />
-                  <option value="Asia/Dubai" />
-                  <option value="Pacific/Auckland" />
-                  <option value="Asia/Kathmandu" />
-                  <option value="Asia/Chittagong" />
-                </datalist>
+                <select
+                  value={timezone} onChange={e => setTimezone(e.target.value)}
+                  style={{ ...inputStyle, appearance: 'none' as const, WebkitAppearance: 'none' as const }}
+                >
+                  <option value="">— Select a timezone —</option>
+                  {supportedTimezones.map(tz => <option key={tz} value={tz}>{tz}</option>)}
+                </select>
+                <span style={{ fontSize: 11, color: 'var(--txt-mut)', marginTop: 3 }}>
+                  Limited to this business's supported zones — every employee assigned to this
+                  location uses it for check-in/out, lateness, and shift-day calculations, so it
+                  can't be entered freely.
+                </span>
               </label>
             </>
           )}
@@ -2071,9 +2073,10 @@ function AttendanceRulesSection({ token }: { token: string }) {
 
       <h2 style={{ margin: '28px 0 4px', fontSize: 15, fontWeight: 700 }}>Default Timezone</h2>
       <p style={{ margin: '0 0 18px', fontSize: 12.5, color: 'var(--txt-mut)', lineHeight: 1.55 }}>
-        Org-wide fallback IANA zone id, used only for an employee who has neither their own
-        Timezone (set on their profile by an Admin) nor their assigned Location's timezone
-        configured. Changing this never reinterprets any existing attendance record.
+        Org-wide fallback IANA zone id, used only for an employee who has no Location assigned at
+        all. Every employee's attendance timezone otherwise comes entirely from their assigned
+        Location (see the Locations tab) — employees have no timezone setting of their own.
+        Changing this never reinterprets any existing attendance record.
       </p>
       <div style={{ display: 'flex', alignItems: 'flex-end', gap: 12 }}>
         <div>

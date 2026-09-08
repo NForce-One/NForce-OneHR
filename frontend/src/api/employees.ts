@@ -33,8 +33,6 @@ export interface EmployeeRecord {
   employmentType: string;
   workMode: string;
   joiningDate: string;
-  /** Admin-set IANA zone id (e.g. "Asia/Kolkata"), or null to fall back to Location then the org default. */
-  timezone: string | null;
   active: boolean;
   currentManager: ManagerRef | null;
   tempPassword?: string;

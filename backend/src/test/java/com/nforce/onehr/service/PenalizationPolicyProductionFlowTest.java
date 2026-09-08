@@ -108,7 +108,7 @@ class PenalizationPolicyProductionFlowTest {
                 .thenReturn(Optional.empty());
         lenient().when(attendanceExceptionRepository.findByEmployeeUserIdInAndExceptionDateBetweenOrderByExceptionDateDescCreatedAtDesc(
                 any(), any(), any())).thenReturn(List.of());
-        lenient().when(attendancePenaltyRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        lenient().when(attendancePenaltyRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
         // Both detectExceptions' own GAP-007 working-day gate and detectNoAttendanceAndShortage
         // need a real schedule for this employee to treat the test dates (weekdays, no location/
         // weekly-off policy configured => default Sat/Sun off) as working days. The employee has
@@ -131,15 +131,23 @@ class PenalizationPolicyProductionFlowTest {
         return User.builder().id(UUID.randomUUID()).email(hrEmail).roles(Set.of(role)).build();
     }
 
+    // Unified-grace model: Attendance.status is the sole "genuinely late" signal ExceptionService's
+    // detectExceptions gates LATE_ARRIVAL detection on — a fixture representing a genuine late
+    // arrival must carry status LATE, exactly as AttendanceInterpretationService/AttendanceService
+    // would have set it (lateByMinutes alone is only ever the raw, no-forgiveness display figure).
     private Attendance lateAttendance(LocalDate date, int lateByMinutes) {
         return Attendance.builder()
                 .employeeUserId(employeeId).workDate(date)
                 .checkInAt(date.atTime(9, 30).plusMinutes(lateByMinutes))
                 .checkOutAt(date.atTime(18, 0))
-                .lateByMinutes(lateByMinutes)
+                .status("LATE").lateByMinutes(lateByMinutes)
                 .build();
     }
 
+    // graceMinutes is retained only as an inert PenalizationPolicyVersion field — no longer
+    // consulted by ConfiguredAttendancePolicyEngine for Late Arrival eligibility (the assigned
+    // Shift's own ShiftVersion.lateGraceMinutes is the sole allowed-late privilege now); kept here
+    // only to exercise that a stored/versioned value continues to round-trip harmlessly.
     private PenalizationPolicyVersion lateArrivalVersion(int version, int graceMinutes) {
         return PenalizationPolicyVersion.builder()
                 .id(UUID.randomUUID()).policyId(policyId).version(version)
@@ -149,9 +157,17 @@ class PenalizationPolicyProductionFlowTest {
                 .build();
     }
 
+    private PenalizationPolicyVersion disabledLateArrivalVersion(int version) {
+        return PenalizationPolicyVersion.builder()
+                .id(UUID.randomUUID()).policyId(policyId).version(version)
+                .effectiveFrom(LocalDate.of(2026, 1, 1).atStartOfDay())
+                .lateArrivalEnabled(false)
+                .build();
+    }
+
     // ── CRITICAL ACCEPTANCE TEST — real production flow, V1 ──
     @Test
-    void realProductionFlow_v1Grace10_lateMinutes12_appliesPenalty() {
+    void realProductionFlow_v1_genuineLateArrival_appliesPenalty() {
         LocalDate date = LocalDate.of(2026, 8, 17);
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), date, date))
                 .thenReturn(List.of(lateAttendance(date, 12)));
@@ -161,7 +177,7 @@ class PenalizationPolicyProductionFlowTest {
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, times(1)).saveAndFlush(captor.capture());
         AttendancePenalty penalty = captor.getValue();
         assertEquals(employeeId, penalty.getEmployeeUserId());
         assertEquals(date, penalty.getIncidentDate());
@@ -172,18 +188,21 @@ class PenalizationPolicyProductionFlowTest {
         assertNotNull(penalty.getEvaluatedAt());
     }
 
-    // ── Same real production flow, V2: grace widened to 15 — NO code change, only configuration ──
+    // ── Same real production flow, V2: HR disables the Late Arrival section — NO code change,
+    // only configuration. (Widening laGracePeriodMinutes no longer changes this outcome at all —
+    // see ConfiguredAttendancePolicyEngineTest's own policyGraceChange_... acceptance test for that
+    // specific claim; this test instead proves a real, still-effective per-version config change.) ──
     @Test
-    void realProductionFlow_v2Grace15_sameLateMinutes12_noMatch_noPenaltyPersisted() {
+    void realProductionFlow_v2LateArrivalDisabled_sameGenuineLateArrival_noMatch_noPenaltyPersisted() {
         LocalDate date = LocalDate.of(2026, 8, 17);
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), date, date))
                 .thenReturn(List.of(lateAttendance(date, 12)));
         when(versionRepository.findVersionsEffectiveAt(date.atStartOfDay()))
-                .thenReturn(List.of(lateArrivalVersion(2, 15)));
+                .thenReturn(List.of(disabledLateArrivalVersion(2)));
 
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
-        verify(attendancePenaltyRepository, never()).save(any());
+        verify(attendancePenaltyRepository, never()).saveAndFlush(any());
     }
 
     // ── Version immutability across two evaluations through the real production path ──
@@ -195,7 +214,7 @@ class PenalizationPolicyProductionFlowTest {
         when(versionRepository.findVersionsEffectiveAt(augDate.atStartOfDay()))
                 .thenReturn(List.of(lateArrivalVersion(1, 10)));
         when(versionRepository.findVersionsEffectiveAt(sepDate.atStartOfDay()))
-                .thenReturn(List.of(lateArrivalVersion(2, 15)));
+                .thenReturn(List.of(disabledLateArrivalVersion(2)));
 
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), augDate, augDate))
                 .thenReturn(List.of(lateAttendance(augDate, 12)));
@@ -205,9 +224,10 @@ class PenalizationPolicyProductionFlowTest {
                 .thenReturn(List.of(lateAttendance(sepDate, 12)));
         exceptionService.getExceptionsForCaller(hrEmail, sepDate, sepDate);
 
-        // Only the August evaluation (V1, 12 > 10) produced a penalty; September (V2, 12 <= 15) did not.
+        // Only the August evaluation (V1, Late Arrival enabled) produced a penalty; September
+        // (V2, HR since disabled the section) did not, for the identical kind of genuine lateness.
         ArgumentCaptor<AttendancePenalty> captor = ArgumentCaptor.forClass(AttendancePenalty.class);
-        verify(attendancePenaltyRepository, times(1)).save(captor.capture());
+        verify(attendancePenaltyRepository, times(1)).saveAndFlush(captor.capture());
         assertEquals(augDate, captor.getValue().getIncidentDate());
         assertEquals(1, captor.getValue().getPolicyVersion());
     }
@@ -226,7 +246,7 @@ class PenalizationPolicyProductionFlowTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
-        verify(attendancePenaltyRepository, never()).save(any());
+        verify(attendancePenaltyRepository, never()).saveAndFlush(any());
     }
 
     @Test
@@ -238,7 +258,7 @@ class PenalizationPolicyProductionFlowTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
-        verify(attendancePenaltyRepository, never()).save(any());
+        verify(attendancePenaltyRepository, never()).saveAndFlush(any());
     }
 
     // ── Regularization: unchanged existing meaning, now honored through the real flow too ──
@@ -256,7 +276,7 @@ class PenalizationPolicyProductionFlowTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
-        verify(attendancePenaltyRepository, never()).save(any());
+        verify(attendancePenaltyRepository, never()).saveAndFlush(any());
     }
 
     // ── Duplicate-evaluation guard: re-running the dashboard load for an already-detected
@@ -276,6 +296,6 @@ class PenalizationPolicyProductionFlowTest {
 
         exceptionService.getExceptionsForCaller(hrEmail, date, date);
 
-        verify(attendancePenaltyRepository, never()).save(any());
+        verify(attendancePenaltyRepository, never()).saveAndFlush(any());
     }
 }

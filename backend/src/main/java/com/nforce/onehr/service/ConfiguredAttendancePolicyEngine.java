@@ -99,9 +99,15 @@ public class ConfiguredAttendancePolicyEngine implements AttendancePolicyEngine 
         if (ctx.getLateMinutes() == null) {
             return configurationRequired(v, "lateMinutes fact is required to evaluate Late Arrival.");
         }
-        if (v.getLaGracePeriodMinutes() != null && ctx.getLateMinutes() <= v.getLaGracePeriodMinutes()) {
-            return noMatch(v.getPolicyId(), v.getVersion(), "Late minutes are within the configured grace period.");
-        }
+        // Deliberately NOT re-applying v.getLaGracePeriodMinutes() as a second, independently-
+        // configured grace here. There is exactly one allowed-late privilege — the assigned Shift's
+        // own ShiftVersion.lateGraceMinutes — and it is already the sole reason this evaluation is
+        // even reached: ExceptionService only ever calls into this engine for a LATE_ARRIVAL
+        // discrepancy once Attendance.status is genuinely LATE against that shift grace (see
+        // ExceptionService#detectExceptions). Re-checking a second, separately configured grace
+        // here would let a Penalization Policy silently override (widen OR narrow) the shift's own
+        // privilege for the exact same occurrence — the two-grace duplication this engine used to
+        // have, now unified onto the shift as the single source of truth.
         if (v.isLaIgnoreWhenEffectiveHoursMetEnabled()
                 && ctx.getEffectiveHoursPercent() != null && ctx.getEffectiveHoursPercent() >= 100.0) {
             return noMatch(v.getPolicyId(), v.getVersion(), "Employee completed full effective hours despite late arrival.");

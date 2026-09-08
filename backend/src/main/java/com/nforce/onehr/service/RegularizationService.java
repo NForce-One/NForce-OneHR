@@ -570,17 +570,24 @@ public class RegularizationService {
             // overwrite), so a disputed or repeated correction can always be reconstructed from
             // audit_log rather than silently losing what the record looked like beforehand.
             Map<String, Object> beforeAttendanceSnapshot = attendanceSnapshot(record);
+            Employee employee = employeeRepository.findById(req.getEmployeeUserId()).orElse(null);
             if (isNewRecord) {
                 record = Attendance.builder()
                         .employeeUserId(req.getEmployeeUserId())
                         .workDate(req.getAttendanceDate())
                         .checkInAt(req.getRequestedCheckIn())
+                        // Snapshotted once, at creation, exactly like a normal Check-In/Web
+                        // Clock-In — see AttendanceRulesService#resolveEmployeeZoneId and
+                        // Attendance#getTimezone's own doc comment. Never touched again after
+                        // this: an existing row (the non-isNewRecord branch below) keeps
+                        // whatever timezone it already snapshotted, even if this correction
+                        // changes its check-in time or the employee's Location has since changed.
+                        .timezone(attendanceRulesService.resolveEmployeeZoneId(employee).getId())
                         .build();
             }
             if (req.getRequestedCheckIn() != null) record.setCheckInAt(req.getRequestedCheckIn());
             if (req.getRequestedCheckOut() != null) record.setCheckOutAt(req.getRequestedCheckOut());
             record.setSource(SOURCE_REGULARIZATION);
-            Employee employee = employeeRepository.findById(req.getEmployeeUserId()).orElse(null);
             AttendanceInterpretation interpretation = isNewRecord
                     ? attendanceInterpretationService.interpretForKnownWorkDate(employee, record.getWorkDate(), record.getCheckInAt())
                     : attendanceInterpretationService.interpretExistingRecordLateness(record, record.getCheckInAt());

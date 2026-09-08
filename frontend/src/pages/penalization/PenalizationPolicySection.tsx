@@ -236,9 +236,12 @@ function ViewModal({ policy, initialSection, onClose }: { policy: PenalizationPo
       {section === 'lateArrival' && (
         <>
           <DetailRow label="Basis" value={policy.lateArrival.basis === 'TOTAL_HOURS' ? 'Total hours' : 'Number of incidents'} />
-          <DetailRow label="Grace period" value={policy.lateArrival.gracePeriodMinutes != null ? `${policy.lateArrival.gracePeriodMinutes} min(s) every shift` : 'Not configured'} />
           {policy.lateArrival.basis === 'TOTAL_HOURS' ? (
             <>
+              {/* Only this basis still consults the policy's own grace period server-side — the
+                  Number of Incidents basis is governed entirely by the employee's assigned Shift's
+                  own allowed-late privilege (one allowed-late grace, not a second one here). */}
+              <DetailRow label="Grace period" value={policy.lateArrival.gracePeriodMinutes != null ? `${policy.lateArrival.gracePeriodMinutes} min(s) every shift` : 'Not configured'} />
               <DetailRow label="Allowed hours" value={policy.lateArrival.allowedHours != null ? `${policy.lateArrival.allowedHours}h / ${policy.lateArrival.exemptPeriod.toLowerCase()}` : 'Not configured'} />
               {policy.lateArrival.lateHoursTiers.length === 0 ? (
                 <DetailRow label="Tiers" value="Not configured" />
@@ -830,11 +833,16 @@ function ConfigurationWorkspace({ policy, token, leaveTypes, policyId, initialVi
                   <option value="TOTAL_HOURS">Total Hours</option>
                 </select>
               </div>
-              <div>
-                <span style={labelText}>Grace period (minutes every shift)</span>
-                <input type="number" min={0} style={inputStyle} value={la.gracePeriodMinutes ?? ''}
-                  onChange={e => patch('lateArrival', { gracePeriodMinutes: e.target.value === '' ? null : Number(e.target.value) })} />
-              </div>
+              {la.basis === 'TOTAL_HOURS' && (
+                // Only this basis still consults this grace period server-side. Under Number of
+                // Incidents, the employee's assigned Shift's own allowed-late privilege is the
+                // sole grace — there is no separate policy-level one for this admin to configure.
+                <div>
+                  <span style={labelText}>Grace period (minutes every shift)</span>
+                  <input type="number" min={0} style={inputStyle} value={la.gracePeriodMinutes ?? ''}
+                    onChange={e => patch('lateArrival', { gracePeriodMinutes: e.target.value === '' ? null : Number(e.target.value) })} />
+                </div>
+              )}
 
               {la.basis === 'NUMBER_OF_INCIDENTS' && (
                 <>
