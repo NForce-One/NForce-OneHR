@@ -26,9 +26,14 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.security.access.AccessDeniedException;
 
 import java.lang.reflect.Field;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -65,6 +70,12 @@ class RegularizationServiceTest {
     @Mock private com.nforce.onehr.repository.ShiftRepository shiftRepository;
 
     private RegularizationService regularizationService;
+    // Hoisted out of setUp() (rather than kept as local variables there) purely so
+    // useClock(Clock) below can rebuild regularizationService with a different Clock — every
+    // other collaborator is a genuine @Mock field already; these two are the only real
+    // (non-mocked) collaborators the constructor needs.
+    private AttendanceInterpretationService attendanceInterpretationService;
+    private AttendanceRulesService attendanceRulesService;
 
     private final UUID employeeId = UUID.randomUUID();
     private final UUID managerId = UUID.randomUUID();
@@ -120,7 +131,15 @@ class RegularizationServiceTest {
         lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(defaultShiftVersion);
         lenient().when(employeeRepository.findById(employeeId))
                 .thenReturn(Optional.of(Employee.builder().userId(employeeId).shift(defaultShift).build()));
-        lenient().when(employeeRepository.findById(argThat(id -> id != null && !id.equals(employeeId))))
+        // Super Admin also holds EMPLOYEE (see superAdminUser above) and is used as the
+        // regularization subject in several literal-date scenarios below — resolves to an
+        // Employee with the same defaultShift so the workday-validation lookup
+        // (RegularizationService#resolveTimes -> AttendanceInterpretationService#belongsToWorkday)
+        // has a real shift context to resolve against, exactly like a real Super Admin employee
+        // record would.
+        lenient().when(employeeRepository.findById(superAdminId))
+                .thenReturn(Optional.of(Employee.builder().userId(superAdminId).shift(defaultShift).build()));
+        lenient().when(employeeRepository.findById(argThat(id -> id != null && !id.equals(employeeId) && !id.equals(superAdminId))))
                 .thenReturn(Optional.empty());
         lenient().when(regularizationApprovalRepository.findByRequestIdOrderByActionDateDesc(any()))
                 .thenReturn(List.of());
@@ -142,19 +161,42 @@ class RegularizationServiceTest {
                         // (previously attendanceProps.getZone()'s identical stub).
                         .defaultTimezone(java.time.ZoneId.systemDefault().getId())
                         .build()));
-        AttendanceRulesService attendanceRulesService = new AttendanceRulesService(attendanceRulesRepository);
+        attendanceRulesService = new AttendanceRulesService(attendanceRulesRepository);
         // Resolves any Shift referenced by an Attendance fixture's own .shiftId(...) — mirrors the
         // real ShiftRepository for AttendanceInterpretationService.interpretExistingRecordLateness.
         // Defaults to resolving defaultShift itself (declared just above), since every existing-
         // record approve() test in this file currently stubs an empty Attendance lookup (always
         // hitting the brand-new-record/interpretForKnownWorkDate path) rather than an existing one.
         lenient().when(shiftRepository.findById(defaultShift.getId())).thenReturn(Optional.of(defaultShift));
-        AttendanceInterpretationService attendanceInterpretationService =
-                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+        attendanceInterpretationService = new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+
+        // Default Clock for every test that doesn't care about the future-timestamp guard (see
+        // RegularizationService#resolveTimes): a fixed instant a decade past whatever "now" is
+        // when each test runs, so every one of this file's many `LocalDate.now()`-based fixtures
+        // (a stand-in for "some arbitrary calendar date," not literally "this exact moment") reads
+        // as safely historical regardless of the real wall-clock time-of-day the suite happens to
+        // run at. The dedicated "future-timestamp guard" tests below call useClock(...) themselves
+        // with a specific fixed reference instant instead.
+        useClock(Clock.fixed(Instant.now().plus(Duration.ofDays(3650)), ZoneOffset.UTC));
+
+        // Default for existing tests that don't care about the monthly cap — most submit()
+        // tests use today's date and don't stub this, so let it resolve to a lenient 0.
+        lenient().when(regularizationRepository.countByEmployeeUserIdAndCreatedAtBetween(any(), any(), any()))
+                .thenReturn(0L);
+    }
+
+    /**
+     * (Re)builds regularizationService against the given Clock, reusing every other
+     * already-configured mock/collaborator — lets an individual test swap in a specific fixed
+     * "now" for RegularizationService#resolveTimes's future-timestamp guard without disturbing
+     * anything else setUp() already stubbed. Also re-applies the two @Value-injected fields,
+     * since those live on the RegularizationService instance itself and are lost on rebuild.
+     */
+    private void useClock(Clock clock) throws Exception {
         regularizationService = new RegularizationService(regularizationRepository, regularizationApprovalRepository,
                 attendanceRepository, historyRepository, userRepository, employeeRepository, auditService,
                 auditSnapshot, notificationService, exceptionService, attendanceInterpretationService,
-                attendanceRulesService);
+                attendanceRulesService, clock);
 
         // @Value-injected fields — never populated outside a Spring container.
         Field employeeLookback = RegularizationService.class.getDeclaredField("employeeLookbackDays");
@@ -164,11 +206,6 @@ class RegularizationServiceTest {
         Field monthlyLimit = RegularizationService.class.getDeclaredField("monthlyLimit");
         monthlyLimit.setAccessible(true);
         monthlyLimit.set(regularizationService, 3);
-
-        // Default for existing tests that don't care about the monthly cap — most submit()
-        // tests use today's date and don't stub this, so let it resolve to a lenient 0.
-        lenient().when(regularizationRepository.countByEmployeeUserIdAndCreatedAtBetween(any(), any(), any()))
-                .thenReturn(0L);
     }
 
     private CreateRegularizationRequest request(LocalDate date, LocalDateTime checkIn, LocalDateTime checkOut, String reason) {
@@ -243,12 +280,12 @@ class RegularizationServiceTest {
 
     @Test
     void submit_overnightShift_330pmTo1230am_isAcceptedAndCheckoutRollsToNextDay() {
-        // Scenario F: check-in's business date (today, since 15:30 >= 07:00) and the rolled-over
-        // check-out's business date (also today, since 00:30 < 07:00 attributes it back to the
-        // previous business day) agree — both belong to attendanceDate=today — so this passes the
-        // new business-date consistency check. The actual stored check-out timestamp remains the
-        // real next-calendar-day value; only its BUSINESS-date attribution rolls back, not the
-        // timestamp itself.
+        // Scenario F: check-in's workday (today, since defaultShift's own 09:00 start has already
+        // been reached) and the rolled-over check-out's workday (also today, since 00:30 falls
+        // before today's 03:00 workday boundary — 09:00 + 18h max — so it's still part of today's
+        // overnight tail) agree — both belong to attendanceDate=today — so this passes the
+        // workday-consistency check. The actual stored check-out timestamp remains the real
+        // next-calendar-day value; only its WORKDAY attribution rolls back, not the timestamp itself.
         when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
         LocalDate today = LocalDate.now();
         // The frontend always sends both times on the same attendanceDate (RequestModal in
@@ -265,19 +302,37 @@ class RegularizationServiceTest {
     }
 
     @Test
-    void scenarioG_overnightCheckout_18Aug659AM_businessDateRemains17Aug() {
-        // Same shape as scenario F but at the boundary's edge: check-out rolls over to next-day
-        // 06:59, still < 07:00, so it's still attributed back to check-in's business date.
+    void scenarioG_overnightCheckoutPast3AMWorkdayBoundary_isRejected() {
+        // Same shape as scenario F, but past the ACTUAL shift-aware workday boundary this time:
+        // defaultShift is 9:00-18:00 with an 18h max workday duration (see setUp), so the workday
+        // this check-in (20:00) belongs to ends at 03:00 the next calendar day — never a fixed
+        // 07:00 AM cutover. Check-out rolls over to next-day 06:59, which is PAST that 03:00
+        // boundary, so it genuinely belongs to the NEXT workday and must be rejected.
         when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
         LocalDate today = LocalDate.now();
-        CreateRegularizationRequest req = request(today, today.atTime(20, 0), today.atTime(6, 59), "Overnight shift, boundary edge");
+        CreateRegularizationRequest req = request(today, today.atTime(20, 0), today.atTime(6, 59), "Overnight shift, past the workday boundary");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, employeeEmail));
+        assertTrue(ex.getMessage().startsWith("Corrected check-out time must fall within the attendance workday ("));
+        verify(regularizationRepository, never()).save(any());
+    }
+
+    @Test
+    void scenarioG2_overnightCheckoutJustBeforeTheWorkdayBoundary_isAccepted() {
+        // The mirror case: a check-out just BEFORE the same 03:00 workday boundary (defaultShift
+        // 9:00-18:00, 18h max) still belongs to the same workday as the 20:00 check-in.
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        CreateRegularizationRequest req = request(today, today.atTime(20, 0), today.atTime(2, 59), "Overnight shift, within the workday");
         req.setManagerUserId(hrId);
 
         RegularizationResponse resp = regularizationService.submit(req, employeeEmail);
 
         assertEquals("PENDING", resp.getStatus());
         assertEquals(today.atTime(20, 0), resp.getRequestedCheckIn());
-        assertEquals(today.plusDays(1).atTime(6, 59), resp.getRequestedCheckOut());
+        assertEquals(today.plusDays(1).atTime(2, 59), resp.getRequestedCheckOut());
     }
 
     @Test
@@ -318,17 +373,179 @@ class RegularizationServiceTest {
     }
 
     @Test
-    void scenario9_overnightCheckoutAt659am_18Aug_literalDates_businessDateRemains17Aug() {
+    void scenario9_overnightCheckoutAt659am_18Aug_literalDates_isRejectedPastTheWorkdayBoundary() {
+        // Literal-dated counterpart to scenarioG above: 6:59 AM 18-Aug is past the 03:00 workday
+        // boundary a 9:00-18:00/18h-max shift produces, so it belongs to 18-Aug's own workday, not
+        // 17-Aug's — a genuine mismatch with the requested attendanceDate.
         when(userRepository.findByEmail(superAdminEmail)).thenReturn(Optional.of(superAdminUser));
         LocalDate aug17 = LocalDate.of(2026, 8, 17);
-        CreateRegularizationRequest req = request(aug17, aug17.atTime(20, 0), aug17.atTime(6, 59), "Overnight shift, boundary edge");
+        CreateRegularizationRequest req = request(aug17, aug17.atTime(20, 0), aug17.atTime(6, 59), "Overnight shift, past the workday boundary");
         req.setManagerUserId(hrId);
 
-        RegularizationResponse resp = regularizationService.submit(req, superAdminEmail);
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, superAdminEmail));
+        assertTrue(ex.getMessage().startsWith("Corrected check-out time must fall within the attendance workday ("));
+    }
+
+    // ── Workday-aware validation (ShiftDayPolicy), replacing the old fixed calendar-date/07:00
+    //    boundary check — the exact spec worked example: a 10:00-19:00 shift with an 18h maximum
+    //    workday duration spans workday 04:00 -> 04:00 the NEXT calendar day. ──────────────────
+
+    /** Overrides defaultShift's 9:00-18:00 stub with the spec's own 10:00-19:00 shift for one test. */
+    private void stubShift10to19() {
+        lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(
+                ShiftVersion.builder().startTime(LocalTime.of(10, 0)).endTime(LocalTime.of(19, 0)).lateGraceMinutes(10).build());
+    }
+
+    @Test
+    void submit_missingCheckout_correctedPostMidnightCheckout_isAccepted_theExactReportedBug() {
+        // The exact bug report: an attendance with a missing checkout, corrected with a
+        // post-midnight checkout that still belongs to the SAME workday (04:00 -> 04:00 next day
+        // for a 10:00-19:00 shift) — must no longer be rejected as "not falling on the attendance
+        // date".
+        stubShift10to19();
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        LocalDateTime existingCheckIn = today.atTime(9, 25);
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, today))
+                .thenReturn(Optional.of(Attendance.builder().employeeUserId(employeeId).workDate(today)
+                        .checkInAt(existingCheckIn).shiftId(defaultShift.getId()).build()));
+
+        CreateRegularizationRequest req = request(today, null, today.atTime(0, 21), "Forgot to punch out");
+        req.setManagerUserId(hrId);
+        RegularizationResponse resp = regularizationService.submit(req, employeeEmail);
 
         assertEquals("PENDING", resp.getStatus());
-        assertEquals(aug17, resp.getAttendanceDate());
-        assertEquals(LocalDateTime.of(2026, 8, 18, 6, 59), resp.getRequestedCheckOut());
+        assertEquals(today.plusDays(1).atTime(0, 21), resp.getRequestedCheckOut());
+    }
+
+    @Test
+    void submit_missingCheckout_correctedCheckoutAt330amWithinTheWorkday_isAccepted() {
+        stubShift10to19();
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, today))
+                .thenReturn(Optional.of(Attendance.builder().employeeUserId(employeeId).workDate(today)
+                        .checkInAt(today.atTime(9, 25)).shiftId(defaultShift.getId()).build()));
+
+        CreateRegularizationRequest req = request(today, null, today.atTime(3, 30), "Forgot to punch out");
+        req.setManagerUserId(hrId);
+        RegularizationResponse resp = regularizationService.submit(req, employeeEmail);
+
+        assertEquals(today.plusDays(1).atTime(3, 30), resp.getRequestedCheckOut());
+    }
+
+    @Test
+    void submit_correctedCheckoutExactlyAtTheWorkdayEnd_isRejected() {
+        // 04:00 next day is exactly workdayEndAt — ShiftDayPolicy already attributes that instant
+        // (and everything after) to the NEXT workday, never the originating one.
+        stubShift10to19();
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, today))
+                .thenReturn(Optional.of(Attendance.builder().employeeUserId(employeeId).workDate(today)
+                        .checkInAt(today.atTime(9, 25)).shiftId(defaultShift.getId()).build()));
+
+        CreateRegularizationRequest req = request(today, null, today.atTime(4, 0), "Forgot to punch out");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, employeeEmail));
+        assertTrue(ex.getMessage().startsWith("Corrected check-out time must fall within the attendance workday ("));
+    }
+
+    @Test
+    void submit_correctedCheckoutAfterTheWorkdayEnd_isRejected() {
+        stubShift10to19();
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, today))
+                .thenReturn(Optional.of(Attendance.builder().employeeUserId(employeeId).workDate(today)
+                        .checkInAt(today.atTime(9, 25)).shiftId(defaultShift.getId()).build()));
+
+        CreateRegularizationRequest req = request(today, null, today.atTime(5, 0), "Forgot to punch out");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, employeeEmail));
+        assertTrue(ex.getMessage().startsWith("Corrected check-out time must fall within the attendance workday ("));
+    }
+
+    @Test
+    void submit_correctedCheckIn_postMidnightWithinAnOvernightShiftsWorkday_isAccepted() {
+        // No prior punch exists yet for this date — resolves against the EMPLOYEE's current shift
+        // (interpretForKnownWorkDate's own rule), a genuinely overnight one: 22:00-07:00, 18h max
+        // -> workday 16:00 -> 16:00 next day. A brand-new check-in correction at 05:00 the NEXT
+        // calendar day is still within that window (before the 16:00 boundary), so it's genuinely
+        // a post-midnight arrival that still belongs to TODAY's workday.
+        lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(
+                ShiftVersion.builder().startTime(LocalTime.of(22, 0)).endTime(LocalTime.of(7, 0)).lateGraceMinutes(10).build());
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, today)).thenReturn(Optional.empty());
+
+        CreateRegularizationRequest req = request(today, today.plusDays(1).atTime(5, 0), null, "Night shift check-in, post-midnight");
+        req.setManagerUserId(hrId);
+        RegularizationResponse resp = regularizationService.submit(req, employeeEmail);
+
+        assertEquals("PENDING", resp.getStatus());
+        assertEquals(today.plusDays(1).atTime(5, 0), resp.getRequestedCheckIn());
+    }
+
+    @Test
+    void submit_correctedCheckIn_beforeAnOvernightShiftsWorkdayStart_belongsToThePreviousWorkday_isRejected() {
+        // Same 22:00-07:00/18h-max shift (workday 16:00 -> 16:00 next day) — a check-in correction
+        // at 10:00 on the attendance date itself is BEFORE that date's own 16:00 workday start
+        // (it's still the tail of the PREVIOUS workday, which doesn't end until 16:00), so it
+        // mismatches the requested attendanceDate.
+        lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(
+                ShiftVersion.builder().startTime(LocalTime.of(22, 0)).endTime(LocalTime.of(7, 0)).lateGraceMinutes(10).build());
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, today)).thenReturn(Optional.empty());
+
+        CreateRegularizationRequest req = request(today, today.atTime(10, 0), null, "Too early to belong to today's workday");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, employeeEmail));
+        assertTrue(ex.getMessage().startsWith("Corrected check-in time must fall within the attendance workday ("));
+    }
+
+    /**
+     * The corrected-checkout side of the same "record's own snapshotted shift, never the
+     * employee's current one" guarantee {@link #approve_correctingAnExistingRecord_usesItsOwnSnapshottedShift_notTheEmployeesCurrentOne}
+     * already proves at approval time — here proven at SUBMISSION/validation time instead.
+     * existingPunch is snapshotted under defaultShift (9:00-18:00, workday boundary 03:00), but the
+     * employee has SINCE been reassigned to a 10:00-19:00 shift (workday boundary 04:00) — a
+     * 03:30 AM correction must be validated against the RECORD's own 03:00 boundary (rejected),
+     * never the employee's new 04:00 one (which would have accepted it).
+     */
+    @Test
+    void submit_correctingAnExistingRecord_validatesAgainstItsOwnSnapshottedShift_notTheEmployeesCurrentOne() {
+        Shift newShift = Shift.builder().id(UUID.randomUUID()).name("New Shift").active(true).build();
+        ShiftVersion oldVersion = ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).lateGraceMinutes(15).build();
+        ShiftVersion newVersion = ShiftVersion.builder().startTime(LocalTime.of(10, 0)).endTime(LocalTime.of(19, 0)).lateGraceMinutes(10).build();
+        lenient().when(shiftVersionResolver.resolve(any(), any())).thenAnswer(inv -> {
+            Shift s = inv.getArgument(0);
+            return s.getId().equals(newShift.getId()) ? newVersion : oldVersion;
+        });
+        // Employee reassigned since the record's own date — CURRENT shift is the new one.
+        lenient().when(employeeRepository.findById(employeeId))
+                .thenReturn(Optional.of(Employee.builder().userId(employeeId).shift(newShift).build()));
+
+        when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
+        LocalDate today = LocalDate.now();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, today))
+                .thenReturn(Optional.of(Attendance.builder().employeeUserId(employeeId).workDate(today)
+                        .checkInAt(today.atTime(9, 25)).shiftId(defaultShift.getId()).build()));
+
+        CreateRegularizationRequest req = request(today, null, today.atTime(3, 30), "Forgot to punch out");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, employeeEmail));
+        assertTrue(ex.getMessage().startsWith("Corrected check-out time must fall within the attendance workday ("));
     }
 
     @Test
@@ -346,14 +563,14 @@ class RegularizationServiceTest {
     }
 
     @Test
-    void submit_checkoutClockTimeAfterSevenAMOnRolledOverDay_isRejectedForBusinessDateMismatch() {
+    void submit_checkoutClockTimeWayPastTheWorkdayBoundary_isRejectedForWorkdayMismatch() {
         // Check-out's clock time (3:00 PM) is earlier than check-in's (3:30 PM), so the same-day
-        // rollover fix (above) still shifts it to the next calendar day. But 3:00 PM on that next
-        // day is itself >= the 07:00 AM boundary, so resolveBusinessDate attributes it to ITS OWN
-        // business date, not check-in's — the two sides now disagree on which attendanceDate this
-        // request belongs to. A genuinely valid overnight case never has this problem (its
-        // check-out clock time is always < 07:00, per the boundary rule); this ~23.5h interval is
-        // the case the boundary rule is NOT meant to cover, and must still fail.
+        // rollover fix (above) still shifts it to the next calendar day. But 3:00 PM the next day
+        // is itself well past the workday boundary a 9:00-18:00/18h-max shift produces (03:00 the
+        // next day), so it genuinely belongs to the NEXT workday, not check-in's — the two sides
+        // disagree on which attendanceDate this request belongs to. A genuinely valid overnight
+        // case never has this problem (its check-out always lands before the workday boundary);
+        // this ~23.5h interval is the case that boundary is NOT meant to cover, and must still fail.
         when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
         LocalDate today = LocalDate.now();
         CreateRegularizationRequest req = request(today, today.atTime(15, 30), today.atTime(15, 0), "Long overnight shift");
@@ -361,7 +578,7 @@ class RegularizationServiceTest {
 
         IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
                 () -> regularizationService.submit(req, employeeEmail));
-        assertEquals("Corrected check-out time must fall on the attendance date", ex.getMessage());
+        assertTrue(ex.getMessage().startsWith("Corrected check-out time must fall within the attendance workday ("));
         verify(regularizationRepository, never()).save(any());
     }
 
@@ -530,6 +747,145 @@ class RegularizationServiceTest {
 
         assertThrows(IllegalArgumentException.class,
                 () -> regularizationService.submit(request(today, null, null, "Nothing on file"), employeeEmail));
+        verify(regularizationRepository, never()).save(any());
+    }
+
+    // ── Future-timestamp guard (RegularizationService#resolveTimes): a corrected check-in/
+    //    check-out must describe something that has already happened, read in the employee's own
+    //    business zone — never later than the authoritative server clock. Uses the Super Admin
+    //    fixture throughout (lookback-window-exempt, see submit_bySuperAdmin_bypassesLookbackWindow)
+    //    so each test can pin a fully fixed, fictitious reference "now" via useClock(...) —
+    //    deterministic regardless of the real wall-clock time-of-day `mvn test` actually runs at. ──
+
+    /** A Clock permanently fixed at {@code at}, read in the same zone attendanceRulesService's
+     * defaultTimezone stub resolves to (see setUp()) — so resolveTimes()'s own
+     * {@code LocalDateTime.ofInstant(clock.instant(), zone)} reconstructs exactly {@code at}
+     * again, regardless of the machine's own real timezone offset. */
+    private Clock fixedClockAt(LocalDateTime at) {
+        ZoneId zone = ZoneId.systemDefault();
+        return Clock.fixed(at.atZone(zone).toInstant(), zone);
+    }
+
+    @Test
+    void submit_futureGuard_pastSameDayTimes_areAccepted() throws Exception {
+        LocalDateTime fixedNow = LocalDateTime.of(2026, 6, 15, 18, 0);
+        useClock(fixedClockAt(fixedNow));
+        when(userRepository.findByEmail(superAdminEmail)).thenReturn(Optional.of(superAdminUser));
+        LocalDate attendanceDate = fixedNow.toLocalDate();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(superAdminId, attendanceDate)).thenReturn(Optional.empty());
+
+        CreateRegularizationRequest req = request(attendanceDate, fixedNow.minusHours(9), fixedNow.minusHours(1), "Forgot badge");
+        req.setManagerUserId(hrId);
+
+        RegularizationResponse resp = regularizationService.submit(req, superAdminEmail);
+
+        assertEquals("PENDING", resp.getStatus());
+        assertEquals(fixedNow.minusHours(9), resp.getRequestedCheckIn());
+        assertEquals(fixedNow.minusHours(1), resp.getRequestedCheckOut());
+    }
+
+    @Test
+    void submit_futureGuard_historicalDate_isAccepted() throws Exception {
+        // A genuinely historical correction's own resolved instant is, by construction, already
+        // in the past relative to "now" — never rejected by the future-timestamp guard, no matter
+        // how far back (separately bounded by the lookback window, which Super Admin is exempt
+        // from — see submit_bySuperAdmin_bypassesLookbackWindow).
+        LocalDateTime fixedNow = LocalDateTime.of(2026, 6, 15, 18, 0);
+        useClock(fixedClockAt(fixedNow));
+        when(userRepository.findByEmail(superAdminEmail)).thenReturn(Optional.of(superAdminUser));
+        LocalDate attendanceDate = fixedNow.toLocalDate().minusDays(30);
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(superAdminId, attendanceDate)).thenReturn(Optional.empty());
+
+        CreateRegularizationRequest req = request(attendanceDate, attendanceDate.atTime(9, 0), attendanceDate.atTime(18, 0), "Old correction");
+        req.setManagerUserId(hrId);
+
+        RegularizationResponse resp = regularizationService.submit(req, superAdminEmail);
+
+        assertEquals("PENDING", resp.getStatus());
+    }
+
+    @Test
+    void submit_futureGuard_sameDayCheckInLaterThanNow_isRejected() throws Exception {
+        LocalDateTime fixedNow = LocalDateTime.of(2026, 6, 15, 18, 0);
+        useClock(fixedClockAt(fixedNow));
+        when(userRepository.findByEmail(superAdminEmail)).thenReturn(Optional.of(superAdminUser));
+        LocalDate attendanceDate = fixedNow.toLocalDate();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(superAdminId, attendanceDate)).thenReturn(Optional.empty());
+
+        CreateRegularizationRequest req = request(attendanceDate, fixedNow.plusHours(2), null, "Hasn't happened yet");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, superAdminEmail));
+        assertEquals("Corrected check-in time cannot be later than the current time", ex.getMessage());
+        verify(regularizationRepository, never()).save(any());
+    }
+
+    @Test
+    void submit_futureGuard_sameDayCheckOutLaterThanNow_isRejected() throws Exception {
+        LocalDateTime fixedNow = LocalDateTime.of(2026, 6, 15, 18, 0);
+        useClock(fixedClockAt(fixedNow));
+        when(userRepository.findByEmail(superAdminEmail)).thenReturn(Optional.of(superAdminUser));
+        LocalDate attendanceDate = fixedNow.toLocalDate();
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(superAdminId, attendanceDate)).thenReturn(Optional.empty());
+
+        // Check-in (9:00) already happened; the requested check-out (19:00) hasn't — proves the
+        // two sides are validated independently, not as one all-or-nothing pair.
+        CreateRegularizationRequest req = request(attendanceDate, attendanceDate.atTime(9, 0), fixedNow.plusHours(1), "Still clocked in");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, superAdminEmail));
+        assertEquals("Corrected check-out time cannot be later than the current time", ex.getMessage());
+        verify(regularizationRepository, never()).save(any());
+    }
+
+    /** Shared 22:00-07:00 overnight shift setup for the two tests below — same shape as
+     * submit_correctedCheckIn_postMidnightWithinAnOvernightShiftsWorkday_isAccepted above. */
+    private void stubOvernightShift2200to0700() {
+        lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(
+                ShiftVersion.builder().startTime(LocalTime.of(22, 0)).endTime(LocalTime.of(7, 0)).lateGraceMinutes(10).build());
+    }
+
+    @Test
+    void submit_futureGuard_overnightCheckoutAlreadyPast_isAccepted() throws Exception {
+        stubOvernightShift2200to0700();
+        LocalDate attendanceDate = LocalDate.of(2026, 6, 15);
+        // "Now" is well after the overnight session's own end — the whole corrected interval,
+        // check-in through the post-midnight checkout, already genuinely happened.
+        useClock(fixedClockAt(attendanceDate.plusDays(1).atTime(10, 0)));
+        when(userRepository.findByEmail(superAdminEmail)).thenReturn(Optional.of(superAdminUser));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(superAdminId, attendanceDate)).thenReturn(Optional.empty());
+
+        // Frontend convention: both submitted on the same attendanceDate; check-out's earlier
+        // clock time triggers the existing same-day rollover onto the next calendar day.
+        CreateRegularizationRequest req = request(attendanceDate, attendanceDate.atTime(22, 0), attendanceDate.atTime(5, 0), "Overnight shift");
+        req.setManagerUserId(hrId);
+
+        RegularizationResponse resp = regularizationService.submit(req, superAdminEmail);
+
+        assertEquals("PENDING", resp.getStatus());
+        assertEquals(attendanceDate.atTime(22, 0), resp.getRequestedCheckIn());
+        assertEquals(attendanceDate.plusDays(1).atTime(5, 0), resp.getRequestedCheckOut());
+    }
+
+    @Test
+    void submit_futureGuard_overnightCheckoutNotYetHappened_isRejected() throws Exception {
+        stubOvernightShift2200to0700();
+        LocalDate attendanceDate = LocalDate.of(2026, 6, 15);
+        // "Now" is 2 AM the next day: the 22:00 check-in already happened, but the claimed 5 AM
+        // checkout is still three hours away — must be rejected even though the check-in side,
+        // checked independently, is perfectly valid on its own.
+        useClock(fixedClockAt(attendanceDate.plusDays(1).atTime(2, 0)));
+        when(userRepository.findByEmail(superAdminEmail)).thenReturn(Optional.of(superAdminUser));
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(superAdminId, attendanceDate)).thenReturn(Optional.empty());
+
+        CreateRegularizationRequest req = request(attendanceDate, attendanceDate.atTime(22, 0), attendanceDate.atTime(5, 0), "Overnight shift");
+        req.setManagerUserId(hrId);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> regularizationService.submit(req, superAdminEmail));
+        assertEquals("Corrected check-out time cannot be later than the current time", ex.getMessage());
         verify(regularizationRepository, never()).save(any());
     }
 
@@ -1403,7 +1759,7 @@ class RegularizationServiceTest {
         when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser));
         when(historyRepository.findByEmployeeUserIdAndEffectiveToIsNull(employeeId))
                 .thenReturn(Optional.of(EmployeeManagerHistory.builder().employeeUserId(employeeId).managerUserId(managerId).build()));
-        Employee employeeRecord = Employee.builder().userId(employeeId).fullName("Alex Employee").user(employeeUser).build();
+        Employee employeeRecord = Employee.builder().userId(employeeId).fullName("Alex Employee").user(employeeUser).shift(defaultShift).build();
         when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employeeRecord));
 
         LocalDate today = LocalDate.now();

@@ -36,7 +36,7 @@ import { useAuthStore } from '../store/authStore';
 import { useToast } from '../context/ToastContext';
 import { toShellRole } from '../lib/nav.config';
 import { TimeFormatProvider, useTimeFormat } from '../context/TimeFormatContext';
-import { minutesSinceMidnight, shiftMarkerPositions, segmentBarPosition, breakMarkerPosition } from '../utils/shiftMarkers';
+import { minutesSinceMidnight, shiftMarkerPositions, segmentBarPosition, breakMarkerPosition, resolveWorkdayWindow, punchCalendarDateIfDiffers } from '../utils/shiftMarkers';
 
 // ─── Formatting helpers ───────────────────────────────────────────────────────
 // Server timestamps are wall-clock strings in the business timezone (no offset), so they are
@@ -493,8 +493,8 @@ function PunchHistoryList({ date, token, refreshKey }: { date: string; token: st
         <Clock size={10.5} /> Punch History
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <PunchSourceGroup label="Check-In / Check-Out" sessions={officeSessions} />
-        <PunchSourceGroup label="Web Check-In / Check-Out" sessions={webSessions} />
+        <PunchSourceGroup label="Check-In / Check-Out" sessions={officeSessions} workDate={date} />
+        <PunchSourceGroup label="Web Check-In / Check-Out" sessions={webSessions} workDate={date} />
       </div>
     </div>
   );
@@ -2708,12 +2708,13 @@ function BreakTimelineMarker({ breakStart, breakEnd, leftPct, widthPct }: {
 
 /**
  * One scheduled-shift-boundary marker (start or end) — a small, subtle triangle sitting on top of
- * the same 24-hour track the actual-attendance bar is drawn on (see AttendanceTimeline), so an
- * employee can compare "when I was scheduled" against "when I actually showed up" at a glance.
+ * the same workday-window track the actual-attendance bar is drawn on (see AttendanceTimeline), so
+ * an employee can compare "when I was scheduled" against "when I actually showed up" at a glance.
  * Purely an overlay: it never redraws, resizes, or replaces the actual-attendance TimelineBar
- * itself. `leftPct` comes from shiftMarkerPositions, the exact same 0-1440-minute basis TimelineBar
- * itself is positioned on, so the two always line up correctly. Hover shows a small "Shift start/
- * end HH:MM" tooltip, mirroring TimelineBar's own tooltip mechanics.
+ * itself. `leftPct` comes from shiftMarkerPositions, the exact same workday-window basis
+ * TimelineBar itself is positioned on (workdayStartAt -> workdayEndAt, never 00:00-24:00 — see
+ * shiftMarkers.ts), so the two always line up correctly. Hover shows a small "Shift start/end
+ * HH:MM" tooltip, mirroring TimelineBar's own tooltip mechanics.
  */
 function ShiftBoundaryMarker({ label, leftPct }: { label: string; leftPct: number }) {
   const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
@@ -2814,18 +2815,32 @@ function AttendanceTimeline({ info, punches, punchesLoading }: {
       ? punches.map((p) => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt }))
       : [{ key: info.iso, checkInAt: record.checkInAt, checkOutAt: record.checkOutAt }];
 
+  // The track's own coordinate system: workdayStartAt -> workdayEndAt (per ShiftDayPolicy, via
+  // AttendanceResponse.workdayStartAt/workdayEndAt) — NEVER a fixed 00:00-24:00 calendar day, so
+  // a post-midnight punch still lands to the right of the shift-start marker instead of wrapping
+  // back to the track's own left edge. See shiftMarkers.ts's own header comment.
+  const workdayWindow = resolveWorkdayWindow(record.workDate, record.workdayStartAt, record.workdayEndAt);
+  const trackHours = Math.ceil(workdayWindow.totalMinutes / 60);
+
   // Scheduled shift start/end markers — null for a legacy record predating the shift snapshot
   // (see AttendanceResponse.shiftStartAt's own doc comment), in which case none are drawn.
-  const markers = shiftMarkerPositions(record.shiftStartAt, record.shiftEndAt);
+  const markers = shiftMarkerPositions(record.shiftStartAt, record.shiftEndAt, workdayWindow);
 
   return (
     <div style={{ position: 'relative', height: ATTENDANCE_VISUAL_HEIGHT, width: '100%' }}>
+      {/* No workday-boundary tooltip here by design — the workday window is already represented
+          visually by the track's own extent/background and the shift-boundary markers below;
+          a separate "Workday HH:MM – HH:MM" hover on top of that was confusing and carried no
+          attendance information of its own, so it's intentionally not reinstated (see the
+          Attendance UI correction spec's "Remove confusing workday hover" requirement). Hover
+          behavior for actual attendance (TimelineBar) and breaks (BreakTimelineMarker) is
+          untouched. */}
       <div style={{ position: 'absolute', left: 0, right: 0, top: 5, height: 4, background: 'var(--raised2)', borderRadius: 2 }} />
-      {Array.from({ length: 25 }).map((_, i) => (
-        <div key={i} style={{ position: 'absolute', left: `${(i / 24) * 100}%`, top: 2, width: 1, height: 10, background: 'var(--line2)', opacity: i % 6 === 0 ? 0.8 : 0.35 }} />
+      {Array.from({ length: trackHours + 1 }).map((_, i) => (
+        <div key={i} style={{ position: 'absolute', left: `${Math.min(100, (i * 60 / workdayWindow.totalMinutes) * 100)}%`, top: 2, width: 1, height: 10, background: 'var(--line2)', opacity: i % 6 === 0 ? 0.8 : 0.35 }} />
       ))}
       {segments.map((seg, i) => {
-        const position = segmentBarPosition(seg.checkInAt, seg.checkOutAt);
+        const position = segmentBarPosition(seg.checkInAt, seg.checkOutAt, workdayWindow);
         if (!position) return null;
         return (
           <TimelineBar key={seg.key ?? i} leftPct={position.leftPct} widthPct={position.widthPct} checkInAt={seg.checkInAt} checkOutAt={seg.checkOutAt} />
@@ -2838,7 +2853,7 @@ function AttendanceTimeline({ info, punches, punchesLoading }: {
       {segments.slice(0, -1).map((seg, i) => {
         const next = segments[i + 1];
         if (!seg.checkOutAt || !next?.checkInAt) return null;
-        const position = breakMarkerPosition(seg.checkOutAt, next.checkInAt);
+        const position = breakMarkerPosition(seg.checkOutAt, next.checkInAt, workdayWindow);
         if (!position) return null;
         return (
           <BreakTimelineMarker
@@ -2901,31 +2916,51 @@ function DayShiftAndActions({ info, config, onRegularize, onApplyPartialDay }: {
   );
 }
 
+/** " (9 Sep)" appended to a punch's formatted time when its own calendar date differs from the
+ * attendance row's own {@code workDate} — see {@link punchCalendarDateIfDiffers}'s own doc
+ * comment for why (a legitimate post-midnight punch must stay visually distinct from a same-day
+ * one at the same clock time). Empty string when they match, so a same-day punch renders exactly
+ * as it always has. Reuses the existing {@link formatShortDay} formatter (already used elsewhere
+ * on this page for a compact day label) rather than introducing another one. */
+function punchDateSuffix(iso: string, workDate: string): string {
+  const differing = punchCalendarDateIfDiffers(iso, workDate);
+  return differing ? ` (${formatShortDay(differing)})` : '';
+}
+
 /** One source's block of sessions within DayPunchIntervals — mirrors Keka's per-source grouping
- * (its own company-name section for normal punches, a separate "Web Clock In" section). */
-function PunchSourceGroup({ label, sessions }: {
+ * (its own company-name section for normal punches, a separate "Web Clock In" section).
+ * `workDate` is the attendance row's own authoritative workDate (never re-derived here — see
+ * {@link punchDateSuffix}) so a session whose check-in/check-out lands on a different calendar
+ * date (a post-midnight continuation of this same logical workday) renders with a date qualifier
+ * instead of being indistinguishable from a same-day punch. */
+function PunchSourceGroup({ label, sessions, workDate }: {
   label: string;
   sessions: { key: string; checkInAt: string; checkOutAt: string | null }[];
+  workDate: string;
 }) {
   const { formatTime } = useTimeFormat();
   if (sessions.length === 0) return null;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
       <div style={{ fontSize: 9.5, fontWeight: 700, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em' }}>{label}</div>
-      {sessions.map((s, i) => (
-        <div key={s.key ?? i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11.5 }}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--ok)', fontWeight: 600 }}>
-            <ArrowDownLeft size={12} /> {formatTime(s.checkInAt) ?? dash}
-          </span>
-          {s.checkOutAt ? (
-            <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--txt)', fontWeight: 600 }}>
-              <ArrowUpRight size={12} /> {formatTime(s.checkOutAt)}
+      {sessions.map((s, i) => {
+        const inTime = formatTime(s.checkInAt);
+        const outTime = s.checkOutAt ? formatTime(s.checkOutAt) : null;
+        return (
+          <div key={s.key ?? i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11.5 }}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--ok)', fontWeight: 600 }}>
+              <ArrowDownLeft size={12} /> {inTime ? `${inTime}${punchDateSuffix(s.checkInAt, workDate)}` : dash}
             </span>
-          ) : (
-            <span style={{ fontSize: 10, fontWeight: 700, color: '#E4373D', letterSpacing: '.04em' }}>MISSING</span>
-          )}
-        </div>
-      ))}
+            {s.checkOutAt ? (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--txt)', fontWeight: 600 }}>
+                <ArrowUpRight size={12} /> {outTime ? `${outTime}${punchDateSuffix(s.checkOutAt, workDate)}` : outTime}
+              </span>
+            ) : (
+              <span style={{ fontSize: 10, fontWeight: 700, color: '#E4373D', letterSpacing: '.04em' }}>MISSING</span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -2939,6 +2974,11 @@ function PunchSourceGroup({ label, sessions }: {
  */
 function DayPunchIntervals({ info, punches }: { info: DayInfo; punches: Punch[] | undefined }) {
   const record = info.record;
+  // The authoritative workDate every session's date qualifier is compared against (see
+  // PunchSourceGroup/punchDateSuffix) — record.workDate when a record exists (always equal to
+  // info.iso, since recordByDate is itself keyed by workDate), else info.iso as a same-value
+  // fallback for the (structurally unreachable once sessions is non-empty) no-record case.
+  const workDate = record?.workDate ?? info.iso;
   const sessions: { key: string; checkInAt: string; checkOutAt: string | null; source: Punch['source'] }[] =
     punches && punches.length > 0
       ? punches.map((p) => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt, source: p.source }))
@@ -2959,8 +2999,8 @@ function DayPunchIntervals({ info, punches }: { info: DayInfo; punches: Punch[] 
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 260 }}>
-      <PunchSourceGroup label="Check-In / Check-Out" sessions={officeSessions} />
-      <PunchSourceGroup label="Web Check-In / Check-Out" sessions={webSessions} />
+      <PunchSourceGroup label="Check-In / Check-Out" sessions={officeSessions} workDate={workDate} />
+      <PunchSourceGroup label="Web Check-In / Check-Out" sessions={webSessions} workDate={workDate} />
     </div>
   );
 }

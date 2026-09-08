@@ -212,6 +212,79 @@ class ShiftDayPolicyTest {
                 policy.maximumAttendanceBoundary(employee, day));
     }
 
+    // ── workdayStartAt/workdayEndAt: the Attendance timeline's own coordinate system ─────────
+
+    /**
+     * The exact worked example from the Attendance UI correction spec: a 10:00-19:00 shift with
+     * an 18h maximum workday duration must produce workday start 04:00 / workday end 04:00 the
+     * next day — i.e. the timeline's track spans 04:00->10:00->19:00->04:00(+1), never
+     * 00:00->24:00.
+     */
+    @Test
+    void workdayStartAndEnd_10to19Shift_18hMax_matchesTheSpecWorkedExample() {
+        Employee employee = withShift(LocalTime.of(10, 0), LocalTime.of(19, 0));
+
+        assertEquals(LocalDateTime.of(day, LocalTime.of(4, 0)), policy.workdayStartAt(employee, day));
+        assertEquals(LocalDateTime.of(day.plusDays(1), LocalTime.of(4, 0)), policy.workdayEndAt(employee, day));
+    }
+
+    /**
+     * For a shift whose timing doesn't change day-to-day, one day's workdayEndAt and the next
+     * day's workdayStartAt must be the exact same instant — the timeline for consecutive days
+     * tiles with no gap or overlap, exactly like ShiftDayPolicy's own shiftDayOf attribution
+     * (whose Rule 2 this pairing is derived from) guarantees no punch falls into neither day.
+     */
+    @Test
+    void workdayStartAt_equalsThePreviousDaysOwnWorkdayEnd_forAStableShift() {
+        Employee employee = withShift(LocalTime.of(10, 0), LocalTime.of(19, 0));
+        assertEquals(policy.workdayEndAt(employee, day), policy.workdayStartAt(employee, day.plusDays(1)));
+    }
+
+    /** Overnight shifts: workday window must be derived the same way — never hard-coded to 04:00/any fixed clock time. */
+    @Test
+    void workdayStartAndEnd_overnightShifts_matchEveryWorkedExample() {
+        Employee shift1530to0030 = withShift(LocalTime.of(15, 30), LocalTime.of(0, 30));
+        assertEquals(LocalDateTime.of(day, LocalTime.of(9, 30)), policy.workdayStartAt(shift1530to0030, day));
+        assertEquals(LocalDateTime.of(day.plusDays(1), LocalTime.of(9, 30)), policy.workdayEndAt(shift1530to0030, day));
+
+        Employee shift1930to0430 = withShift(LocalTime.of(19, 30), LocalTime.of(4, 30));
+        assertEquals(LocalDateTime.of(day, LocalTime.of(13, 30)), policy.workdayStartAt(shift1930to0430, day));
+        assertEquals(LocalDateTime.of(day.plusDays(1), LocalTime.of(13, 30)), policy.workdayEndAt(shift1930to0430, day));
+
+        Employee shift2200to0700 = withShift(LocalTime.of(22, 0), LocalTime.of(7, 0));
+        assertEquals(LocalDateTime.of(day, LocalTime.of(16, 0)), policy.workdayStartAt(shift2200to0700, day));
+        assertEquals(LocalDateTime.of(day.plusDays(1), LocalTime.of(16, 0)), policy.workdayEndAt(shift2200to0700, day));
+    }
+
+    /**
+     * workdayEndAt must be exactly the instant shiftDayOf itself rolls a timestamp onto the next
+     * logical workday — one minute before it is still the original workday, the instant itself
+     * (and everything after) already belongs to the new one. This is the same 04:00 boundary the
+     * spec's "12:21 AM / 3:43 AM still belong to the original workday, 4:00 AM onward is a new
+     * one" example describes.
+     */
+    @Test
+    void workdayEndAt_isExactlyWhereShiftDayOfRollsOverToTheNextWorkday() {
+        Employee employee = withShift(LocalTime.of(10, 0), LocalTime.of(19, 0));
+        LocalDateTime boundary = policy.workdayEndAt(employee, day);
+        LocalDate nextDay = day.plusDays(1);
+
+        assertEquals(day, policy.shiftDayOf(employee, boundary.minusMinutes(1)),
+                "3:59 AM still belongs to the original workday");
+        assertEquals(nextDay, policy.shiftDayOf(employee, boundary),
+                "4:00 AM onward already belongs to the new workday");
+    }
+
+    @Test
+    void workdayStartAt_noShiftEmployee_throws() {
+        assertThrows(IllegalStateException.class, () -> policy.workdayStartAt(null, day));
+    }
+
+    @Test
+    void workdayEndAt_noShiftEmployee_throws() {
+        assertThrows(IllegalStateException.class, () -> policy.workdayEndAt(null, day));
+    }
+
     /**
      * There is no generic fixed-clock-time fallback anymore — a null-shift employee reaching
      * shiftDayOf/maximumAttendanceBoundary is now an anomaly (every employee is expected to have

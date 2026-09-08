@@ -26,6 +26,7 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -114,6 +115,12 @@ public class RegularizationService {
     private final AttendanceInterpretationService attendanceInterpretationService;
     // Persisted, Admin-editable HALF_DAY threshold (Workstream B) — see its own Javadoc.
     private final AttendanceRulesService attendanceRulesService;
+    // The same test-controllable production Clock AuthService already uses (see TimeConfig/
+    // MutableClock) — real wall-clock time in production, freezable in tests. Backs ONLY the
+    // future-timestamp guard in resolveTimes() below; every other date/time computation in this
+    // class (REGULARIZATION_DAY_BOUNDARY/resolveBusinessDate, reviewedAt/approvedAt/
+    // finalApprovedAt, ...) is untouched and still reads the real system clock directly.
+    private final Clock clock;
 
     /** Resolved requested times after applying punch auto-fill from attendance history. */
     private record ResolvedTimes(LocalDateTime checkIn, LocalDateTime checkOut) {}
@@ -343,24 +350,77 @@ public class RegularizationService {
             checkOut = checkOut.plusDays(1);
         }
 
-        // Regularization's own 07:00 AM business-day boundary (REGULARIZATION_DAY_BOUNDARY /
-        // resolveBusinessDate — same rule already used for "today" in the lookback-window and
-        // monthly-limit checks) applies here too: a punch between midnight and 07:00 belongs to
-        // the PREVIOUS business date even though its own calendar date is the next day. Checked
-        // against the (possibly rolled-over) resolved value above, not the raw request field, so
-        // an overnight check-out — e.g. rolled over to 18-Aug 00:30 — is correctly attributed to
-        // 17-Aug's attendanceDate instead of being rejected for "not falling on" it.
-        if (req.getRequestedCheckIn() != null && !resolveBusinessDate(checkIn).equals(req.getAttendanceDate())) {
-            throw new IllegalArgumentException("Corrected check-in time must fall on the attendance date");
-        }
-        if (req.getRequestedCheckOut() != null && !resolveBusinessDate(checkOut).equals(req.getAttendanceDate())) {
-            throw new IllegalArgumentException("Corrected check-out time must fall on the attendance date");
+        // Validate each EXPLICITLY-requested correction against this attendance's actual
+        // shift-aware WORKDAY window (see ShiftDayPolicy#shiftDayOf), never a bare "same calendar
+        // date" or fixed-clock-time comparison. A 10:00-19:00 shift with an 18h maximum workday
+        // duration spans workday 04:00 -> 04:00 the NEXT calendar day, so a corrected punch at
+        // 12:21 AM or 3:30 AM the next calendar day can still legitimately belong to this
+        // attendanceDate's workday. Checked against the (possibly rolled-over) resolved value
+        // above, not the raw request field, so an overnight check-out — e.g. rolled over to
+        // 18-Aug 00:30 — is correctly validated against 17-Aug's own workday, not rejected for
+        // merely landing on a different calendar date. Resolved against existingPunch's own
+        // snapshotted shift when one already exists for this date (never the employee's current
+        // shift — see AttendanceInterpretationService#belongsToWorkday), or the employee's
+        // current shift for a brand-new correction with no prior punch to preserve context from.
+        if (req.getRequestedCheckIn() != null || req.getRequestedCheckOut() != null) {
+            Employee employee = employeeRepository.findById(employeeId).orElse(null);
+            if (req.getRequestedCheckIn() != null
+                    && !attendanceInterpretationService.belongsToWorkday(employee, existingPunch, req.getAttendanceDate(), checkIn)) {
+                throw new IllegalArgumentException(
+                        workdayValidationMessage("check-in", employee, existingPunch, req.getAttendanceDate()));
+            }
+            if (req.getRequestedCheckOut() != null
+                    && !attendanceInterpretationService.belongsToWorkday(employee, existingPunch, req.getAttendanceDate(), checkOut)) {
+                throw new IllegalArgumentException(
+                        workdayValidationMessage("check-out", employee, existingPunch, req.getAttendanceDate()));
+            }
+
+            // A corrected check-in/check-out must describe something that has already happened —
+            // never later than the authoritative server clock, read in the SAME employee/business
+            // zone every real Check-In/Web Clock-In/Attendance row already resolves through (see
+            // AttendanceRulesService#resolveEmployeeZoneId; mirrors AttendanceService.resolveZone's
+            // own "employee's configured timezone is the only authoritative source" rule). This is
+            // deliberately independent of attendanceDate/REGULARIZATION_DAY_BOUNDARY/
+            // resolveBusinessDate above (that 07:00 boundary remains scoped purely to the lookback-
+            // window check, untouched here): a genuinely historical correction's own resolved
+            // instant is, by construction, already in the past relative to "now," so this can never
+            // reject one. Checked against the same (auto-filled + overnight-rolled-over) `checkIn`/
+            // `checkOut` values the workday check above just validated, and independently for each
+            // side, so an overnight correction whose check-in already happened but whose check-out
+            // (rolled onto tomorrow) has not is caught correctly rather than treated as one unit.
+            LocalDateTime now = LocalDateTime.ofInstant(clock.instant(), attendanceRulesService.resolveEmployeeZoneId(employee));
+            if (req.getRequestedCheckIn() != null && checkIn.isAfter(now)) {
+                throw new IllegalArgumentException("Corrected check-in time cannot be later than the current time");
+            }
+            if (req.getRequestedCheckOut() != null && checkOut.isAfter(now)) {
+                throw new IllegalArgumentException("Corrected check-out time cannot be later than the current time");
+            }
         }
 
         if (checkIn != null && checkOut != null && !checkOut.isAfter(checkIn)) {
             throw new IllegalArgumentException("Check-out time must be after check-in time");
         }
         return new ResolvedTimes(checkIn, checkOut);
+    }
+
+    /**
+     * "Corrected check-in/out time must fall within the attendance workday (X - Y)" — includes the
+     * actual resolved workday window (see {@link AttendanceInterpretationService#resolveWorkdayWindowFor})
+     * so a rejected correction tells the employee exactly what range would have been accepted,
+     * rather than a bare rejection. Falls back to a window-less message only in the (structurally
+     * unreachable here, since this is only ever called right after {@code belongsToWorkday}
+     * returned {@code false} — which itself requires a resolvable shift context) legacy-row case.
+     */
+    private String workdayValidationMessage(String field, Employee employee, Attendance existingRecordOrNull, LocalDate attendanceDate) {
+        AttendanceInterpretationService.WorkdayWindow window =
+                attendanceInterpretationService.resolveWorkdayWindowFor(employee, existingRecordOrNull, attendanceDate);
+        if (window == null) {
+            return "Corrected " + field + " time must fall within the attendance workday for "
+                    + attendanceDate.format(NOTIFICATION_DATE_FMT) + ".";
+        }
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("d MMM h:mm a");
+        return "Corrected " + field + " time must fall within the attendance workday ("
+                + window.start().format(fmt) + " - " + window.end().format(fmt) + ").";
     }
 
     /** Selected manager (validated as an eligible approver) else the employee's current manager. */

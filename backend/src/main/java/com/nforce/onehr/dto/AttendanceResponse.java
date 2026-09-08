@@ -42,4 +42,14 @@ public class AttendanceResponse {
     /** Scheduled shift end for this row's own workDate — see {@link #shiftStartAt}. Rolls to the
      * next calendar day for an overnight shift (end not after start). Null for a legacy row. */
     private LocalDateTime shiftEndAt;
+    /** Start of this row's logical WORKDAY (never calendar midnight) — see
+     * AttendanceInterpretationService#resolveScheduledWindow / ShiftDayPolicy#workdayStartAt. The
+     * Attendance timeline's track spans workdayStartAt..workdayEndAt, not 00:00-24:00, so a
+     * post-midnight punch still positions correctly relative to the shift it belongs to. Null for
+     * a legacy row predating the shiftId snapshot, same as shiftStartAt/shiftEndAt. */
+    private LocalDateTime workdayStartAt;
+    /** End of this row's logical WORKDAY — see {@link #workdayStartAt} /
+     * ShiftDayPolicy#workdayEndAt (the same instant as ShiftDayPolicy#maximumAttendanceBoundary
+     * for this workDate). Null for a legacy row. */
+    private LocalDateTime workdayEndAt;
 }
