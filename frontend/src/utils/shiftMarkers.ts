@@ -39,13 +39,16 @@ export function minutesSinceMidnight(iso: string): number | null {
  * immune-to-DST, immune-to-browser-timezone arithmetic base: every timestamp this module compares
  * is parsed the exact same way, so the differences between them come out correct regardless of
  * the viewer's own timezone (the actual guarantee `minutesSinceMidnight`'s own doc comment already
- * relies on `new Date()` NOT providing).
+ * relies on `new Date()` NOT providing). Seconds are captured (defaulting to 0 when absent) so
+ * callers needing exact elapsed time — see {@link secondsBetween} — aren't silently truncated to
+ * whole minutes; existing minute-granularity callers (marker positioning) are unaffected, since a
+ * fractional minute only makes their positioning more accurate, never wrong.
  */
 function parseWallClockMs(iso: string): number | null {
-  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso);
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(iso);
   if (!m) return null;
-  const [, y, mo, d, h, mi] = m;
-  return Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi));
+  const [, y, mo, d, h, mi, s] = m;
+  return Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), s ? Number(s) : 0);
 }
 
 /** Whole minutes from {@code fromIso} to {@code toIso} (negative if {@code toIso} is earlier). Null if either is unparseable. */
@@ -54,6 +57,19 @@ export function minutesBetween(fromIso: string, toIso: string): number | null {
   const to = parseWallClockMs(toIso);
   if (from == null || to == null) return null;
   return (to - from) / 60000;
+}
+
+/**
+ * Whole elapsed SECONDS from {@code fromIso} to {@code toIso} (negative if {@code toIso} is
+ * earlier), truncated toward zero — never rounded. Null if either is unparseable. The
+ * seconds-precision sibling of {@link minutesBetween}, for exact-duration display (e.g. "Late by
+ * 1m 37s") rather than marker positioning.
+ */
+export function secondsBetween(fromIso: string, toIso: string): number | null {
+  const from = parseWallClockMs(fromIso);
+  const to = parseWallClockMs(toIso);
+  if (from == null || to == null) return null;
+  return Math.trunc((to - from) / 1000);
 }
 
 /**

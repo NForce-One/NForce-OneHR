@@ -511,6 +511,78 @@ class AttendanceInterpretationServiceTest {
         assertFalse(generousInterpretation.getIsLate(), "30-minute grace forgives the same 10-minute delay");
     }
 
+    // ── lateByMinutes: whole elapsed minutes, never inclusive/rounded-up counting ─────────────
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_49MinutesLate_isNotRoundedUpTo50() {
+        // The exact regression this covers: shift starts 15:30, check-in at 16:19:00 is 49
+        // whole minutes late — must never be reported as 50.
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(16, 19, 0));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee, workDate, checkInAt);
+
+        assertEquals(49, interpretation.getLateByMinutes());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_59SecondsIntoTheSameMinute_staysAt49() {
+        // 4:19:59 has not yet completed the 50th minute of lateness — must still read 49, never
+        // rounded up because of the trailing seconds (whole ELAPSED minutes, not inclusive count).
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(16, 19, 59));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee, workDate, checkInAt);
+
+        assertEquals(49, interpretation.getLateByMinutes());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_exactly50MinutesLate_reads50() {
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(16, 20, 0));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee, workDate, checkInAt);
+
+        assertEquals(50, interpretation.getLateByMinutes());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_exactShiftStart_isZero() {
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(15, 30, 0));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee, workDate, checkInAt);
+
+        assertEquals(0, interpretation.getLateByMinutes());
+        assertFalse(interpretation.getIsLate());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_overnightShift_49MinutesPastMidnightRolloverStart() {
+        // Overnight shift starting 23:30 — check-in 00:19:59 the next calendar day (49 minutes
+        // and change past shift start) must still read 49, exercising the same seconds-truncation
+        // rule across a date rollover.
+        Shift overnight = shift("Overnight", LocalTime.of(23, 30), LocalTime.of(7, 30), LocalDate.MIN, true);
+        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(overnight).build();
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime shiftStartAt = LocalDateTime.of(workDate, LocalTime.of(23, 30, 0));
+        LocalDateTime checkInAt = shiftStartAt.plusMinutes(49).plusSeconds(59);
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee, workDate, checkInAt);
+
+        assertEquals(LocalDate.of(2026, 3, 11), checkInAt.toLocalDate(), "sanity check: check-in rolled onto the next calendar day");
+        assertEquals(49, interpretation.getLateByMinutes());
+    }
+
     @Test
     void interpretExistingRecordLateness_usesTheRecordsOwnSnapshottedShiftsGrace_afterReassignment() {
         // The direct grace-period analogue of the reassignment regression above: an employee

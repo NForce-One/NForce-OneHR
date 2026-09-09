@@ -124,7 +124,7 @@ public class AttendanceInterpretationService {
         LocalDateTime deadlineAt = shiftStartAt.plusMinutes(graceMinutes);
         boolean isLate = checkInAt.isAfter(deadlineAt);
         int lateByMinutes = checkInAt.isAfter(shiftStartAt)
-                ? (int) Math.ceil(Duration.between(shiftStartAt, checkInAt).getSeconds() / 60.0)
+                ? (int) Duration.between(shiftStartAt, checkInAt).toMinutes()
                 : 0;
         return AttendanceInterpretation.builder()
                 .outcome(InterpretationOutcome.RESOLVED)
