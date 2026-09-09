@@ -38,9 +38,5 @@ logs/
 
 # Local HRMS product screenshots
 docs/penalization-policy/
-docs/HR_FEATURE_IMPLEMENTATION_HISTORY.md
-.vercel
-.env*
-backend/.claude/
-backend/skills-lock.json
-frontend/test-results/
+docs/output/
+docs/penalization-policy-audit
