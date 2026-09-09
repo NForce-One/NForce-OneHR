@@ -228,10 +228,12 @@ public class AuthService {
 
         emailService.sendPasswordResetEmail(user.getEmail(), fullName, tempPassword, requestOrigin);
         auditService.log(user.getId(), "PASSWORD_RESET_VIA_FORGOT_FLOW", user.getId());
+        // No linkPath: the Password Reset notification intentionally has no "Open related
+        // page" action in the Notifications tab (ONEHR-351) — email delivery is unaffected.
         notificationService.send(user.getId(), "SECURITY",
                 "Password Reset",
                 "Your password was reset via the forgot-password flow. If you didn't request this, contact your HR admin immediately.",
-                "/change-password");
+                null);
 
         return ForgotPasswordResponse.builder()
                 .message("Password reset instructions have been sent to your email")

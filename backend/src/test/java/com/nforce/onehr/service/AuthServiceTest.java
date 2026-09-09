@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.*;
 
 /**
@@ -251,7 +252,10 @@ class AuthServiceTest {
         assertTrue(user.isMustChangePassword());
         verify(emailService).sendPasswordResetEmail(eq(EMAIL), eq(EMAIL), anyString(), eq("http://localhost:5180"));
         verify(auditService).log(user.getId(), "PASSWORD_RESET_VIA_FORGOT_FLOW", user.getId());
-        verify(notificationService).send(eq(user.getId()), eq("SECURITY"), anyString(), anyString(), anyString());
+        // linkPath is null so the Notifications tab renders no "Open related page" action
+        // for this Password Reset notification (ONEHR-351); the reset email itself is
+        // unaffected, as asserted above via sendPasswordResetEmail.
+        verify(notificationService).send(eq(user.getId()), eq("SECURITY"), anyString(), anyString(), isNull());
     }
 
     @Test

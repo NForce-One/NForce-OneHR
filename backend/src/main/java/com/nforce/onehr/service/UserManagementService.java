@@ -491,10 +491,12 @@ public class UserManagementService {
         String after = auditSnapshot.toJson(Map.of("mustChangePassword", true));
 
         auditService.log(actor.getId(), "PASSWORD_RESET", userId, before, after);
+        // No linkPath: the Password Reset notification intentionally has no "Open related
+        // page" action in the Notifications tab (ONEHR-351) — email delivery is unaffected.
         notificationService.send(target.getId(), "SECURITY",
                 "Password Reset by Administrator",
                 "An administrator has reset your password. Please log in with your temporary password and change it immediately.",
-                "/change-password");
+                null);
         return ResetPasswordResponse.builder()
                 .tempPassword(tempPassword)
                 .message("Password reset. User must change password on next login.")

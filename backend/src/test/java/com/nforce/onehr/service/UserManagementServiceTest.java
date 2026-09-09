@@ -29,6 +29,8 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.*;
 
 /**
@@ -346,6 +348,20 @@ class UserManagementServiceTest {
         assertEquals(4, targetUser.getTokenVersion());
         assertTrue(targetUser.isMustChangePassword());
         verify(userRepository).save(targetUser);
+    }
+
+    // ONEHR-351: the admin-triggered Password Reset notification must not carry a linkPath,
+    // so the Notifications tab renders no "Open related page" action for it. The reset email
+    // itself (EmailService) is untouched by this change.
+    @Test
+    void resetPassword_sendsNotificationWithNoRelatedPageLink() {
+        when(userRepository.findById(targetUserId)).thenReturn(Optional.of(targetUser));
+        when(passwordEncoder.encode(anyString())).thenReturn("temp-hash");
+
+        userManagementService.resetPassword(targetUserId, actorEmail);
+
+        verify(notificationService).send(eq(targetUserId), eq("SECURITY"),
+                eq("Password Reset by Administrator"), anyString(), isNull());
     }
 
     // Employee ID rework (ONEHR): createUser must go through the centralized
