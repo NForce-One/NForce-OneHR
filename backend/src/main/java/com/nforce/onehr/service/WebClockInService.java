@@ -7,8 +7,6 @@ import com.nforce.onehr.dto.attendance.WebClockInResponse;
 import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.entity.EmployeeManagerHistory;
-import com.nforce.onehr.entity.Location;
-import com.nforce.onehr.entity.Role;
 import com.nforce.onehr.entity.User;
 import com.nforce.onehr.entity.WebClockInRequest;
 import com.nforce.onehr.repository.AttendancePunchRepository;
@@ -20,16 +18,12 @@ import com.nforce.onehr.repository.WebClockInRequestRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
 import java.time.ZoneId;
-import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -41,19 +35,21 @@ import java.util.stream.Collectors;
 /**
  * Web Clock-In / Check-in: any employee working remotely can self-declare a check-in — it
  * upserts the day's {@link Attendance} row (source WEB_REMOTE) and starts counting worked time
- * immediately, the same instant it's submitted, with NO wait for HR review. That immediate
- * attendance effect is deliberately decoupled from the request's own approval lifecycle: the
- * FIRST request of a given employee's shift/workday starts {@code PENDING} and is routed to the
- * employee's manager (or HR/Super Admin) for a real approve/reject decision via
- * {@link #approve}/{@link #reject} — it does not self-approve. Every later Web Clock-In cycle
- * within the SAME shift/workday mirrors that first request's current outcome on submit (see
- * {@code submit}'s own comment) — whether it's still awaiting review (PENDING) or already
- * decided (APPROVED) — so it neither re-asks HR nor surfaces as a second, independently-
- * actionable pending request; the shift only ever gets one real review, and approve()/reject()
- * cascades that one decision to every sibling cycle at once (see their own comments). Check-out
- * and cancel need no approval either, and neither is gated by review status at all (PENDING,
- * APPROVED, or REJECTED) — whether HR has looked at the request yet is independent of the
- * employee actually finishing (or undoing) their own real session.
+ * immediately, the same instant it's submitted. There is no approval step at all — no
+ * PENDING/APPROVED/REJECTED review, no approve/reject decision, no Approval Center entry. In its
+ * place, the FIRST Web Clock-In of an employee's resolved work day requires a note/reason and
+ * sends the employee's Reporting Manager a purely informational notification (no action, no
+ * link into an approval queue) — every later Web Clock-In cycle within the SAME resolved work day
+ * needs no note and never re-notifies the manager (see {@code submit}'s own comment for how
+ * "first cycle of the day" is determined). Check-out and cancel need no note/approval either,
+ * and Check-out never notifies anyone.
+ *
+ * <p>An employee can Web Clock-In and Web Clock-Out any number of times within the same resolved
+ * work day — each cycle is its own row, and every one of them (open or closed) contributes to the
+ * day's punch history and combined worked-minutes total (see {@code collectPunches}/
+ * {@code recomputeCombinedWorkedMinutes} in {@link AttendanceService}). Only ONE Web session may
+ * be open (not yet checked out) at a time — see {@code submit}'s own open-session guard — that is
+ * a concurrency guard, not a once-per-day restriction.
  *
  * <p>Web Clock-In/Out is deliberately independent of normal Check-In/Check-Out: each is tracked
  * via its own open/closed state (this class's own WebClockInRequest.checkedOutAt vs.
@@ -71,14 +67,11 @@ import java.util.stream.Collectors;
 @Slf4j
 public class WebClockInService {
 
-    private static final Set<String> APPROVER_OVERRIDE_ROLES = Set.of("HR_ADMIN", "SUPER_ADMIN");
     private static final String STATUS_PRESENT = "PRESENT";
     private static final String STATUS_LATE = "LATE";
     private static final String STATUS_HALF_DAY = "HALF_DAY";
     // Mirrors AttendanceService.STATUS_MISSING_CHECKOUT — see checkOut's own doc comment.
     private static final String STATUS_MISSING_CHECKOUT = "MISSING_CHECKOUT";
-    private static final String STATUS_PENDING = "PENDING";
-    private static final String STATUS_APPROVED = "APPROVED";
     private static final String SOURCE_WEB_REMOTE = "WEB_REMOTE";
 
     private final WebClockInRequestRepository webClockInRepository;
@@ -124,8 +117,8 @@ public class WebClockInService {
         // past its own workday/grace window (a forgotten Web Clock-Out from days ago) is stale,
         // not really "still checked in" — auto-close it at its own natural shift end (mirrors
         // AttendanceService.checkIn's Missing-Check-Out staleness bypass, adapted here as an
-        // auto-close since WebClockInRequest's own `status` field is a review status, not an
-        // attendance-completion one) instead of letting it block Web Clock-In forever.
+        // auto-close since a Web session's own open/closed state is tracked purely on
+        // checkedOutAt) instead of letting it block Web Clock-In forever.
         Optional<WebClockInRequest> openWebSession = webClockInRepository.findFirstByEmployeeUserIdAndCheckedOutAtIsNullOrderByWorkDateDesc(actor.getId());
         if (openWebSession.isPresent()) {
             WebClockInRequest openReq = openWebSession.get();
@@ -164,57 +157,45 @@ public class WebClockInService {
                 employee, new AttendanceContext(actor.getId(), now, zone));
         LocalDate today = interpretation.getWorkDate();
 
-        // Once THIS employee's FIRST Web Clock-In of the shift/workday has a request in flight
-        // (PENDING) or already decided (APPROVED), every later Web Clock-In cycle the same
-        // shift/workday mirrors that same request's outcome and never re-notifies HR — only the
-        // very first request of a shift needs a real HR decision. Keyed on employee + workDate
-        // (the shift's own resolved workday, same key findOpenByEmployeeUserId/collectPunches
-        // already use for "same shift"), not on the button click itself, so this survives any
-        // number of Web Clock-In/Out cycles within the one shift/workday. A REJECTED first
-        // request does NOT count here — per the existing "Resubmit" flow (see
-        // AttendanceHeroBanner's WebClockInRow `legacy` handling), a rejected shift needs a
-        // genuinely fresh reason + review, not a silent auto-carry of a decision HR already
-        // turned down.
-        Optional<WebClockInRequest> firstReviewableThisShift = webClockInRepository
-                .findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(actor.getId(), today).stream()
-                .filter(r -> STATUS_PENDING.equals(r.getStatus()) || STATUS_APPROVED.equals(r.getStatus()))
-                .findFirst();
+        // Whether this is the employee's FIRST Web Clock-In cycle of the resolved work day —
+        // keyed on employee + workDate (the shift's own resolved workday, same key
+        // findOpenByEmployeeUserId/collectPunches already use for "same shift"), not on the
+        // button click itself, so this correctly recognizes any number of prior Web Clock-In/Out
+        // cycles within the one shift/workday, including ones that already crossed midnight on an
+        // overnight shift. Backs BOTH of this method's remaining rules below: the mandatory note
+        // on the first cycle, and the once-per-day manager notification.
+        boolean firstCycleToday = webClockInRepository
+                .findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(actor.getId(), today).isEmpty();
 
-        UUID approverId = resolveAssignedApprover(actor.getId());
+        String reason = req.getReason() != null ? req.getReason().trim() : null;
+        if (firstCycleToday && (reason == null || reason.isEmpty())) {
+            throw new IllegalArgumentException("A note is required for your first web clock-in of the day.");
+        }
+
         WebClockInRequest entity = WebClockInRequest.builder()
                 .employeeUserId(actor.getId())
-                .assignedApproverId(approverId)
                 .workDate(today)
                 .requestedCheckIn(now)
-                .reason(req.getReason().trim())
-                .status(firstReviewableThisShift.map(WebClockInRequest::getStatus).orElse(STATUS_PENDING))
+                .reason(reason)
                 .build();
-        // Mirrors the shift's first request exactly, whichever state it's in — this cycle needs
-        // no HR notification/decision of its own. If that first request is itself still PENDING,
-        // this row stays PENDING too but silently (no notification below), and approve()/reject()
-        // cascades its eventual decision to every sibling row for this employee+workDate — see
-        // those methods' own comments — so it never sits as an orphaned, separately-actionable
-        // duplicate in the approver's queue.
-        if (firstReviewableThisShift.isPresent() && STATUS_APPROVED.equals(firstReviewableThisShift.get().getStatus())) {
-            entity.setReviewedBy(firstReviewableThisShift.get().getReviewedBy());
-            entity.setReviewedAt(now);
-            entity.setReviewComment("Auto-approved — a prior Web Clock-In this shift was already approved.");
-        }
         entity = webClockInRepository.save(entity);
 
         // The attendance effect is immediate and real-time — the employee is checked in and
-        // worked time starts accruing the moment they submit, regardless of how long HR takes to
-        // review. See this class's own Javadoc for why these two things are deliberately
-        // decoupled.
+        // worked time starts accruing the moment they submit. See this class's own Javadoc.
         applyCheckInToAttendance(entity, zone.getId(), employee, interpretation);
 
         auditService.log(actor.getId(), "WEB_CLOCK_IN_CHECKED_IN", entity.getId());
 
-        if (approverId != null && firstReviewableThisShift.isEmpty()) {
-            notificationService.send(approverId, "WEB_CLOCK_IN_SUBMITTED",
-                    "Web Clock-In Request Submitted",
-                    employeeName(actor.getId()) + " has submitted a web clock-in request for " + today + ".",
-                    "/approvals?type=WEB_CLOCK_IN");
+        // Purely informational — no action needed, no link into an approval queue — and only
+        // ever sent once per employee per resolved work day (see firstCycleToday above).
+        if (firstCycleToday) {
+            UUID managerId = resolveAssignedApprover(actor.getId());
+            if (managerId != null) {
+                notificationService.send(managerId, "WEB_CLOCK_IN_NOTICE",
+                        "Web Clock-In",
+                        employeeName(actor.getId()) + " web clocked in for " + today + ".",
+                        "/my-team");
+            }
         }
         return toResponse(entity);
     }
@@ -256,132 +237,8 @@ public class WebClockInService {
     }
 
     /**
-     * Manager sees only requests assigned to them; HR/Super Admin see all pending requests.
-     * Deduplicated to at most one row per employee+workDate (the shift's earliest-submitted
-     * PENDING cycle) — later Web Clock-In cycles within the same shift mirror that first
-     * request's PENDING status (see submit()'s own comment) purely so checkOut/punch-history
-     * still has its own row per cycle; they must never surface as separate actionable items for
-     * the approver to review one-by-one.
-     */
-    @Transactional(readOnly = true)
-    public List<WebClockInResponse> listPendingForApprover(String actorEmail) {
-        User actor = requireActor(actorEmail);
-        List<WebClockInRequest> pending = webClockInRepository.findByStatus("PENDING");
-
-        if (!hasOverrideRole(actor)) {
-            pending = pending.stream().filter(r -> actor.getId().equals(r.getAssignedApproverId())).toList();
-        }
-        List<WebClockInRequest> deduped = pending.stream()
-                .collect(Collectors.groupingBy(r -> Map.entry(r.getEmployeeUserId(), r.getWorkDate())))
-                .values().stream()
-                .map(rows -> rows.stream().min(Comparator.comparing(WebClockInRequest::getRequestedCheckIn)).orElseThrow())
-                .toList();
-        return toResponses(deduped);
-    }
-
-    /**
-     * HR/manager approval of a Web Clock-In request. The attendance effect (the Attendance row,
-     * worked minutes, punch history) was ALREADY applied the moment the employee submitted — see
-     * {@link #submit}'s own doc comment — so this only ever updates the request's own review
-     * status; it must NOT re-touch the Attendance row. Re-applying it here would silently reopen
-     * a session the employee may have already checked out of (or resumed since), reintroducing
-     * exactly the double-counting bug fixed in checkOut's own "already closed elsewhere" guard.
-     *
-     * <p>Cascades to every OTHER still-PENDING request for this same employee+workDate — later
-     * Web Clock-In cycles within the same shift mirror the first request's PENDING status (see
-     * submit()'s own comment) purely so checkOut/punch-history still has its own row per cycle;
-     * approving the shift's one real decision must resolve all of them at once, not leave later
-     * cycles stuck PENDING forever just because HR happened to approve a different row's id.
-     */
-    @Transactional
-    public WebClockInResponse approve(UUID requestId, String comment, String actorEmail) {
-        User actor = requireActor(actorEmail);
-        WebClockInRequest req = requirePending(requestId);
-        assertCanReview(req, actor);
-
-        String before = auditSnapshot.toJson(Map.of("status", "PENDING"));
-        req.setStatus("APPROVED");
-        req.setReviewedBy(actor.getId());
-        req.setReviewedAt(LocalDateTime.now());
-        req.setReviewComment(comment);
-        webClockInRepository.save(req);
-        approveSiblingCycles(req, actor.getId(), comment);
-
-        String after = auditSnapshot.toJson(Map.of("status", "APPROVED", "reviewComment", comment != null ? comment : ""));
-        auditService.log(actor.getId(), "WEB_CLOCK_IN_APPROVED", req.getEmployeeUserId(), before, after);
-
-        notificationService.send(req.getEmployeeUserId(), "WEB_CLOCK_IN_APPROVED",
-                "Web Clock-In Approved",
-                "Your web clock-in for " + req.getWorkDate() + " has been approved by " + employeeName(actor.getId()) + ".",
-                "/my-requests?type=WEB_CLOCK_IN");
-        return toResponse(req);
-    }
-
-    /** Same cascade rationale as approve() — see its own doc comment. */
-    @Transactional
-    public WebClockInResponse reject(UUID requestId, String comment, String actorEmail) {
-        User actor = requireActor(actorEmail);
-        WebClockInRequest req = requirePending(requestId);
-        assertCanReview(req, actor);
-
-        String before = auditSnapshot.toJson(Map.of("status", "PENDING"));
-        req.setStatus("REJECTED");
-        req.setReviewedBy(actor.getId());
-        req.setReviewedAt(LocalDateTime.now());
-        req.setReviewComment(comment);
-        webClockInRepository.save(req);
-        rejectSiblingCycles(req, actor.getId(), comment);
-
-        String after = auditSnapshot.toJson(Map.of("status", "REJECTED", "reviewComment", comment != null ? comment : ""));
-        auditService.log(actor.getId(), "WEB_CLOCK_IN_REJECTED", req.getEmployeeUserId(), before, after);
-
-        notificationService.send(req.getEmployeeUserId(), "WEB_CLOCK_IN_REJECTED",
-                "Web Clock-In Rejected",
-                "Your web clock-in for " + req.getWorkDate() + " has been rejected by " + employeeName(actor.getId())
-                        + (comment != null && !comment.isBlank() ? ". Reason: " + comment.trim() : "."),
-                "/my-requests?type=WEB_CLOCK_IN");
-        return toResponse(req);
-    }
-
-    /**
-     * Every OTHER PENDING cycle for this same employee+workDate, approved alongside the one HR
-     * actually reviewed — see approve()'s own doc comment. Silently skipped if none exist (the
-     * normal case, going forward, since only the shift's first cycle is ever PENDING under the
-     * new submit() logic); only reachable for pre-existing duplicate rows or a rare race between
-     * two near-simultaneous submits.
-     */
-    private void approveSiblingCycles(WebClockInRequest approved, UUID reviewerId, String comment) {
-        webClockInRepository.findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(
-                        approved.getEmployeeUserId(), approved.getWorkDate())
-                .stream()
-                .filter(r -> !r.getId().equals(approved.getId()) && STATUS_PENDING.equals(r.getStatus()))
-                .forEach(sibling -> {
-                    sibling.setStatus(STATUS_APPROVED);
-                    sibling.setReviewedBy(reviewerId);
-                    sibling.setReviewedAt(LocalDateTime.now());
-                    sibling.setReviewComment(comment);
-                    webClockInRepository.save(sibling);
-                });
-    }
-
-    /** Every OTHER PENDING cycle for this same employee+workDate, rejected alongside this one. */
-    private void rejectSiblingCycles(WebClockInRequest rejected, UUID reviewerId, String comment) {
-        webClockInRepository.findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(
-                        rejected.getEmployeeUserId(), rejected.getWorkDate())
-                .stream()
-                .filter(r -> !r.getId().equals(rejected.getId()) && STATUS_PENDING.equals(r.getStatus()))
-                .forEach(sibling -> {
-                    sibling.setStatus("REJECTED");
-                    sibling.setReviewedBy(reviewerId);
-                    sibling.setReviewedAt(LocalDateTime.now());
-                    sibling.setReviewComment(comment);
-                    webClockInRepository.save(sibling);
-                });
-    }
-
-    /**
-     * No approval needed to check out — the employee closes out their own web clock-in day
-     * regardless of whether HR has reviewed it yet. Deliberately independent of the normal
+     * No approval needed to check out — the employee closes out their own web clock-in day. Never
+     * sends a notification (see this class's own Javadoc). Deliberately independent of the normal
      * Check-In/Check-Out session (see this class's own Javadoc): never reads or writes
      * Attendance.checkOutAt (that field belongs exclusively to the normal session now — see
      * AttendanceService.findOpenNormalAttendance) and never blocks on, or is blocked by, whatever
@@ -398,7 +255,7 @@ public class WebClockInService {
         requireEmployee(actor.getId());
         assertEligibleToPunch(actor);
 
-        // Looked up by "not yet checked out" regardless of review status, not by today's
+        // Looked up by "not yet checked out" regardless of calendar date, not by today's
         // work_date — a web clock-in from before midnight (shift crosses into the next day) can
         // still be open under yesterday's work_date once the calendar date rolls over. This is
         // this Web session's OWN open/closed signal — entirely independent of whether a normal
@@ -619,40 +476,11 @@ public class WebClockInService {
         return stored != null ? stored : zoneIdFor(employeeUserId);
     }
 
+    /** The employee's current manager, if any — resolved fresh on every call, never persisted. */
     private UUID resolveAssignedApprover(UUID employeeId) {
         return historyRepository.findByEmployeeUserIdAndEffectiveToIsNull(employeeId)
                 .map(EmployeeManagerHistory::getManagerUserId)
                 .orElse(null);
-    }
-
-    private WebClockInRequest requirePending(UUID requestId) {
-        WebClockInRequest req = webClockInRepository.findById(requestId)
-                .orElseThrow(() -> new IllegalArgumentException("Request not found"));
-        if (!"PENDING".equals(req.getStatus())) {
-            throw new IllegalArgumentException("Only pending requests can be reviewed");
-        }
-        return req;
-    }
-
-    private void assertCanReview(WebClockInRequest req, User actor) {
-        if (hasOverrideRole(actor)) return;
-        if (actor.getId().equals(req.getAssignedApproverId())) return;
-
-        boolean isManager = actor.getRoles().stream().anyMatch(r -> r.getCode().equals("MANAGER"));
-        if (isManager && isCurrentManagerOf(actor.getId(), req.getEmployeeUserId())) return;
-
-        throw new AccessDeniedException("You are not authorized to review this request");
-    }
-
-    private boolean hasOverrideRole(User actor) {
-        return actor.getRoles().stream().anyMatch(r -> APPROVER_OVERRIDE_ROLES.contains(r.getCode()));
-    }
-
-    private boolean isCurrentManagerOf(UUID managerCandidateId, UUID employeeUserId) {
-        return historyRepository.findByEmployeeUserIdAndEffectiveToIsNull(employeeUserId)
-                .map(EmployeeManagerHistory::getManagerUserId)
-                .map(managerCandidateId::equals)
-                .orElse(false);
     }
 
     private User requireActor(String email) {
@@ -694,50 +522,36 @@ public class WebClockInService {
     }
 
     /**
-     * Batch equivalent of {@link #toResponse} — listMine/listPendingForApprover funnel through
-     * here instead of mapping row-by-row. Previously each row cost up to 4 findById round trips
-     * (employee, email, reviewer, assignedApprover); this collects every distinct user id
-     * referenced across the whole batch and resolves them with one name-lookup query total,
-     * regardless of how many requests are being mapped. Output fields/values are unchanged.
+     * Batch equivalent of {@link #toResponse} — listMine funnels through here instead of mapping
+     * row-by-row. Collects every distinct employee id referenced across the whole batch and
+     * resolves them with one name-lookup query total, regardless of how many requests are being
+     * mapped.
      */
     private List<WebClockInResponse> toResponses(List<WebClockInRequest> requests) {
         if (requests.isEmpty()) {
             return List.of();
         }
 
-        Set<UUID> allUserIds = new LinkedHashSet<>();
+        Set<UUID> employeeIds = new LinkedHashSet<>();
         for (WebClockInRequest req : requests) {
-            allUserIds.add(req.getEmployeeUserId());
-            addIfNotNull(allUserIds, req.getReviewedBy());
-            addIfNotNull(allUserIds, req.getAssignedApproverId());
+            employeeIds.add(req.getEmployeeUserId());
         }
 
-        Map<UUID, String> nameById = employeeRepository.findNamesByUserIds(allUserIds).stream()
-                .collect(Collectors.toMap(row -> (UUID) row[0], row -> (String) row[1]));
-        Map<UUID, Employee> employeeById = employeeRepository.findAllByIdWithDepartment(allUserIds).stream()
+        Map<UUID, Employee> employeeById = employeeRepository.findAllByIdWithDepartment(employeeIds).stream()
                 .collect(Collectors.toMap(Employee::getUserId, e -> e));
-        Map<UUID, String> emailById = userRepository.findAllById(allUserIds).stream()
+        Map<UUID, String> emailById = userRepository.findAllById(employeeIds).stream()
                 .collect(Collectors.toMap(User::getId, User::getEmail));
 
-        return requests.stream().map(req -> toResponse(req, nameById, employeeById, emailById)).toList();
+        return requests.stream().map(req -> toResponse(req, employeeById, emailById)).toList();
     }
 
-    private static void addIfNotNull(Set<UUID> ids, UUID id) {
-        if (id != null) {
-            ids.add(id);
-        }
-    }
-
-    private WebClockInResponse toResponse(WebClockInRequest req, Map<UUID, String> nameById,
-                                           Map<UUID, Employee> employeeById, Map<UUID, String> emailById) {
+    private WebClockInResponse toResponse(WebClockInRequest req, Map<UUID, Employee> employeeById,
+                                           Map<UUID, String> emailById) {
         Employee employee = employeeById.get(req.getEmployeeUserId());
         String employeeName = employee != null ? employee.getFullName() : "Unknown";
         String departmentName = employee != null && employee.getDepartment() != null
                 ? employee.getDepartment().getName() : null;
         String employeeEmail = emailById.getOrDefault(req.getEmployeeUserId(), "");
-        String reviewerName = req.getReviewedBy() == null ? null : nameById.get(req.getReviewedBy());
-        String assignedApproverName = req.getAssignedApproverId() == null ? null
-                : nameById.get(req.getAssignedApproverId());
 
         return WebClockInResponse.builder()
                 .id(req.getId())
@@ -748,13 +562,7 @@ public class WebClockInService {
                 .workDate(req.getWorkDate())
                 .requestedCheckIn(req.getRequestedCheckIn())
                 .reason(req.getReason())
-                .status(req.getStatus())
-                .assignedApproverId(req.getAssignedApproverId())
-                .assignedApproverName(assignedApproverName)
                 .checkedOutAt(req.getCheckedOutAt())
-                .reviewedByName(reviewerName)
-                .reviewedAt(req.getReviewedAt())
-                .reviewComment(req.getReviewComment())
                 .createdAt(req.getCreatedAt())
                 .build();
     }

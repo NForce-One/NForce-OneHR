@@ -818,6 +818,101 @@ class AttendanceServiceTest {
         assertEquals("America/New_York", historical.getTimezone(), "a Location change must never rewrite an existing record's own locked-in zone");
     }
 
+    // ── My Team "Not in yet today" roster: location must never affect the check-in verdict ──
+    // (defect/353-357). getDayForMyTeam/getDayForPeers query a widened +/-1 business-zone-day
+    // window and resolveRosterRecord picks the right row out of it — see that method's own
+    // Javadoc for why an exact-day-only match used to misclassify a genuinely checked-in
+    // employee as "not in yet" whenever their Location's timezone crossed midnight at a
+    // different moment than the org's business zone.
+
+    @Test
+    void getDayForMyTeam_employeeCheckedInSameBusinessDay_excludedFromNotInYet() {
+        Employee employeeNoLocation = Employee.builder().userId(employeeId).employeeCode("E1").fullName("Test Employee")
+                .shift(defaultShift).user(User.builder().id(employeeId).active(true).build()).build();
+        UUID managerId = UUID.randomUUID();
+        String managerEmail = "manager@test.com";
+        Employee manager = Employee.builder().userId(managerId).employeeCode("M1").fullName("Manager")
+                .user(User.builder().id(managerId).active(true).build()).build();
+        when(employeeRepository.findByUser_Email(managerEmail)).thenReturn(Optional.of(manager));
+        when(managerHistoryRepository.findCurrentDirectReportIds(managerId)).thenReturn(List.of(employeeId));
+        when(employeeRepository.findAllById(List.of(employeeId))).thenReturn(List.of(employeeNoLocation));
+
+        LocalDate day = LocalDate.of(2026, 1, 15);
+        Attendance checkedIn = Attendance.builder().id(UUID.randomUUID()).employeeUserId(employeeId)
+                .workDate(day).checkInAt(day.atTime(9, 0)).timezone("Asia/Kolkata").status("PRESENT")
+                .shiftId(defaultShift.getId()).build();
+        when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(
+                List.of(employeeId), day.minusDays(1), day.plusDays(1)))
+                .thenReturn(List.of(checkedIn));
+
+        List<AttendanceResponse> roster = service.getDayForMyTeam(managerEmail, day);
+
+        assertEquals(1, roster.size());
+        assertNotNull(roster.get(0).getCheckInAt());
+        assertEquals(day, roster.get(0).getWorkDate());
+    }
+
+    @Test
+    void getDayForMyTeam_employeeCheckedInAtDifferentLocationTimezone_stillExcludedFromNotInYet() {
+        // Reference zone (standing in for the business day the roster is queried for -- passed
+        // explicitly below, so the org-default-timezone stub from setUp() is never consulted)
+        // and this employee's Location zone are deliberately chosen 26 hours apart (more than a
+        // full day), so their calendar dates are guaranteed to differ right now no matter when
+        // this test runs -- no Assumptions.assumeTrue skip needed (see this file's shiftEnd test
+        // above for the alternative this sidesteps).
+        Location location = Location.builder().name("Baker Island Office").timezone("Etc/GMT+12").build();
+        Employee employeeWithLocation = Employee.builder().userId(employeeId).employeeCode("E1").fullName("Test Employee")
+                .shift(defaultShift).location(location).user(User.builder().id(employeeId).active(true).build()).build();
+        UUID managerId = UUID.randomUUID();
+        String managerEmail = "manager@test.com";
+        Employee manager = Employee.builder().userId(managerId).employeeCode("M1").fullName("Manager")
+                .user(User.builder().id(managerId).active(true).build()).build();
+        when(employeeRepository.findByUser_Email(managerEmail)).thenReturn(Optional.of(manager));
+        when(managerHistoryRepository.findCurrentDirectReportIds(managerId)).thenReturn(List.of(employeeId));
+        when(employeeRepository.findAllById(List.of(employeeId))).thenReturn(List.of(employeeWithLocation));
+
+        LocalDate businessDay = LocalDate.now(ZoneId.of("Pacific/Kiritimati"));
+        LocalDate employeeOwnDay = LocalDate.now(ZoneId.of("Etc/GMT+12"));
+        assertNotEquals(businessDay, employeeOwnDay, "test setup requires the two zones' calendar dates to actually differ");
+
+        Attendance checkedIn = Attendance.builder().id(UUID.randomUUID()).employeeUserId(employeeId)
+                .workDate(employeeOwnDay).checkInAt(LocalDateTime.now().minusHours(1))
+                .timezone("Etc/GMT+12").status("PRESENT").shiftId(defaultShift.getId()).build();
+        when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(
+                List.of(employeeId), businessDay.minusDays(1), businessDay.plusDays(1)))
+                .thenReturn(List.of(checkedIn));
+
+        List<AttendanceResponse> roster = service.getDayForMyTeam(managerEmail, businessDay);
+
+        assertEquals(1, roster.size());
+        assertNotNull(roster.get(0).getCheckInAt(),
+                "an employee who already checked in must never show as 'not in yet' just because their Location's timezone differs from the business zone");
+    }
+
+    @Test
+    void getDayForMyTeam_noAttendanceRecordInWindow_stillShowsNotInYet() {
+        Employee employeeNoRecord = Employee.builder().userId(employeeId).employeeCode("E1").fullName("Test Employee")
+                .shift(defaultShift).user(User.builder().id(employeeId).active(true).build()).build();
+        UUID managerId = UUID.randomUUID();
+        String managerEmail = "manager@test.com";
+        Employee manager = Employee.builder().userId(managerId).employeeCode("M1").fullName("Manager")
+                .user(User.builder().id(managerId).active(true).build()).build();
+        when(employeeRepository.findByUser_Email(managerEmail)).thenReturn(Optional.of(manager));
+        when(managerHistoryRepository.findCurrentDirectReportIds(managerId)).thenReturn(List.of(employeeId));
+        when(employeeRepository.findAllById(List.of(employeeId))).thenReturn(List.of(employeeNoRecord));
+
+        LocalDate day = LocalDate.of(2026, 1, 15);
+        when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(
+                List.of(employeeId), day.minusDays(1), day.plusDays(1)))
+                .thenReturn(List.of());
+
+        List<AttendanceResponse> roster = service.getDayForMyTeam(managerEmail, day);
+
+        assertEquals(1, roster.size());
+        assertNull(roster.get(0).getCheckInAt());
+        assertEquals(day, roster.get(0).getWorkDate());
+    }
+
     // ── Phase 0.4 / Phase 1: concurrency race -> clean application response ──
 
     @Test
@@ -1199,7 +1294,7 @@ class AttendanceServiceTest {
                 .id(UUID.randomUUID()).employeeUserId(employeeId).workDate(workDate)
                 .requestedCheckIn(LocalDateTime.of(workDate, LocalTime.of(22, 7)))
                 .checkedOutAt(LocalDateTime.of(workDate, LocalTime.of(22, 8)))
-                .reason("test").status("PENDING").build();
+                .reason("test").build();
         when(webClockInRequestRepository.findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(employeeId, workDate))
                 .thenReturn(List.of(webCycle));
 

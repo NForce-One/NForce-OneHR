@@ -30,8 +30,8 @@ import java.util.UUID;
  * domain-record id (LeaveRequest/ExpenseClaim/Attendance) that must be looked up to find the
  * affected employee's own id. For every other tracked action ({@code EMPLOYEE_*}, {@code USER_*},
  * {@code PASSWORD_RESET}, {@code ASSET_*} approve/assign/reassign/return/fulfill,
- * {@code REGULARIZATION_APPROVED}/{@code REJECTED}, {@code WEB_CLOCK_IN_APPROVED}/{@code
- * REJECTED}), {@code target_id} already IS the affected employee's own id directly — those call
+ * {@code REGULARIZATION_APPROVED}/{@code REJECTED}), {@code target_id} already IS the affected
+ * employee's own id directly — those call
  * sites pass it straight through rather than a domain-record id (see AssetService: Asset/
  * AssetAssignment/AssetRequest use Long primary keys that can't fit AuditService.log's UUID
  * target slot, so those services pass the affected employee's UUID instead of a record id, the
@@ -105,9 +105,9 @@ public class AuditTargetResolver {
         }
         // EMPLOYEE_*, USER_*, PASSWORD_RESET, ASSET_* (approve/assign/reassign/return/fulfill —
         // ASSET_CREATED/ASSET_RETIRED correctly fall back to the actor's own id here too, since
-        // there's no distinct affected employee for those), REGULARIZATION_APPROVED/REJECTED, and
-        // WEB_CLOCK_IN_APPROVED/REJECTED: target_id already IS the affected employee's own id —
-        // no domain-record lookup needed or possible.
+        // there's no distinct affected employee for those), and REGULARIZATION_APPROVED/REJECTED:
+        // target_id already IS the affected employee's own id — no domain-record lookup needed or
+        // possible.
         return targetId;
     }
 

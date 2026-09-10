@@ -1194,7 +1194,6 @@ function ActionNeeded({ requests }: { requests: MyRequestItem[] }) {
   const REQ_LABEL: Record<string, string> = {
     LEAVE:         'Leave request',
     REGULARIZATION:'Regularization',
-    WEB_CLOCK_IN:  'Web clock-in',
     WFH:           'WFH request',
     PARTIAL_DAY:   'Partial day',
     OVERTIME:      'Overtime',
@@ -1272,7 +1271,6 @@ function RecentRequests({ requests }: { requests: MyRequestItem[] }) {
   const REQ_LABEL: Record<string, string> = {
     LEAVE:         'Leave',
     REGULARIZATION:'Regularization',
-    WEB_CLOCK_IN:  'Web Clock-In',
     WFH:           'WFH',
     PARTIAL_DAY:   'Partial Day',
     OVERTIME:      'Overtime',
@@ -1512,12 +1510,12 @@ const ROLE_LABELS: Record<string, string> = {
 };
 
 const APPROVAL_TYPE_COLORS: Record<string, string> = {
-  LEAVE: '#4E9EE8', REGULARIZATION: '#2FB67C', WEB_CLOCK_IN: '#E0A93B',
+  LEAVE: '#4E9EE8', REGULARIZATION: '#2FB67C',
   EXPENSE: '#8B5CF6', ASSET_REQUEST: '#F97316', WFH: '#EC4899',
   PARTIAL_DAY: '#14B8A6', OVERTIME: '#6366F1', HELP_CONTENT: '#6B7280',
 };
 const APPROVAL_TYPE_LABELS: Record<string, string> = {
-  LEAVE: 'Leave', REGULARIZATION: 'Regularization', WEB_CLOCK_IN: 'Web Clock-In',
+  LEAVE: 'Leave', REGULARIZATION: 'Regularization',
   EXPENSE: 'Expense', ASSET_REQUEST: 'Asset Request', WFH: 'WFH',
   PARTIAL_DAY: 'Partial Day', OVERTIME: 'Overtime', HELP_CONTENT: 'Document Review',
 };

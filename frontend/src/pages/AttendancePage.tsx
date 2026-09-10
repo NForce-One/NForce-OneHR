@@ -87,6 +87,17 @@ function todayIsoDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** The latest of any number of ISO timestamps (nulls/undefined ignored), or null if none are set
+ * — used to combine a normal session's own checkOutAt with any Web Clock-Out(s) the same work
+ * day, since Web Clock-Out never writes the shared Attendance record's own checkOutAt (see
+ * WebClockInService's own class Javadoc) and the displayed Check Out must reflect whichever of
+ * the two actually happened most recently, however many Normal/Web cycles occurred in between. */
+function latestIso(...candidates: (string | null | undefined)[]): string | null {
+  const valid = candidates.filter((v): v is string => !!v);
+  if (valid.length === 0) return null;
+  return valid.reduce((latest, cur) => (wallClockMs(cur) > wallClockMs(latest) ? cur : latest));
+}
+
 /**
  * The day's required effective minutes — the employee's assigned shift duration (wrapping past
  * midnight for overnight shifts). Same calc as ExceptionService.computeEffectiveHoursPercent on
@@ -488,13 +499,22 @@ function PunchHistoryList({ date, token, refreshKey }: { date: string; token: st
   if (punches === null) {
     return <div style={{ fontSize: 11, color: 'var(--txt-dim)' }}>Loading punch history…</div>;
   }
-  if (punches.length <= 1) return null; // a single session adds nothing beyond the bookends above
+  if (punches.length === 0) return null;
 
   // Oldest first, matching the Keka reference (earliest punch at top, latest at bottom) — the
   // API doesn't guarantee an order, so this is display-only, not a data change.
   const sortedPunches = [...punches].sort((a, b) => a.checkInAt.localeCompare(b.checkInAt));
-  const officeSessions = sortedPunches.filter(p => p.source !== 'WEB_REMOTE').map(p => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt }));
-  const webSessions = sortedPunches.filter(p => p.source === 'WEB_REMOTE').map(p => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt }));
+  const officeSessions = sortedPunches.filter(p => p.source !== 'WEB_REMOTE').map(p => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt, note: p.note }));
+  const webSessions = sortedPunches.filter(p => p.source === 'WEB_REMOTE').map(p => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt, note: p.note }));
+
+  // A single NORMAL session adds nothing beyond the Check In/Check Out bookends shown above this
+  // list — but that's only true for the normal session: Web Clock-Out deliberately never writes
+  // the shared Attendance record's own checkOutAt (see WebClockInService's own class Javadoc), so
+  // those bookends never reflect a Web session's check-out time at all, however many Web cycles
+  // there are. Suppressing this whole list whenever total punches <= 1 (the old check) therefore
+  // hid the ONLY place a lone Web Clock-In/Out cycle's check-out time is ever shown. Only skip
+  // when there's truly nothing beyond the bookends: at most one normal session AND no Web session.
+  if (officeSessions.length <= 1 && webSessions.length === 0) return null;
 
   return (
     <div>
@@ -2340,14 +2360,16 @@ function WebCheckInAction({ token, actionStyle, today, loading, onSubmitted }: {
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
-  // Most recent Web Clock-In of the day, regardless of status/checked-out — its reason is reused
-  // for every later cycle the same day/shift so the employee is only asked once. Mirrors
+  // Whether this employee has ANY Web Clock-In cycle on file today — a note is mandatory only
+  // for the very first cycle of the resolved work day (enforced server-side); every later cycle
+  // needs no note at all, so this click can skip the modal entirely. Mirrors
   // AttendanceHeroBanner's WebClockInRow.
-  const [reusableReason, setReusableReason] = useState<string | null>(null);
-  // The currently-open Web session (PENDING/APPROVED, not yet checked out), if any — not just a
-  // boolean: this button must offer Web Clock-Out once one is open (mirrors AttendanceHeroBanner's
+  const [isFirstCycleToday, setIsFirstCycleToday] = useState(true);
+  // The currently-open Web session (not yet checked out), if any — not just a boolean: this
+  // button must offer Web Clock-Out once one is open (mirrors AttendanceHeroBanner's
   // WebClockInRow, which already does this on the Dashboard — this Actions-panel button used to
-  // just sit disabled forever with no way to check out from here once open).
+  // just sit disabled forever with no way to check out from here once open). No approval/review
+  // status at all anymore (see WebClockInService's own class Javadoc).
   const [openWeb, setOpenWeb] = useState<WebClockInRecord | null>(null);
   // Synchronous re-entrancy guards — the `disabled`/`busy`/`checkingOut` state alone only blocks
   // a real click once React has committed the re-render, which isn't guaranteed before a second
@@ -2358,26 +2380,26 @@ function WebCheckInAction({ token, actionStyle, today, loading, onSubmitted }: {
 
   // Returns the fetch's own promise (not fire-and-forget) — submitReason/handleWebCheckOut below
   // await this before releasing their re-entrancy guard, so the button never re-enables while
-  // still showing stale openWeb/reusableReason state. A bare (unreturned) `.then(...)` call here
-  // would make `await refreshMine()` resolve immediately without actually waiting for it.
+  // still showing stale openWeb/isFirstCycleToday state. A bare (unreturned) `.then(...)` call
+  // here would make `await refreshMine()` resolve immediately without actually waiting for it.
   const refreshMine = useCallback(() => {
     // Filtered by the business/Location-zone work date (today.workDate) — never the browser's
     // own UTC calendar date, which can disagree with it near midnight or whenever the employee's
     // device zone differs from their assigned Location's zone.
     const businessTodayIso = today?.workDate;
-    if (!businessTodayIso) { setReusableReason(null); setOpenWeb(null); return Promise.resolve(); }
+    if (!businessTodayIso) { setIsFirstCycleToday(true); setOpenWeb(null); return Promise.resolve(); }
     return webClockInApi.mine(token).then((list: WebClockInRecord[]) => {
       const todays = list.filter(r => r.workDate === businessTodayIso);
-      setReusableReason(todays[0]?.reason ?? null);
-      setOpenWeb(todays.find(r => (r.status === 'APPROVED' || r.status === 'PENDING') && !r.checkedOutAt) ?? null);
-    }).catch(() => { setReusableReason(null); setOpenWeb(null); });
+      setIsFirstCycleToday(todays.length === 0);
+      setOpenWeb(todays.find(r => !r.checkedOutAt) ?? null);
+    }).catch(() => { setIsFirstCycleToday(true); setOpenWeb(null); });
   }, [token, today]);
 
   useEffect(() => { refreshMine(); }, [refreshMine]);
 
   const disabled = loading || !!openWeb;
 
-  async function submitReason(trimmed: string) {
+  async function submitReason(trimmed: string | undefined) {
     if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
@@ -2447,7 +2469,7 @@ function WebCheckInAction({ token, actionStyle, today, loading, onSubmitted }: {
   return (
     <>
       <button
-        onClick={() => (reusableReason ? submitReason(reusableReason) : setOpen(true))}
+        onClick={() => (isFirstCycleToday ? setOpen(true) : submitReason(undefined))}
         disabled={disabled || busy}
         style={{ ...actionStyle, opacity: (disabled || busy) ? 0.6 : 1, cursor: (disabled || busy) ? 'default' : 'pointer' }}
       >
@@ -2944,7 +2966,7 @@ function punchDateSuffix(iso: string, workDate: string): string {
  * instead of being indistinguishable from a same-day punch. */
 function PunchSourceGroup({ label, sessions, workDate }: {
   label: string;
-  sessions: { key: string; checkInAt: string; checkOutAt: string | null }[];
+  sessions: { key: string; checkInAt: string; checkOutAt: string | null; note?: string | null }[];
   workDate: string;
 }) {
   const { formatTime } = useTimeFormat();
@@ -2959,6 +2981,17 @@ function PunchSourceGroup({ label, sessions, workDate }: {
           <div key={s.key ?? i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11.5 }}>
             <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--ok)', fontWeight: 600 }}>
               <ArrowDownLeft size={12} /> {inTime ? `${inTime}${punchDateSuffix(s.checkInAt, workDate)}` : dash}
+              {s.note && (
+                <Tooltip content={s.note}>
+                  <button
+                    type="button"
+                    aria-label="Web clock-in note"
+                    style={{ display: 'inline-flex', background: 'none', border: 'none', padding: 0, margin: 0, cursor: 'pointer', color: 'var(--txt-dim)' }}
+                  >
+                    <Info size={12} />
+                  </button>
+                </Tooltip>
+              )}
             </span>
             {s.checkOutAt ? (
               <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--txt)', fontWeight: 600 }}>
@@ -2988,11 +3021,11 @@ function DayPunchIntervals({ info, punches }: { info: DayInfo; punches: Punch[] 
   // info.iso, since recordByDate is itself keyed by workDate), else info.iso as a same-value
   // fallback for the (structurally unreachable once sessions is non-empty) no-record case.
   const workDate = record?.workDate ?? info.iso;
-  const sessions: { key: string; checkInAt: string; checkOutAt: string | null; source: Punch['source'] }[] =
+  const sessions: { key: string; checkInAt: string; checkOutAt: string | null; source: Punch['source']; note: string | null }[] =
     punches && punches.length > 0
-      ? punches.map((p) => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt, source: p.source }))
+      ? punches.map((p) => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt, source: p.source, note: p.note }))
       : record?.checkInAt
-        ? [{ key: info.iso, checkInAt: record.checkInAt, checkOutAt: record.checkOutAt, source: record.source === 'WEB_REMOTE' ? 'WEB_REMOTE' : 'SYSTEM' }]
+        ? [{ key: info.iso, checkInAt: record.checkInAt, checkOutAt: record.checkOutAt, source: record.source === 'WEB_REMOTE' ? 'WEB_REMOTE' : 'SYSTEM', note: null }]
         : [];
 
   // Oldest first, matching the Keka reference (earliest punch at top, latest at bottom) — the
@@ -3020,14 +3053,33 @@ function DayPunchIntervals({ info, punches }: { info: DayInfo; punches: Punch[] 
  * DayPunchIntervals. Shared by the calendar's side panel AND the View-button modal below, so
  * both present exactly the same information.
  */
-function DayDetailsBody({ info, config, punches, onRegularize, onApplyPartialDay }: {
+function DayDetailsBody({ info, config, punches, workedMinutesToday, businessTodayIso, webSessions, onRegularize, onApplyPartialDay }: {
   info: DayInfo;
   config: AttendanceConfig | null;
   punches: Punch[] | undefined;
+  // Today's live-aware worked-minutes figure and the business/Location-zone "today" ISO it
+  // applies to — same two inputs computeRowMetrics already takes for the Attendance Log's
+  // "Effective Hours" column, so this modal's own figure is computed identically instead of
+  // reading info.record.workedMinutes directly (a second, independent source that only ever
+  // reflects the last *settled* total and can disagree with Effective Hours). Both are optional:
+  // this component only ever needs them for info.iso === businessTodayIso.
+  workedMinutesToday: number | null;
+  businessTodayIso: string | undefined;
+  // This day's Web Clock-In records (if any) — needed so Check Out can reflect the LATEST of the
+  // normal session's own checkOutAt and any Web Clock-Out(s) the same day, since Web Clock-Out
+  // never writes the shared record's own checkOutAt (see WebClockInService's own class Javadoc).
+  webSessions: WebClockInRecord[];
   onRegularize: () => void;
   onApplyPartialDay: () => void;
 }) {
   const { formatTime, formatDuration } = useTimeFormat();
+  const metrics = info.record ? computeRowMetrics(info, punches, workedMinutesToday, businessTodayIso) : null;
+  // Check In is always the day's original checkInAt (frozen across every resume regardless of
+  // source, see AttendanceService.checkIn's own doc comment) — never replaced by a later
+  // Check-In/Web Clock-In cycle. Check Out is the latest close from either source.
+  const checkOutDisplay = info.record
+    ? latestIso(info.record.checkOutAt, ...webSessions.map((r) => r.checkedOutAt))
+    : null;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 11 }}>
       <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--txt)' }}>{formatDay(info.iso)}</div>
@@ -3071,28 +3123,32 @@ function DayDetailsBody({ info, config, punches, onRegularize, onApplyPartialDay
               <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
                 <LogIn size={11} /> Check In
               </div>
-              {/* sessionStartedAt (not checkInAt) — checkInAt is the day's *original* check-in,
-                  deliberately frozen across a same-day resume, so on a day with more than one
-                  Check-In/Check-Out cycle it showed the first session's time here even though
-                  DayPunchIntervals below correctly lists every session including the latest.
-                  sessionStartedAt updates on every resume, matching the last punch. */}
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatTime(info.record.sessionStartedAt ?? info.record.checkInAt) ?? missingPunch}</div>
+              {/* The day's original checkInAt — locked for the entire resolved work day
+                  regardless of source, never replaced by a later Check-In/Web Clock-In cycle
+                  (see AttendanceService.checkIn's own doc comment). DayPunchIntervals below still
+                  lists every individual session, including the latest. */}
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatTime(info.record.checkInAt) ?? missingPunch}</div>
             </div>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
                 <LogOut size={11} /> Check Out
               </div>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatTime(info.record.checkOutAt) ?? missingPunch}</div>
+              {/* Latest of the normal session's own checkOutAt and any Web Clock-Out(s) this day
+                  — see checkOutDisplay's own comment above. */}
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatTime(checkOutDisplay) ?? missingPunch}</div>
             </div>
           </div>
           <div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
-              <Clock size={11} /> Hours
+              <Clock size={11} /> Worked Today
             </div>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatDuration(info.record.workedMinutes) ?? dash}</div>
+            {/* Same calculation as the Attendance Log's "Effective Hours" column (both go through
+                computeRowMetrics) — previously this read info.record.workedMinutes directly, a
+                static total that never reflects today's still-open session live. */}
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatDuration(metrics?.effectiveMinutes ?? null) ?? dash}</div>
           </div>
           <StatusPill status={info.record.status} />
-          <LateBadge minutes={info.record.lateByMinutes} checkInAt={info.record.checkInAt} shiftStartAt={info.record.shiftStartAt} graceMinutes={config?.lateGraceMinutes} workedMinutes={info.record.workedMinutes} config={config} />
+          <LateBadge minutes={info.record.lateByMinutes} checkInAt={info.record.checkInAt} shiftStartAt={info.record.shiftStartAt} graceMinutes={config?.lateGraceMinutes} workedMinutes={metrics?.effectiveMinutes ?? info.record.workedMinutes} config={config} />
           <DayShiftAndActions info={info} config={config} onRegularize={onRegularize} onApplyPartialDay={onApplyPartialDay} />
           <DayPunchIntervals info={info} punches={punches} />
         </>
@@ -3110,10 +3166,13 @@ function DayDetailsBody({ info, config, punches, onRegularize, onApplyPartialDay
  * on the calendar's side panel, which can be scrolled out of view) showing the exact same
  * DayDetailsBody: shift timing, Regularize, Apply Partial Day, and the full punch history.
  */
-function DayDetailsModal({ info, config, punches, onClose, onRegularize, onApplyPartialDay }: {
+function DayDetailsModal({ info, config, punches, workedMinutesToday, businessTodayIso, webSessions, onClose, onRegularize, onApplyPartialDay }: {
   info: DayInfo;
   config: AttendanceConfig | null;
   punches: Punch[] | undefined;
+  workedMinutesToday: number | null;
+  businessTodayIso: string | undefined;
+  webSessions: WebClockInRecord[];
   onClose: () => void;
   onRegularize: () => void;
   onApplyPartialDay: () => void;
@@ -3123,7 +3182,7 @@ function DayDetailsModal({ info, config, punches, onClose, onRegularize, onApply
       <div style={{ ...modalStyle, maxWidth: 420 }}>
         <ModalHeader title="Attendance Details" onClose={onClose} />
         <div style={{ padding: 24 }}>
-          <DayDetailsBody info={info} config={config} punches={punches} onRegularize={onRegularize} onApplyPartialDay={onApplyPartialDay} />
+          <DayDetailsBody info={info} config={config} punches={punches} workedMinutesToday={workedMinutesToday} businessTodayIso={businessTodayIso} webSessions={webSessions} onRegularize={onRegularize} onApplyPartialDay={onApplyPartialDay} />
         </div>
       </div>
     </div>
@@ -3527,6 +3586,17 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
   // DayPunchIntervals in the View/details side panel), fetched once per punched day and cached
   // across month switches via the existing per-date /attendance/punches/{date} endpoint.
   const [punchesByDate, setPunchesByDate] = useState<Map<string, Punch[]>>(new Map());
+
+  // This employee's full Web Clock-In history, refreshed alongside `today` — needed so the Check
+  // In/Check Out summary can combine Web Clock-In/Out with the normal session (Web Clock-Out
+  // never writes the shared Attendance record's own checkOutAt, see WebClockInService's own class
+  // Javadoc). Deliberately separate from punchesByDate/Punch History's own fetch — this state is
+  // only ever read by the summary fields below, never by PunchHistoryList/DayPunchIntervals.
+  const [webRecords, setWebRecords] = useState<WebClockInRecord[]>([]);
+  const webForIso = useCallback(
+    (iso: string) => webRecords.filter((r) => r.workDate === iso),
+    [webRecords],
+  );
   useEffect(() => {
     const datesNeeded = logRows
       .filter((info) => info.record?.checkInAt && !punchesByDate.has(info.iso))
@@ -3570,12 +3640,16 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
         if (!cancelled) showToast('error', err instanceof Error ? err.message : 'Failed to load attendance');
       })
       .finally(() => { if (!cancelled) setLoading(false); });
+    webClockInApi.mine(token).then((list) => { if (!cancelled) setWebRecords(list); }).catch(() => {});
     return () => { cancelled = true; };
   }, [token, showToast]);
 
   // sessionStartedAt (not checkInAt) — the currently-open session's own start, so a resumed
-  // session after a break shows its own elapsed time instead of counting from the day's
-  // original check-in (which would wrongly include the break in "elapsed").
+  // session's live worked-time (workedMinutesToday below) counts from its own resume, not the
+  // day's original check-in (which would wrongly include the break). This is purely an input to
+  // that live calculation — it must never be read for a DISPLAYED "Check In" time; the day's
+  // original checkInAt (frozen across every resume, see AttendanceService.checkIn's own doc
+  // comment) is what "Check In" itself always shows, see the render below.
   const openSince = today?.canCheckOut ? today.record?.sessionStartedAt ?? today.record?.checkInAt ?? null : null;
 
   useEffect(() => {
@@ -3584,17 +3658,10 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
     return () => clearInterval(id);
   }, [openSince]);
 
-  const elapsed = useMemo(() => {
-    if (!openSince) return null;
-    void tick; // re-derive on each tick
-    const minutes = Math.floor(
-      (Date.now() + serverOffsetMs.current - wallClockMs(openSince)) / 60000,
-    );
-    return minutes >= 0 ? formatDuration(minutes) : null;
-  }, [openSince, tick]);
-
-  // Raw minutes-worked-so-far-today (same clock as `elapsed`), for the Today's Timings
-  // progress bar / break panel, which need a number rather than a formatted string.
+  // Raw minutes-worked-so-far-today, for the Today's Timings progress bar / break panel, the
+  // Attendance Log's "Effective Hours" column, and the Calendar's "Worked Today" figure — the
+  // ONE shared live-aware calculation all three read, rather than each computing (or a UI
+  // element separately re-deriving) its own "elapsed" figure that could drift from this one.
   const workedMinutesToday = useMemo(() => {
     if (openSince) {
       void tick;
@@ -3603,6 +3670,17 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
     }
     return today?.record?.workedMinutes ?? null;
   }, [openSince, tick, today]);
+
+  // Check In/Check Out summary for today: Check In is always the day's original checkInAt
+  // (frozen across every resume regardless of source, see AttendanceService.checkIn's own doc
+  // comment) — locked for the entire resolved work day, never the latest In. Check Out is the
+  // LATEST of the normal session's own checkOutAt and any Web Clock-Out(s) the same work day
+  // (Web Clock-Out never writes the shared record's own checkOutAt, see WebClockInService's own
+  // class Javadoc) — so it keeps updating to whichever source most recently closed a session.
+  const todayCheckOutDisplay = useMemo(() => {
+    if (!today) return null;
+    return latestIso(today.record?.checkOutAt, ...webForIso(today.workDate).map((r) => r.checkedOutAt));
+  }, [today, webForIso]);
 
   // Re-read /today so canCheckIn/canCheckOut always come from the server, never inferred — the
   // ONE shared refresh every check-in/check-out/web-check-in entry point calls afterward, so
@@ -3624,6 +3702,9 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
     attendanceApi.punches(refreshed.workDate, token)
       .then((p) => setPunchesByDate((prev) => new Map(prev).set(refreshed.workDate, p)))
       .catch(() => {});
+    // Same followup-refresh treatment for the Check In/Check Out summary's own Web Clock-In
+    // history — see webRecords' own comment.
+    webClockInApi.mine(token).then(setWebRecords).catch(() => {});
     return refreshed;
   }, [token, refreshMonth]);
 
@@ -3734,28 +3815,33 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
                         <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
                           <LogIn size={11} /> Check In
                         </div>
-                        {/* sessionStartedAt, falling back to the day's original checkInAt when
-                            there's been no resume yet — checkInAt alone would keep showing the
-                            first session's time after a later Check-In → Check-Out → Check-In
-                            again cycle, even though this same panel's Elapsed timer below
-                            already correctly tracks the latest session via sessionStartedAt. */}
+                        {/* The day's original checkInAt — locked for the entire resolved work
+                            day regardless of source (see AttendanceService.checkIn's own doc
+                            comment: never touched on a resume), so a later Check-In/Web Clock-In
+                            cycle never replaces what's shown here. */}
                         <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>
-                          {formatTime(today.record?.sessionStartedAt ?? today.record?.checkInAt ?? null) ?? dash}
+                          {formatTime(today.record?.checkInAt ?? null) ?? dash}
                         </div>
                       </div>
                       <div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
                           <LogOut size={11} /> Check Out
                         </div>
-                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatTime(today.record?.checkOutAt ?? null) ?? dash}</div>
+                        {/* Latest of the normal session's own checkOutAt and any Web Clock-Out(s)
+                            today — see todayCheckOutDisplay's own comment. */}
+                        <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatTime(todayCheckOutDisplay) ?? dash}</div>
                       </div>
                     </div>
                     <div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 3 }}>
-                        <Clock size={11} /> {today.canCheckOut ? 'Elapsed' : 'Worked Today'}
+                        <Clock size={11} /> Worked Today
                       </div>
+                      {/* Same underlying figure as the Attendance Log's "Effective Hours" column
+                          for today's row (both read workedMinutesToday) — previously this read
+                          today.record?.workedMinutes directly instead, a second, independent
+                          source that could disagree with Effective Hours rather than matching it. */}
                       <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>
-                        {(today.canCheckOut ? elapsed : formatDuration(today.record?.workedMinutes ?? null)) ?? dash}
+                        {formatDuration(workedMinutesToday) ?? dash}
                       </div>
                     </div>
                     {today.record?.status && <StatusPill status={today.record.status} />}
@@ -3796,6 +3882,9 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
                 info={selectedInfo}
                 config={config}
                 punches={punchesByDate.get(selectedInfo.iso)}
+                workedMinutesToday={workedMinutesToday}
+                businessTodayIso={today?.workDate}
+                webSessions={webForIso(selectedInfo.iso)}
                 onRegularize={() => setRegularizeDate(selectedInfo.iso)}
                 onApplyPartialDay={() => setPartialDayDate(selectedInfo.iso)}
               />
@@ -3924,6 +4013,9 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
             info={viewInfo}
             config={config}
             punches={punchesByDate.get(viewDetailsIso)}
+            workedMinutesToday={workedMinutesToday}
+            businessTodayIso={today?.workDate}
+            webSessions={webForIso(viewDetailsIso)}
             onClose={() => setViewDetailsIso(null)}
             onRegularize={() => { setViewDetailsIso(null); setRegularizeDate(viewDetailsIso); }}
             onApplyPartialDay={() => { setViewDetailsIso(null); setPartialDayDate(viewDetailsIso); }}

@@ -17,12 +17,6 @@ public class WebClockInResponse {
     private LocalDate workDate;
     private LocalDateTime requestedCheckIn;
     private String reason;
-    private String status;
-    private UUID assignedApproverId;
-    private String assignedApproverName;
     private LocalDateTime checkedOutAt;
-    private String reviewedByName;
-    private LocalDateTime reviewedAt;
-    private String reviewComment;
     private LocalDateTime createdAt;
 }

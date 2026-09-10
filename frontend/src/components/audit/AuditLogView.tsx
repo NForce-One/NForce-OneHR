@@ -27,7 +27,7 @@ function formatTimestampForExport(iso: string): string {
 // under a different key per module (see each service's `auditSnapshot.toJson(...)` call) — no
 // single field name is shared across all of them. Try every known key rather than pick one.
 // Gated on the action itself ending in "REJECTED" (not just "does this key happen to exist") —
-// WEB_CLOCK_IN_APPROVED's own snapshot also carries a "reviewComment" (an optional approval
+// REGULARIZATION_APPROVED's own snapshot also carries a "reviewComment" (an optional approval
 // note), which would otherwise leak into this column for an approved row.
 const REJECTION_REASON_KEYS = [
   'reviewComment', 'decisionReason', 'rejectionReason', 'managerRejectionReason', 'finalRejectionReason',

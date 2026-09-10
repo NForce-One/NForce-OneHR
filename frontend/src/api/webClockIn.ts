@@ -13,8 +13,6 @@ async function handle<T>(res: Response): Promise<T> {
   return body as T;
 }
 
-export type WebClockInStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
-
 export interface WebClockInRecord {
   id: string;
   employeeUserId: string;
@@ -23,14 +21,10 @@ export interface WebClockInRecord {
   departmentName: string | null;
   workDate: string;
   requestedCheckIn: string;
-  reason: string;
-  status: WebClockInStatus;
-  assignedApproverId: string | null;
-  assignedApproverName: string | null;
+  // Mandatory on the first Web Clock-In of a resolved work day, optional on every later cycle
+  // the same day — enforced server-side, not by this client. No approval attached to it at all.
+  reason: string | null;
   checkedOutAt: string | null;
-  reviewedByName: string | null;
-  reviewedAt: string | null;
-  reviewComment: string | null;
   createdAt: string;
 }
 
@@ -38,7 +32,7 @@ export const webClockInApi = {
   // timezone is the browser's own IANA zone (see attendance.ts's browserTimezone) — the server
   // still generates the actual timestamp itself, this only picks which zone it reads its clock
   // in, falling back to the employee's configured Location.timezone if omitted/invalid.
-  submit: (reason: string, token: string) =>
+  submit: (reason: string | undefined, token: string) =>
     fetch(BASE, {
       method: 'POST', headers: authHeaders(token), body: JSON.stringify({ reason, timezone: browserTimezone() }),
     }).then(r => handle<WebClockInRecord>(r)),
@@ -55,15 +49,4 @@ export const webClockInApi = {
   cancel: (token: string) =>
     fetch(`${BASE}/cancel`, { method: 'DELETE', headers: authHeaders(token) })
       .then(r => handle<void>(r)),
-
-  approve: (id: string, token: string, comment?: string) =>
-    fetch(`${BASE}/${id}/approve`, {
-      method: 'PATCH', headers: authHeaders(token),
-      body: JSON.stringify({ comment: comment || undefined }),
-    }).then(r => handle<WebClockInRecord>(r)),
-
-  reject: (id: string, comment: string, token: string) =>
-    fetch(`${BASE}/${id}/reject`, {
-      method: 'PATCH', headers: authHeaders(token), body: JSON.stringify({ comment }),
-    }).then(r => handle<WebClockInRecord>(r)),
 };
