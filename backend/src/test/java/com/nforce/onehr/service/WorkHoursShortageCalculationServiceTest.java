@@ -7,6 +7,7 @@ import com.nforce.onehr.entity.PenalizationPolicyVersion;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.repository.AttendanceRepository;
+import com.nforce.onehr.repository.ShiftRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -37,6 +38,7 @@ class WorkHoursShortageCalculationServiceTest {
     @Mock private AttendanceRepository attendanceRepository;
     @Mock private ExpectedWorkHoursService expectedWorkHoursService;
     @Mock private WorkingDayService workingDayService;
+    @Mock private ShiftRepository shiftRepository;
 
     private WorkHoursShortageCalculationService service;
 
@@ -61,14 +63,24 @@ class WorkHoursShortageCalculationServiceTest {
     private Shift shift(String name, LocalTime start, LocalTime end) {
         Shift s = Shift.builder().id(UUID.randomUUID()).name(name).build();
         shiftVersions.add(ShiftVersion.builder().shift(s).startTime(start).endTime(end).effectiveFrom(LocalDate.MIN).build());
+        allShifts.add(s);
         return s;
     }
 
+    private final List<Shift> allShifts = new java.util.ArrayList<>();
     private final Shift nineToSix = shift("Regular", LocalTime.of(9, 0), LocalTime.of(18, 0));
 
     @BeforeEach
     void setUp() {
-        service = new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
+        service = new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver, shiftRepository);
+        // shiftBoundedGrossMinutes now resolves the Shift from the Attendance record's own
+        // snapshotted shiftId (never the employee's current/live Shift) — see attendance()'s own
+        // comment on why every fixture that exercises shift-bounding sets it.
+        lenient().when(shiftRepository.findById(any())).thenAnswer(inv -> shiftById(inv.getArgument(0)));
+    }
+
+    private Optional<Shift> shiftById(UUID id) {
+        return allShifts.stream().filter(s -> s.getId().equals(id)).findFirst();
     }
 
     private Employee employeeWithShift(Shift shift) {
@@ -80,9 +92,21 @@ class WorkHoursShortageCalculationServiceTest {
                 .effectiveFrom(monday.minusMonths(1).atStartOfDay()).workHoursShortageEnabled(true);
     }
 
+    /** Snapshots {@code nineToSix} by default — every test using this helper puts its employee on that same shift; see the explicit-shift overload for the one test that needs a different (or no) snapshot. */
     private Attendance attendance(LocalDate date, LocalTime checkIn, LocalTime checkOut, int workedMinutes) {
+        return attendance(date, checkIn, checkOut, workedMinutes, nineToSix);
+    }
+
+    /**
+     * shiftBoundedGrossMinutes now resolves the Shift from THIS record's own snapshotted
+     * shiftId (never the employee's current/live Shift) — {@code shift} here must be null,
+     * exactly like a real legacy pre-{@code shiftId} row, only when the test deliberately means
+     * to exercise the "cannot be evaluated" fallback.
+     */
+    private Attendance attendance(LocalDate date, LocalTime checkIn, LocalTime checkOut, int workedMinutes, Shift shift) {
         return Attendance.builder().employeeUserId(employeeId).workDate(date)
-                .checkInAt(date.atTime(checkIn)).checkOutAt(date.atTime(checkOut)).workedMinutes(workedMinutes).build();
+                .checkInAt(date.atTime(checkIn)).checkOutAt(date.atTime(checkOut)).workedMinutes(workedMinutes)
+                .shiftId(shift != null ? shift.getId() : null).build();
     }
 
     // ── DAY frequency (default) ──
@@ -247,7 +271,8 @@ class WorkHoursShortageCalculationServiceTest {
         Employee employee = employeeWithShift(overnight);
         // Punched in at 21:00 (1h early) through 07:00 next day (1h late) — spans midnight.
         Attendance record = Attendance.builder().employeeUserId(employeeId).workDate(monday)
-                .checkInAt(monday.atTime(21, 0)).checkOutAt(monday.plusDays(1).atTime(7, 0)).workedMinutes(600).build();
+                .checkInAt(monday.atTime(21, 0)).checkOutAt(monday.plusDays(1).atTime(7, 0)).workedMinutes(600)
+                .shiftId(overnight.getId()).build();
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, monday)).thenReturn(Optional.of(record));
         when(expectedWorkHoursService.adjustedExpectedMinutes(employee, monday)).thenReturn(480L); // 22:00-06:00 = 8h
 
@@ -258,10 +283,38 @@ class WorkHoursShortageCalculationServiceTest {
         assertEquals(100.0, percent, 0.001);
     }
 
+    /**
+     * The historical-integrity invariant Attendance.shiftId's own snapshot exists to protect —
+     * one layer up from Shift Versioning: a later EMPLOYEE REASSIGNMENT (a different Shift
+     * entity entirely, not just a new timing version of the same one) must never retroactively
+     * change a shortage figure already computed for a past date. The record was snapshotted
+     * under nineToSix (09:00-18:00); the employee object handed to computeShortagePercent now
+     * carries a completely different current shift — proving the bounded figure still comes
+     * from the record's own snapshot, not employee.getShift().
+     */
+    @Test
+    void excludeOutsideShift_employeeReassignedSinceThisRecord_stillUsesTheRecordsOwnSnapshottedShift() {
+        Shift reassignedTo = shift("Night", LocalTime.of(22, 0), LocalTime.of(6, 0));
+        Employee employeeNow = employeeWithShift(reassignedTo);
+        // Snapshotted under nineToSix (09:00-18:00) — the shift actually in effect when this
+        // record was created, before the reassignment above.
+        Attendance record = attendance(monday, LocalTime.of(8, 0), LocalTime.of(19, 0), 600, nineToSix);
+        when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, monday)).thenReturn(Optional.of(record));
+        when(expectedWorkHoursService.adjustedExpectedMinutes(employeeNow, monday)).thenReturn(540L);
+
+        Double percent = service.computeShortagePercent(employeeNow, monday,
+                version().whsDeductionBasis("GROSS_HOURS").whsExcludeHoursOutsideShiftEnabled(true).build());
+
+        // Trimmed to nineToSix's own 09:00-18:00 = 540 min, not the new shift's 22:00-06:00
+        // window (which wouldn't even overlap this record's 08:00-19:00 punch at all).
+        assertEquals(540 * 100.0 / 540, percent, 0.001);
+    }
+
     @Test
     void excludeOutsideShift_noAssignedShift_fallsBackToUnboundedFigure() {
         Employee employee = employeeWithShift(null);
-        Attendance record = attendance(monday, LocalTime.of(8, 0), LocalTime.of(18, 0), 600);
+        // No shiftId snapshot either — a real legacy/no-shift row, not just a live-employee gap.
+        Attendance record = attendance(monday, LocalTime.of(8, 0), LocalTime.of(18, 0), 600, null);
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, monday)).thenReturn(Optional.of(record));
         when(expectedWorkHoursService.adjustedExpectedMinutes(employee, monday)).thenReturn(540L);
 

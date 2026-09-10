@@ -4,6 +4,7 @@ import com.nforce.onehr.dto.PunchResponse;
 import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.AttendancePunch;
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.entity.User;
@@ -81,15 +82,33 @@ class AttendancePunchHistoryWorkdayTest {
                         .maximumShiftDayDurationHours(BigDecimal.valueOf(18)).build()));
         ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
             @Override
-            public ShiftVersion resolve(Shift s, LocalDate workDate) {
+            public Optional<ShiftVersion> resolveIfPresent(Shift s, LocalDate workDate) {
                 return shiftVersions.stream()
                         .filter(v -> v.getShift().getId().equals(s.getId()))
                         .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
-                        .max(Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                        .max(Comparator.comparing(ShiftVersion::getEffectiveFrom));
+            }
+            @Override
+            public ShiftVersion resolve(Shift s, LocalDate workDate) {
+                return resolveIfPresent(s, workDate)
                         .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
             }
         };
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver = new EmployeeShiftAssignmentResolver(null) {
+            @Override
+            public Optional<EmployeeShiftAssignment> resolveIfPresent(UUID employeeUserId, LocalDate workDate) {
+                return employeeUserId.equals(employeeId) && shift != null
+                        ? Optional.of(EmployeeShiftAssignment.builder()
+                                .employeeUserId(employeeUserId).shift(shift).effectiveFrom(LocalDate.MIN).build())
+                        : Optional.empty();
+            }
+            @Override
+            public EmployeeShiftAssignment resolve(UUID employeeUserId, LocalDate workDate) {
+                return resolveIfPresent(employeeUserId, workDate)
+                        .orElseThrow(() -> new IllegalStateException("no assignment effective on or before " + workDate));
+            }
+        };
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver, employeeShiftAssignmentResolver);
         lenient().when(attendanceRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
                 com.nforce.onehr.entity.AttendanceRules.builder()
                         .halfDayMaxHours(BigDecimal.valueOf(3.5)).defaultTimezone("Asia/Kolkata").build()));
@@ -100,11 +119,11 @@ class AttendancePunchHistoryWorkdayTest {
                     .filter(s -> s.getId().equals(id)).findFirst();
         });
         AttendanceInterpretationService attendanceInterpretationService =
-                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository, employeeShiftAssignmentResolver);
         service = new AttendanceService(attendanceRepository, attendancePunchRepository, webClockInRequestRepository,
                 attendanceExceptionRepository, employeeRepository, managerHistoryRepository,
                 auditService, auditSnapshot, latePenaltyService, workingDayService, expectedWorkHoursService,
-                shiftDayPolicy, attendanceRulesService, attendanceInterpretationService);
+                shiftDayPolicy, attendanceRulesService, attendanceInterpretationService, employeeShiftAssignmentResolver);
 
         // The spec's own worked example: 10:00-19:00 shift, 18h max -> workday Sep 8 04:00 to
         // Sep 9 04:00.

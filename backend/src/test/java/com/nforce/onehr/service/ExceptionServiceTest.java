@@ -49,8 +49,8 @@ class ExceptionServiceTest {
     @Mock private AttendancePolicyEngine attendancePolicyEngine;
     @Mock private AttendancePenaltyRepository attendancePenaltyRepository;
     @Mock private AttendancePenaltyService attendancePenaltyService;
-    @Mock private ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
     @Mock private ShiftVersionResolver shiftVersionResolver;
+    @Mock private ShiftRepository shiftRepository;
 
     private ExceptionService exceptionService;
 
@@ -71,22 +71,21 @@ class ExceptionServiceTest {
     @BeforeEach
     void setUp() {
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
-        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
-                ShiftWeeklyOffRules.builder().maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, attendancePenaltyEvaluationService,
                 workingDayService, holidayRepository, penalizationPolicyResolutionService, expectedWorkHoursService,
                 workHoursShortageCalculationService, attendancePolicyEngine, attendancePenaltyRepository,
-                attendancePenaltyService, shiftDayPolicy, shiftVersionResolver);
+                attendancePenaltyService, shiftVersionResolver, shiftRepository);
         // Default: employeeId is the only account holding the EMPLOYEE role — matches
         // EmployeeService.listEmployees()'s own definition of who counts as an employee.
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeId));
-        // Default: the LATE_ARRIVAL path resolves each employee's shift-relative "expected"
-        // start time via shiftDayPolicy.resolveShiftStart(...) — stubWorkingDays() below gives
-        // that employee a real Shift, so this just needs to resolve to *some* ShiftVersion
-        // rather than throw. The exact start/end values don't matter to any assertion here.
+        // Default: the LATE_ARRIVAL/WORK_HOURS_SHORTAGE display paths resolve the record's own
+        // snapshotted shiftId (resolveSnapshotShift) — stubWorkingDays() below gives that
+        // employee a real Shift with the same id, so this just needs to resolve to *some*
+        // ShiftVersion rather than throw. The exact start/end values don't matter to any
+        // assertion here.
+        lenient().when(shiftRepository.findById(any())).thenAnswer(inv -> Optional.of(Shift.builder().id(inv.getArgument(0)).build()));
         lenient().when(shiftVersionResolver.resolve(any(), any()))
                 .thenReturn(ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build());
         lenient().when(leaveRequestRepository.findByEmployeeUserIdInAndStatusAndStartDateLessThanEqualAndEndDateGreaterThanEqual(

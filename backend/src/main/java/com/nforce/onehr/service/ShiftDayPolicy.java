@@ -1,6 +1,7 @@
 package com.nforce.onehr.service;
 
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.ShiftVersion;
 import lombok.RequiredArgsConstructor;
@@ -9,6 +10,8 @@ import org.springframework.stereotype.Component;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Single source of truth for "what shift-relative day/time does this instant belong to" —
@@ -78,6 +81,12 @@ import java.time.LocalTime;
  * extend to 09:30 today — because today's own (new-version) start (06:00) has already been
  * reached. Reversed (06:00-15:00 -> 15:30-00:30, fresh check-in today at 15:30) is unaffected
  * either way, since the OLD version's short same-day boundary never reached that far regardless.
+ * <li><b>Brand-new Shift case</b>: a Shift created (and assigned) TODAY has, by design, no version
+ * effective before today (see {@code OrgService#createShift} and the V159 migration backfill's own
+ * comment) — there is no "yesterday" for it to have an overnight tail under. A fresh check-in
+ * today before today's own start therefore never falls back to Rule 2's yesterday-boundary check
+ * (which would otherwise have nothing to resolve and incorrectly fail) — it simply resolves to
+ * TODAY, exactly as an ordinary early arrival would.
  * </ul>
  *
  * <h2>No-shift employees — there is no fallback, anywhere in this class</h2>
@@ -102,6 +111,11 @@ public class ShiftDayPolicy {
 
     private final ShiftWeeklyOffRulesService shiftWeeklyOffRulesService;
     private final ShiftVersionResolver shiftVersionResolver;
+    // Only for the day-aware shiftDayOf(UUID, ...)/workdayStartAt(UUID, ...) overloads below —
+    // every other method here keeps resolving strictly through shiftOf(Employee), untouched. See
+    // those overloads' own Javadoc for why a real employee's day-attribution needs this and a
+    // historical/pinned-snapshot resolution (the Employee-taking overloads) does not.
+    private final EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     /**
      * The employee's actually-assigned Shift start on {@code day}, per the version effective on
@@ -186,7 +200,39 @@ public class ShiftDayPolicy {
      * other method here.
      */
     public LocalDateTime workdayStartAt(Employee employee, LocalDate day) {
-        return maximumAttendanceBoundary(employee, day.minusDays(1));
+        requireShift(employee);
+        LocalDate previousDay = day.minusDays(1);
+        if (shiftVersionResolver.resolveIfPresent(shiftOf(employee), previousDay).isEmpty()) {
+            // The Shift did not exist yet as of the previous day (e.g. a brand-new Shift whose
+            // earliest version is effective `day` itself) — there is no earlier boundary to roll
+            // over from, so `day`'s own workday simply starts at its own shift start. See
+            // shiftDayOf's identical reasoning for its own Rule 2.
+            return shiftStartAt(employee, day);
+        }
+        return maximumAttendanceBoundary(employee, previousDay);
+    }
+
+    /**
+     * {@link #workdayStartAt(Employee, LocalDate)}'s day-aware counterpart for a REAL employee
+     * (never a historical/pinned-snapshot stand-in) — resolves the Shift Assignment governing
+     * {@code day.minusDays(1)} independently via {@link EmployeeShiftAssignmentResolver}, rather
+     * than trusting {@code Employee.shift} (a best-effort display cache, not authoritative — see
+     * that field's own Javadoc). See {@link #shiftDayOf(UUID, LocalDateTime)}'s Javadoc for why
+     * this distinct overload exists at all rather than a single method.
+     */
+    public LocalDateTime workdayStartAt(UUID employeeUserId, LocalDate day) {
+        LocalDate previousDay = day.minusDays(1);
+        Optional<EmployeeShiftAssignment> previousAssignment =
+                employeeShiftAssignmentResolver.resolveIfPresent(employeeUserId, previousDay);
+        if (previousAssignment.isEmpty()) {
+            // No assignment yet as of the previous day (e.g. a brand-new employee/assignment) —
+            // there is no earlier boundary to roll over from, so `day`'s own workday simply starts
+            // at its own shift start — mirrors the Employee-taking overload's identical reasoning.
+            Employee pinnedToday = pin(employeeUserId, employeeShiftAssignmentResolver.resolve(employeeUserId, day));
+            return shiftStartAt(pinnedToday, day);
+        }
+        Employee pinnedYesterday = pin(employeeUserId, previousAssignment.get());
+        return maximumAttendanceBoundary(pinnedYesterday, previousDay);
     }
 
     /**
@@ -223,9 +269,56 @@ public class ShiftDayPolicy {
             return candidate;
         }
 
-        // Rule 2: otherwise, is this still yesterday's overnight tail?
-        LocalDateTime previousDayBoundary = maximumAttendanceBoundary(employee, candidate.minusDays(1));
+        // Rule 2: otherwise, is this still yesterday's overnight tail? Only applicable if the Shift
+        // actually had a version covering yesterday — a brand-new Shift (effective as of TODAY)
+        // has no yesterday to roll over from, so an early punch can only ever belong to today (see
+        // workdayStartAt's identical reasoning, and ShiftVersionResolver#resolveIfPresent's own
+        // Javadoc for why this absence is expected, not the invariant resolve() guards against).
+        LocalDate previousDay = candidate.minusDays(1);
+        if (shiftVersionResolver.resolveIfPresent(shiftOf(employee), previousDay).isEmpty()) {
+            return candidate;
+        }
+        LocalDateTime previousDayBoundary = maximumAttendanceBoundary(employee, previousDay);
         return timestamp.isBefore(previousDayBoundary) ? candidate.minusDays(1) : candidate;
+    }
+
+    /**
+     * {@link #shiftDayOf(Employee, LocalDateTime)}'s day-aware counterpart for a REAL employee —
+     * used exclusively for a FRESH action with no prior Attendance context (a brand-new check-in,
+     * or a brand-new backdated regularization row). Rule 1 (today's own start) and Rule 2
+     * (yesterday's boundary) each resolve the Shift Assignment governing THEIR OWN specific
+     * calendar day independently via {@link EmployeeShiftAssignmentResolver} — never a single
+     * Shift resolved once and reused for both, since a reassignment can land exactly on the
+     * today/yesterday boundary this method examines (yesterday governed by Shift A, today by
+     * Shift B): resolving once for "today" and reusing it for Rule 2's yesterday-boundary check
+     * would compute that boundary from a Shift the employee wasn't even under yesterday, which can
+     * misattribute the day entirely — see the design discussion's own worked walkthrough.
+     *
+     * <p>{@code Employee.shift} (a best-effort display cache, never authoritative — see that
+     * field's own Javadoc) is deliberately never consulted here, by construction: this overload
+     * takes only the employee's id, not the entity. An ALREADY-EXISTING Attendance row's own
+     * historical interpretation never goes through this overload at all — see
+     * {@link #shiftDayOf(Employee, LocalDateTime)} and {@code AttendanceInterpretationService
+     * .resolveShiftContextOrNull}'s pinned-snapshot pattern, entirely untouched by this method.
+     */
+    public LocalDate shiftDayOf(UUID employeeUserId, LocalDateTime timestamp) {
+        LocalDate candidate = timestamp.toLocalDate();
+
+        Employee pinnedToday = pin(employeeUserId, employeeShiftAssignmentResolver.resolve(employeeUserId, candidate));
+        LocalDateTime todaysOwnStart = shiftStartAt(pinnedToday, candidate);
+        if (!timestamp.isBefore(todaysOwnStart)) {
+            return candidate;
+        }
+
+        LocalDate previousDay = candidate.minusDays(1);
+        Optional<EmployeeShiftAssignment> previousAssignment =
+                employeeShiftAssignmentResolver.resolveIfPresent(employeeUserId, previousDay);
+        if (previousAssignment.isEmpty()) {
+            return candidate;
+        }
+        Employee pinnedYesterday = pin(employeeUserId, previousAssignment.get());
+        LocalDateTime previousDayBoundary = maximumAttendanceBoundary(pinnedYesterday, previousDay);
+        return timestamp.isBefore(previousDayBoundary) ? previousDay : candidate;
     }
 
     private void requireShift(Employee employee) {
@@ -241,5 +334,18 @@ public class ShiftDayPolicy {
 
     private Shift shiftOf(Employee employee) {
         return employee != null ? employee.getShift() : null;
+    }
+
+    /**
+     * Builds a minimal stand-in {@link Employee} carrying ONLY the Shift a given assignment
+     * resolved to, for a specific day — this class's every other method reads nothing else off
+     * {@code Employee} (see the class Javadoc: {@code shiftOf(employee)} is its only touchpoint),
+     * so this safely re-uses the exact same Employee-taking overloads for the day-aware
+     * {@code UUID}-taking ones above, without duplicating any of their logic. Mirrors {@code
+     * AttendanceInterpretationService.resolveShiftContextOrNull}'s identical stand-in pattern for
+     * a historical row's own snapshot.
+     */
+    private Employee pin(UUID employeeUserId, EmployeeShiftAssignment assignment) {
+        return Employee.builder().userId(employeeUserId).shift(assignment.getShift()).build();
     }
 }

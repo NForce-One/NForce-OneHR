@@ -7,11 +7,13 @@ import com.nforce.onehr.dto.assignments.EmployeeAssignmentRow;
 import com.nforce.onehr.dto.assignments.ImportResultResponse;
 import com.nforce.onehr.dto.penalization.BulkAllocationRequest;
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.PenalisationPolicy;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.WeeklyOffPolicy;
 import com.nforce.onehr.repository.EmployeeManagerHistoryRepository;
 import com.nforce.onehr.repository.EmployeeRepository;
+import com.nforce.onehr.repository.EmployeeShiftAssignmentRepository;
 import com.nforce.onehr.repository.PenalisationPolicyRepository;
 import com.nforce.onehr.repository.ShiftRepository;
 import com.nforce.onehr.repository.WeeklyOffPolicyRepository;
@@ -58,6 +60,7 @@ public class EmployeeAssignmentService {
     private final PenalizationPolicyResolutionService penalizationPolicyResolutionService;
     private final AttendanceProperties attendanceProperties;
     private final ShiftVersionResolver shiftVersionResolver;
+    private final EmployeeShiftAssignmentRepository employeeShiftAssignmentRepository;
 
     @Transactional(readOnly = true)
     public List<EmployeeAssignmentRow> listTeamAssignments(String managerEmail, UUID shiftId, UUID weeklyOffPolicyId,
@@ -125,8 +128,19 @@ public class EmployeeAssignmentService {
                 .build();
     }
 
+    /**
+     * Future-effective Shift assignment (ONEHR-336 follow-up): writes a new
+     * {@link EmployeeShiftAssignment} row per employee rather than mutating {@code Employee.shift}
+     * directly — that field is now a best-effort display/roster cache only, never authoritative
+     * (see its own Javadoc); every attendance-relevant read resolves through
+     * {@link EmployeeShiftAssignmentResolver} instead. {@code effectiveFrom} is required and must
+     * be strictly after today — mirrors {@code OrgService#updateShift}'s identical rule for a
+     * Shift's own timing, for the same reason: the employee's current assignment must remain in
+     * effect through today exactly as it already was, and only a future date's Attendance may be
+     * governed by the new one.
+     */
     @Transactional
-    public AssignmentBulkResultResponse bulkUpdateShift(String managerEmail, List<UUID> employeeUserIds, UUID shiftId) {
+    public AssignmentBulkResultResponse bulkUpdateShift(String managerEmail, List<UUID> employeeUserIds, UUID shiftId, LocalDate effectiveFrom) {
         Shift shift = shiftRepository.findById(shiftId)
                 .orElseThrow(() -> new IllegalArgumentException("Shift not found"));
         // Always a fresh assignment (a manager choosing "put these reports on this shift"), never
@@ -135,7 +149,51 @@ public class EmployeeAssignmentService {
         // .createUser's identical unconditional Shift check.
         if (!shift.isActive())
             throw new IllegalArgumentException("This shift is inactive and cannot be assigned. Choose an active shift.");
-        return bulkApply(managerEmail, employeeUserIds, "SHIFT", shiftId, e -> e.setShift(shift));
+        LocalDate today = LocalDate.now();
+        if (effectiveFrom == null || !effectiveFrom.isAfter(today)) {
+            throw new IllegalArgumentException("Effective From is required and must be a future date (after today)");
+        }
+
+        Employee manager = resolveManager(managerEmail);
+        Set<UUID> reportIds = new HashSet<>(managerHistoryRepository.findCurrentDirectReportIds(manager.getUserId()));
+
+        List<UUID> succeeded = new ArrayList<>();
+        List<AssignmentBulkResultResponse.FailureDto> failed = new ArrayList<>();
+        for (UUID employeeUserId : employeeUserIds) {
+            try {
+                if (!reportIds.contains(employeeUserId)) {
+                    throw new AccessDeniedException("Not a current direct report");
+                }
+                if (!employeeRepository.existsById(employeeUserId)) {
+                    throw new IllegalArgumentException("Employee not found");
+                }
+                assignShift(employeeUserId, shift, effectiveFrom, manager.getUserId());
+                succeeded.add(employeeUserId);
+            } catch (Exception e) {
+                failed.add(AssignmentBulkResultResponse.FailureDto.builder()
+                        .employeeUserId(employeeUserId).reason(e.getMessage()).build());
+            }
+        }
+        auditService.log(manager.getUserId(), "EMPLOYEE_ASSIGNMENT_BULK_UPDATE_SHIFT", shiftId);
+        return AssignmentBulkResultResponse.builder().succeededIds(succeeded).failed(failed).build();
+    }
+
+    /**
+     * At most one PENDING (not-yet-effective) assignment per employee — editing again before the
+     * previously-scheduled change takes effect REPLACES it (delete then insert) rather than
+     * stacking a second one, mirroring {@code OrgService#updateShift}'s identical "at most one
+     * pending version" rule. Never touches any assignment whose {@code effectiveFrom <= today} —
+     * those remain exactly as they are, so no already-effective (let alone historical) Attendance
+     * is ever affected by this call.
+     */
+    private void assignShift(UUID employeeUserId, Shift shift, LocalDate effectiveFrom, UUID createdBy) {
+        employeeShiftAssignmentRepository.deleteByEmployeeUserIdAndEffectiveFromGreaterThan(employeeUserId, LocalDate.now());
+        employeeShiftAssignmentRepository.save(EmployeeShiftAssignment.builder()
+                .employeeUserId(employeeUserId)
+                .shift(shift)
+                .effectiveFrom(effectiveFrom)
+                .createdBy(createdBy)
+                .build());
     }
 
     @Transactional
@@ -213,20 +271,23 @@ public class EmployeeAssignmentService {
     }
 
     /**
-     * CSV schema: {@code employee_code,shift_name,weekly_off_policy_name} — chosen unilaterally
-     * since no format was defined with the PO (ONEHR-108 dev notes). A blank shift/weekly-off
-     * cell for a row leaves that field untouched rather than clearing it.
+     * CSV schema: {@code employee_code,shift_name,shift_effective_from,weekly_off_policy_name} —
+     * {@code shift_effective_from} added for the ONEHR-336 follow-up (future-effective Shift
+     * assignment, mirroring {@link #bulkUpdateShift}'s identical rule) — required and validated
+     * future-only whenever {@code shift_name} is non-blank; ignored otherwise. A blank shift/
+     * weekly-off cell for a row leaves that field untouched rather than clearing it.
      */
     @Transactional
     public ImportResultResponse importShiftsAndWeeklyOffs(String managerEmail, MultipartFile file) throws IOException {
         Employee manager = resolveManager(managerEmail);
         Set<UUID> reportIds = new HashSet<>(managerHistoryRepository.findCurrentDirectReportIds(manager.getUserId()));
+        LocalDate today = LocalDate.now();
 
         List<ImportResultResponse.RowResult> results = new ArrayList<>();
         int succeeded = 0;
 
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(file.getInputStream(), StandardCharsets.UTF_8))) {
-            reader.readLine(); // header: employee_code,shift_name,weekly_off_policy_name
+            reader.readLine(); // header: employee_code,shift_name,shift_effective_from,weekly_off_policy_name
             String line;
             int rowNum = 1;
             while ((line = reader.readLine()) != null) {
@@ -237,7 +298,8 @@ public class EmployeeAssignmentService {
                 String[] cols = line.split(",", -1);
                 String employeeCode = cols.length > 0 ? cols[0].trim() : "";
                 String shiftName = cols.length > 1 ? cols[1].trim() : "";
-                String weeklyOffName = cols.length > 2 ? cols[2].trim() : "";
+                String shiftEffectiveFromRaw = cols.length > 2 ? cols[2].trim() : "";
+                String weeklyOffName = cols.length > 3 ? cols[3].trim() : "";
 
                 try {
                     Employee employee = employeeRepository.findByEmployeeCode(employeeCode)
@@ -252,7 +314,16 @@ public class EmployeeAssignmentService {
                         // comment on why no "unchanged id" exception applies here either.
                         if (!shift.isActive())
                             throw new IllegalArgumentException("This shift is inactive and cannot be assigned. Choose an active shift.");
-                        employee.setShift(shift);
+                        LocalDate shiftEffectiveFrom;
+                        try {
+                            shiftEffectiveFrom = shiftEffectiveFromRaw.isBlank() ? null : LocalDate.parse(shiftEffectiveFromRaw);
+                        } catch (java.time.format.DateTimeParseException e) {
+                            throw new IllegalArgumentException("shift_effective_from must be a valid date (YYYY-MM-DD): " + shiftEffectiveFromRaw);
+                        }
+                        if (shiftEffectiveFrom == null || !shiftEffectiveFrom.isAfter(today)) {
+                            throw new IllegalArgumentException("shift_effective_from is required and must be a future date (after today) when shift_name is set");
+                        }
+                        assignShift(employee.getUserId(), shift, shiftEffectiveFrom, manager.getUserId());
                     }
                     if (!weeklyOffName.isBlank()) {
                         employee.setWeeklyOffPolicy(weeklyOffPolicyRepository.findByName(weeklyOffName)

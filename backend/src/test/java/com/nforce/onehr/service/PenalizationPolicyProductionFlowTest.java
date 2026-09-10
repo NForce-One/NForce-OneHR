@@ -59,8 +59,9 @@ class PenalizationPolicyProductionFlowTest {
     @Mock private NotificationService notificationService;
     @Mock private EmployeeService employeeService;
     @Mock private AttendancePenaltyService attendancePenaltyService;
-    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private ShiftRepository shiftRepository;
     @Mock private ShiftVersionResolver shiftVersionResolver;
+    @Mock private EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     private ExceptionService exceptionService;
 
@@ -85,19 +86,15 @@ class PenalizationPolicyProductionFlowTest {
         lenient().when(allocationRepository.findEffectiveAt(any(), any())).thenReturn(List.of());
         PenalizationPolicyResolutionService policyResolutionService =
                 new PenalizationPolicyResolutionService(versionRepository, allocationRepository, penalizationPolicyService, employeeRepository, attendanceProperties);
-        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
+        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver, employeeShiftAssignmentResolver);
         WorkHoursShortageCalculationService workHoursShortageCalculationService =
-                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
-        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
-                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
-                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver, shiftRepository);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, penaltyEvaluationService,
                 workingDayService, holidayRepository, policyResolutionService, expectedWorkHoursService,
                 workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService,
-                shiftDayPolicy, shiftVersionResolver);
+                shiftVersionResolver, shiftRepository);
 
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeId));
@@ -124,6 +121,19 @@ class PenalizationPolicyProductionFlowTest {
         // start/end values don't matter to any assertion in this class.
         lenient().when(shiftVersionResolver.resolve(any(), any()))
                 .thenReturn(ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build());
+        lenient().when(employeeShiftAssignmentResolver.resolve(eq(employeeId), any())).thenReturn(
+                EmployeeShiftAssignment.builder().employeeUserId(employeeId).shift(shift).effectiveFrom(LocalDate.MIN).build());
+        // ONEHR-336 follow-up: ShiftDayPolicy's own Rule 2 pre-check now calls resolveIfPresent
+        // (not resolve) directly — an unstubbed @Mock answers Optional.empty() regardless of the
+        // resolve() stub above, silently breaking any overnight-rollover check. Delegates to
+        // whatever resolve() is stubbed to return instead of duplicating it.
+        lenient().when(shiftVersionResolver.resolveIfPresent(any(), any())).thenAnswer(inv -> {
+            try {
+                return Optional.of(shiftVersionResolver.resolve(inv.getArgument(0), inv.getArgument(1)));
+            } catch (IllegalStateException e) {
+                return Optional.empty();
+            }
+        });
     }
 
     private User hrUser() {

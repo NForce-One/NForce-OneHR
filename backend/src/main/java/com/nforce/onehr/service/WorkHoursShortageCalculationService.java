@@ -7,6 +7,7 @@ import com.nforce.onehr.entity.LeaveRequest;
 import com.nforce.onehr.entity.PenalizationPolicyVersion;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.repository.AttendanceRepository;
+import com.nforce.onehr.repository.ShiftRepository;
 import com.nforce.onehr.util.WorkHoursCalculator;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -17,6 +18,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -49,6 +51,9 @@ public class WorkHoursShortageCalculationService {
     private final ExpectedWorkHoursService expectedWorkHoursService;
     private final WorkingDayService workingDayService;
     private final ShiftVersionResolver shiftVersionResolver;
+    // Only for shiftBoundedGrossMinutes' historical Attendance.shiftId lookup below — never for
+    // resolving an employee's current/live Shift.
+    private final ShiftRepository shiftRepository;
 
     /**
      * The Work Hours Shortage percent fact for {@code date}, honoring the version's configured
@@ -177,13 +182,16 @@ public class WorkHoursShortageCalculationService {
     }
 
     /**
-     * {@link #grossMinutes} clipped to the employee's assigned shift window for that work date —
-     * overnight-shift-aware (an end time earlier than the start rolls into the next calendar day),
-     * same convention as {@code AttendanceService#shiftEndCutoff}. Null when the employee has no
-     * assigned shift.
+     * {@link #grossMinutes} clipped to the shift window this record was ACTUALLY snapshotted
+     * under (its own {@code shiftId} — never the employee's current/live assignment, so a later
+     * reassignment can't retroactively change a historical shortage figure) — overnight-shift-aware
+     * (an end time earlier than the start rolls into the next calendar day), same convention as
+     * {@code AttendanceService#shiftEndCutoff}. Null when the record has no shift snapshot (a
+     * legacy pre-{@code shiftId} row — "cannot be evaluated," never guessed via the employee's
+     * current Shift).
      */
     private Long shiftBoundedGrossMinutes(Attendance record, Employee employee) {
-        Shift shift = employee.getShift();
+        Shift shift = resolveSnapshotShift(record).orElse(null);
         if (shift == null || record.getCheckInAt() == null || record.getCheckOutAt() == null) {
             return null;
         }
@@ -202,5 +210,25 @@ public class WorkHoursShortageCalculationService {
             return 0L;
         }
         return Duration.between(clippedStart, clippedEnd).toMinutes();
+    }
+
+    /**
+     * Resolves the Shift referenced by {@code record}'s own snapshotted {@code shiftId} — never
+     * the employee's current/live assignment. Empty for a legacy row with no snapshot (see
+     * {@code Attendance.shiftId}'s own Javadoc); callers must treat that as "cannot be bounded,"
+     * never fall back to the employee's current Shift. Mirrors {@code AttendanceInterpretationService
+     * .resolveShiftContextOrNull}'s identical reasoning/error message for the same class of
+     * "references a shift that no longer exists" data-corruption signal.
+     */
+    private Optional<Shift> resolveSnapshotShift(Attendance record) {
+        if (record.getShiftId() == null) {
+            return Optional.empty();
+        }
+        return Optional.of(shiftRepository.findById(record.getShiftId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "Attendance " + record.getId() + " references shift " + record.getShiftId()
+                                + " which no longer exists — Shift deletion should be blocked once any "
+                                + "Attendance references it (see OrgService#deleteShift); this indicates "
+                                + "data corruption, not a case to fall back from.")));
     }
 }

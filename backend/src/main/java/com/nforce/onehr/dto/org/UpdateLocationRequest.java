@@ -5,6 +5,8 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 import lombok.Data;
 
+import java.time.LocalDate;
+
 @Data
 public class UpdateLocationRequest {
     @NotBlank(message = "Name is required")
@@ -34,4 +36,9 @@ public class UpdateLocationRequest {
     @NotBlank(message = "Timezone is required")
     @Size(max = 50)
     private String timezone;
+
+    // Required only when timezone actually differs from the Location's current live value —
+    // future-only (today/past rejected), no default enforced server-side (the UI defaults its
+    // picker to tomorrow). Ignored when timezone is unchanged: see OrgService#updateLocation.
+    private LocalDate effectiveFrom;
 }

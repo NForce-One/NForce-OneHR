@@ -648,8 +648,13 @@ public class RegularizationService {
             if (req.getRequestedCheckIn() != null) record.setCheckInAt(req.getRequestedCheckIn());
             if (req.getRequestedCheckOut() != null) record.setCheckOutAt(req.getRequestedCheckOut());
             record.setSource(SOURCE_REGULARIZATION);
+            // For a brand-new (backdated) row, resolved via the employee's Shift Assignment
+            // EFFECTIVE ON record.getWorkDate() itself (never employee.getShift(), a best-effort
+            // display cache that may not reflect what governed this correction's own date) — a
+            // reassignment between that date and now must not silently change a freshly-created
+            // historical row's own snapshotted shift/lateness.
             AttendanceInterpretation interpretation = isNewRecord
-                    ? attendanceInterpretationService.interpretForKnownWorkDate(employee, record.getWorkDate(), record.getCheckInAt())
+                    ? attendanceInterpretationService.interpretForKnownWorkDate(req.getEmployeeUserId(), record.getWorkDate(), record.getCheckInAt())
                     : attendanceInterpretationService.interpretExistingRecordLateness(record, record.getCheckInAt());
             applyInterpretation(record, interpretation, isNewRecord);
             Attendance savedAttendance = attendanceRepository.save(record);

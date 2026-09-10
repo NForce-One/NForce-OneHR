@@ -321,10 +321,27 @@ public class OrgService {
         loc.setState(req.getState() != null ? req.getState().trim() : null);
         loc.setCountry(req.getCountry() != null ? req.getCountry().trim() : null);
         loc.setHolidayRegion(req.getHolidayRegion() != null ? req.getHolidayRegion().trim() : null);
-        // Changing a Location's timezone here never reinterprets any Attendance row already
-        // snapshotted under the old zone — only future attendance is affected (see
-        // AttendanceRulesService#resolveEmployeeZoneId).
-        loc.setTimezone(validatedTimezone(req.getTimezone()));
+        // Future-effective timezone changes (ONEHR-336 follow-up): unchanged from the Location's
+        // current live value saves immediately, no date required — and clears any previously-
+        // queued pending change (resubmitting the current value is "cancel the pending change,"
+        // not "schedule a no-op"). An actual change requires a future effectiveFrom (today/past
+        // rejected) and is written ONLY to the pending pair — the live `timezone` column, and
+        // therefore every fresh AttendanceRulesService#resolveEmployeeZoneId resolution before
+        // that date, is completely untouched. Never reinterprets any Attendance row already
+        // snapshotted under the old zone either way — only a FUTURE, fresh resolution is ever
+        // affected (see that method's own Javadoc).
+        String newTimezone = validatedTimezone(req.getTimezone());
+        if (newTimezone.equals(loc.getTimezone())) {
+            loc.setPendingTimezone(null);
+            loc.setPendingTimezoneEffectiveFrom(null);
+        } else {
+            LocalDate today = LocalDate.now();
+            if (req.getEffectiveFrom() == null || !req.getEffectiveFrom().isAfter(today)) {
+                throw new IllegalArgumentException("Effective From is required and must be a future date (after today) when changing the timezone");
+            }
+            loc.setPendingTimezone(newTimezone);
+            loc.setPendingTimezoneEffectiveFrom(req.getEffectiveFrom());
+        }
         long count = employeeRepo.countByLocationId(id);
         return LocationResponse.from(locationRepo.save(loc), count);
     }

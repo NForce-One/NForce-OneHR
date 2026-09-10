@@ -70,6 +70,7 @@ class LateArrivalGraceUnificationTest {
     @Mock private ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
     @Mock private ShiftVersionResolver shiftVersionResolver;
     @Mock private ShiftRepository shiftRepository;
+    @Mock private EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     private ExceptionService exceptionService;
     private AttendanceInterpretationService interpretationService;
@@ -101,19 +102,19 @@ class LateArrivalGraceUnificationTest {
         lenient().when(allocationRepository.findEffectiveAt(any(), any())).thenReturn(List.of());
         PenalizationPolicyResolutionService policyResolutionService =
                 new PenalizationPolicyResolutionService(versionRepository, allocationRepository, penalizationPolicyService, employeeRepository, attendanceProperties);
-        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
+        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver, employeeShiftAssignmentResolver);
         WorkHoursShortageCalculationService workHoursShortageCalculationService =
-                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
+                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver, shiftRepository);
         lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
                 ShiftWeeklyOffRules.builder().maximumShiftDayDurationHours(BigDecimal.valueOf(18)).build()));
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
-        interpretationService = new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver, employeeShiftAssignmentResolver);
+        interpretationService = new AttendanceInterpretationService(shiftDayPolicy, shiftRepository, employeeShiftAssignmentResolver);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, penaltyEvaluationService,
                 workingDayService, holidayRepository, policyResolutionService, expectedWorkHoursService,
                 workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService,
-                shiftDayPolicy, shiftVersionResolver);
+                shiftVersionResolver, shiftRepository);
 
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeId));
@@ -132,11 +133,33 @@ class LateArrivalGraceUnificationTest {
                 .employeeCode("NF-TEST").shift(shift).build();
         lenient().when(employeeRepository.findAllByIdWithScheduleDetails(any())).thenReturn(List.of(employee));
         lenient().when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee));
+        // ExceptionService's LATE_ARRIVAL display now resolves the record's own snapshotted
+        // shiftId (resolveSnapshotShift), never the employee's current/live Shift.
+        lenient().when(shiftRepository.findById(shift.getId())).thenReturn(Optional.of(shift));
+        // Every fresh-action resolution in this class shares one assignment (this employee, this
+        // shift, effective from the dawn of time) — this file doesn't exercise assignment history
+        // itself (see ShiftDayPolicyTest/ExpectedWorkHoursServiceTest/EmployeeShiftAssignmentResolverTest
+        // for that), only needs a working resolution so the grace/lateness formula runs for real.
+        EmployeeShiftAssignment assignment = EmployeeShiftAssignment.builder()
+                .employeeUserId(employeeId).shift(shift).effectiveFrom(LocalDate.MIN).build();
+        lenient().when(employeeShiftAssignmentResolver.resolve(eq(employeeId), any())).thenReturn(assignment);
+        lenient().when(employeeShiftAssignmentResolver.resolveIfPresent(eq(employeeId), any())).thenReturn(Optional.of(assignment));
         // Every ShiftVersion resolution in this class shares one 09:00 start / 10-minute grace —
         // the exact example from the clarified business rule.
         lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(
                 ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0))
                         .lateGraceMinutes(SHIFT_GRACE_MINUTES).build());
+        // ONEHR-336 follow-up: ShiftDayPolicy's own Rule 2 pre-check now calls resolveIfPresent
+        // (not resolve) directly — an unstubbed @Mock answers Optional.empty() regardless of the
+        // resolve() stub above, silently breaking any overnight-rollover check. Delegates to
+        // whatever resolve() is stubbed to return instead of duplicating it.
+        lenient().when(shiftVersionResolver.resolveIfPresent(any(), any())).thenAnswer(inv -> {
+            try {
+                return Optional.of(shiftVersionResolver.resolve(inv.getArgument(0), inv.getArgument(1)));
+            } catch (IllegalStateException e) {
+                return Optional.empty();
+            }
+        });
     }
 
     private User hrUser() {
@@ -151,7 +174,7 @@ class LateArrivalGraceUnificationTest {
      */
     private Attendance attendanceAt(LocalDate date, LocalTime checkInTime) {
         LocalDateTime checkInAt = date.atTime(checkInTime);
-        AttendanceInterpretation interpretation = interpretationService.interpretForKnownWorkDate(employee, date, checkInAt);
+        AttendanceInterpretation interpretation = interpretationService.interpretForKnownWorkDate(employee.getUserId(), date, checkInAt);
         return Attendance.builder()
                 .employeeUserId(employeeId).workDate(date)
                 .checkInAt(checkInAt).checkOutAt(date.atTime(18, 0))

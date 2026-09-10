@@ -1,8 +1,10 @@
 package com.nforce.onehr.service;
 
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.LeaveDurationType;
 import com.nforce.onehr.entity.LeaveRequest;
+import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.repository.LeaveRequestRepository;
 import lombok.RequiredArgsConstructor;
@@ -16,6 +18,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -39,26 +42,35 @@ public class ExpectedWorkHoursService {
 
     private final LeaveRequestRepository leaveRequestRepository;
     private final ShiftVersionResolver shiftVersionResolver;
+    private final EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     /**
-     * The employee's assigned shift duration in minutes on {@code date} (per the Shift Version
-     * effective on that date — never the employee's current/live shift for a date it doesn't
-     * govern, so a later timing change can't retroactively change a historical expected-hours
-     * figure), or null if no shift is assigned. Overnight-aware: {@code Duration.between} on two
-     * bare {@link java.time.LocalTime} values has no notion of "next day" — for an overnight shift
-     * (end not after start, e.g. the org's own default 15:30-00:30) it returns a negative value,
-     * which used to be silently treated as "no shift" (returning null here, same as an employee
-     * with no shift at all). That masked expected-hours/Work-Hours-Shortage evaluation for every
-     * overnight-shift employee. Corrected using the exact same rollover rule already established
-     * elsewhere for this purpose (see {@link ShiftDayPolicy#shiftEndAt}): when the end is not
-     * after the start, it falls on the next calendar day, so the elapsed span wraps forward by
-     * 24h instead of going negative.
+     * The employee's assigned shift duration in minutes on {@code date} — resolved from the Shift
+     * Assignment effective on THAT SPECIFIC DATE (never {@code employee.getShift()}, a best-effort
+     * display cache that may not reflect what governed a historical or future date — see that
+     * field's own Javadoc), and the Shift Version effective on that same date, so neither a later
+     * reassignment nor a later timing change can retroactively change a historical expected-hours
+     * figure. Null if no assignment covers {@code date} (a legacy/no-shift state — "cannot be
+     * evaluated," never guessed by falling back to the employee's current assignment).
+     * Overnight-aware: {@code Duration.between} on two bare {@link java.time.LocalTime} values has
+     * no notion of "next day" — for an overnight shift (end not after start, e.g. the org's own
+     * default 15:30-00:30) it returns a negative value, which used to be silently treated as "no
+     * shift" (returning null here, same as an employee with no shift at all). That masked
+     * expected-hours/Work-Hours-Shortage evaluation for every overnight-shift employee. Corrected
+     * using the exact same rollover rule already established elsewhere for this purpose (see
+     * {@link ShiftDayPolicy#shiftEndAt}): when the end is not after the start, it falls on the
+     * next calendar day, so the elapsed span wraps forward by 24h instead of going negative.
      */
     public Long shiftMinutes(Employee employee, LocalDate date) {
-        if (employee == null || employee.getShift() == null) {
+        if (employee == null) {
             return null;
         }
-        ShiftVersion version = shiftVersionResolver.resolve(employee.getShift(), date);
+        Optional<EmployeeShiftAssignment> assignment = employeeShiftAssignmentResolver.resolveIfPresent(employee.getUserId(), date);
+        if (assignment.isEmpty()) {
+            return null;
+        }
+        Shift shift = assignment.get().getShift();
+        ShiftVersion version = shiftVersionResolver.resolve(shift, date);
         LocalTime start = version.getStartTime();
         LocalTime end = version.getEndTime();
         long minutes = Duration.between(start, end).toMinutes();

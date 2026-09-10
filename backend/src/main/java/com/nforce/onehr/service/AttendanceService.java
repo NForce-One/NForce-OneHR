@@ -102,6 +102,10 @@ public class AttendanceService {
     // lateness, checkout/staleness boundary) — see its own class Javadoc. Added last for the same
     // explicit-constructor-test reason as shiftDayPolicy/attendanceRulesService above.
     private final AttendanceInterpretationService attendanceInterpretationService;
+    // Only for getConfig's/historyFor's own "resolve for a real employee" pin — see
+    // ShiftDayPolicy's pinned-vs-day-aware overload split. Added last for the same
+    // explicit-constructor-test reason as the others above.
+    private final EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     // ---------------------------------------------------------------- self-service
 
@@ -248,7 +252,6 @@ public class AttendanceService {
     @Transactional(readOnly = true)
     public AttendanceConfigResponse getConfig(String actorEmail) {
         Employee employee = resolveEmployee(actorEmail);
-        Shift shift = employee.getShift();
         WeeklyOffPolicy weeklyOffPolicy = employee.getWeeklyOffPolicy();
         // A live "what applies today" display, not tied to any specific historical Attendance
         // record — resolves the Shift Version effective right now, same as the Shifts tab itself.
@@ -256,15 +259,18 @@ public class AttendanceService {
         // — not the bare org-wide default — so the displayed shift start/end matches what their
         // own Check-In would actually compute.
         LocalDate configDay = LocalDate.now(attendanceRulesService.resolveEmployeeZoneId(employee));
+        // Resolved from the Shift Assignment effective TODAY (never employee.getShift(), a
+        // best-effort display cache — see that field's own Javadoc), then pinned so
+        // ShiftDayPolicy's existing Employee-taking methods resolve against exactly this Shift.
+        Shift shift = employeeShiftAssignmentResolver.resolve(employee.getUserId(), configDay).getShift();
+        Employee pinnedToday = Employee.builder().userId(employee.getUserId()).shift(shift).build();
 
         return AttendanceConfigResponse.builder()
-                .shiftName(shift != null ? shift.getName() : null)
-                .shiftStart(shiftDayPolicy.resolveShiftStart(employee, configDay))
-                .shiftEnd(shift != null ? shiftDayPolicy.shiftEndAt(employee, configDay).toLocalTime() : null)
-                // Per-Shift-Version grace (see V168) — resolveShiftStart above already requires a
-                // non-null shift (the mandatory-Shift invariant), so this is never reached in a
-                // state where a fallback would be needed.
-                .lateGraceMinutes(shiftDayPolicy.resolveLateGraceMinutes(employee, configDay))
+                .shiftName(shift.getName())
+                .shiftStart(shiftDayPolicy.resolveShiftStart(pinnedToday, configDay))
+                .shiftEnd(shiftDayPolicy.shiftEndAt(pinnedToday, configDay).toLocalTime())
+                // Per-Shift-Version grace (see V168).
+                .lateGraceMinutes(shiftDayPolicy.resolveLateGraceMinutes(pinnedToday, configDay))
                 .halfDayMaxHours(attendanceRulesService.getHalfDayMaxHours())
                 .weeklyOffDays(weeklyOffPolicy != null
                         ? Arrays.stream(weeklyOffPolicy.getOffDays().split(",")).map(String::trim).toList()
@@ -1443,7 +1449,7 @@ public class AttendanceService {
     private List<AttendanceResponse> historyFor(Employee employee, LocalDate from, LocalDate to) {
         // Scoped to one specific employee (never an aggregate/roster view), so their own
         // timezone unambiguously answers "what does 'today' mean" for defaulting the range end.
-        LocalDate end = to != null ? to : shiftDayPolicy.shiftDayOf(employee, now(employee));
+        LocalDate end = to != null ? to : shiftDayPolicy.shiftDayOf(employee.getUserId(), now(employee));
         LocalDate start = from != null ? from : end.minusDays(DEFAULT_HISTORY_DAYS);
         return attendanceRepository
                 .findByEmployeeUserIdAndWorkDateBetweenOrderByWorkDateDesc(

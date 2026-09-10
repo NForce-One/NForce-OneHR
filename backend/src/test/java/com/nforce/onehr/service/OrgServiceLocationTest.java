@@ -134,7 +134,10 @@ class OrgServiceLocationTest {
 
         UpdateLocationRequest req = new UpdateLocationRequest();
         req.setName("nEW yORK");
-        req.setTimezone("America/New_York");
+        // Unchanged from the existing Location's own timezone — this test is about name
+        // normalization only; an actual timezone change now requires a future effectiveFrom
+        // (see OrgServiceLocationTest's own pending-timezone tests below for that behavior).
+        req.setTimezone("Asia/Kolkata");
 
         LocationResponse response = service.updateLocation(id, req);
 
@@ -196,6 +199,135 @@ class OrgServiceLocationTest {
 
         assertEquals("Hyderabad", response.getName());
         verify(locationRepo, never()).existsByNameIgnoreCase(anyString());
+    }
+
+    // ── Future-effective timezone (ONEHR-336 follow-up): pending-timezone semantics ──────────
+    // Unchanged timezone = immediate save, clearing any pending change. Different timezone =
+    // mandatory future effectiveFrom (today/past rejected), written ONLY to the pending pair —
+    // the live `timezone` column is untouched until AttendanceRulesService#resolveEmployeeZoneId
+    // resolves it inline, by date, on its own (see that class's own tests for that side).
+
+    @Test
+    void updateLocation_unchangedTimezone_savesImmediately_noEffectiveFromRequired() {
+        UUID id = UUID.randomUUID();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Hyderabad");
+        req.setTimezone("Asia/Kolkata");
+        req.setEffectiveFrom(null);
+
+        LocationResponse response = service.updateLocation(id, req);
+
+        assertEquals("Asia/Kolkata", response.getTimezone());
+        assertNull(existing.getPendingTimezone());
+        assertNull(existing.getPendingTimezoneEffectiveFrom());
+    }
+
+    @Test
+    void updateLocation_resubmittingTheCurrentTimezone_clearsAnyExistingPendingChange() {
+        // Submitting the current value is "cancel the pending change," not "schedule a no-op."
+        UUID id = UUID.randomUUID();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata")
+                .pendingTimezone("America/New_York").pendingTimezoneEffectiveFrom(java.time.LocalDate.now().plusDays(5))
+                .build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Hyderabad");
+        req.setTimezone("Asia/Kolkata");
+
+        service.updateLocation(id, req);
+
+        assertNull(existing.getPendingTimezone());
+        assertNull(existing.getPendingTimezoneEffectiveFrom());
+    }
+
+    @Test
+    void updateLocation_changedTimezone_requiresAFutureEffectiveFrom_rejectsWhenMissing() {
+        UUID id = UUID.randomUUID();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Hyderabad");
+        req.setTimezone("America/New_York");
+        req.setEffectiveFrom(null);
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> service.updateLocation(id, req));
+        assertTrue(ex.getMessage().contains("Effective From"));
+        assertEquals("Asia/Kolkata", existing.getTimezone(), "live timezone must stay untouched on rejection");
+    }
+
+    @Test
+    void updateLocation_changedTimezone_rejectsToday() {
+        UUID id = UUID.randomUUID();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Hyderabad");
+        req.setTimezone("America/New_York");
+        req.setEffectiveFrom(java.time.LocalDate.now());
+
+        assertThrows(IllegalArgumentException.class, () -> service.updateLocation(id, req));
+        assertNull(existing.getPendingTimezone());
+    }
+
+    @Test
+    void updateLocation_changedTimezone_rejectsAPastDate() {
+        UUID id = UUID.randomUUID();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Hyderabad");
+        req.setTimezone("America/New_York");
+        req.setEffectiveFrom(java.time.LocalDate.now().minusDays(1));
+
+        assertThrows(IllegalArgumentException.class, () -> service.updateLocation(id, req));
+        assertNull(existing.getPendingTimezone());
+    }
+
+    @Test
+    void updateLocation_changedTimezone_withAFutureEffectiveFrom_writesOnlyThePendingPair_liveTimezoneUntouched() {
+        UUID id = UUID.randomUUID();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata").build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+        java.time.LocalDate tomorrow = java.time.LocalDate.now().plusDays(1);
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Hyderabad");
+        req.setTimezone("America/New_York");
+        req.setEffectiveFrom(tomorrow);
+
+        LocationResponse response = service.updateLocation(id, req);
+
+        assertEquals("Asia/Kolkata", existing.getTimezone(), "live timezone stays untouched until the effective date");
+        assertEquals("Asia/Kolkata", response.getTimezone());
+        assertEquals("America/New_York", existing.getPendingTimezone());
+        assertEquals(tomorrow, existing.getPendingTimezoneEffectiveFrom());
+    }
+
+    @Test
+    void updateLocation_changedTimezone_replacesAnyExistingPendingChange_ratherThanStackingASecondOne() {
+        UUID id = UUID.randomUUID();
+        Location existing = Location.builder().id(id).name("Hyderabad").timezone("Asia/Kolkata")
+                .pendingTimezone("America/New_York").pendingTimezoneEffectiveFrom(java.time.LocalDate.now().plusDays(3))
+                .build();
+        when(locationRepo.findById(id)).thenReturn(Optional.of(existing));
+        java.time.LocalDate newEffectiveFrom = java.time.LocalDate.now().plusDays(10);
+
+        UpdateLocationRequest req = new UpdateLocationRequest();
+        req.setName("Hyderabad");
+        req.setTimezone("America/Chicago");
+        req.setEffectiveFrom(newEffectiveFrom);
+
+        service.updateLocation(id, req);
+
+        assertEquals("America/Chicago", existing.getPendingTimezone(), "replaces, never stacks, the prior pending change");
+        assertEquals(newEffectiveFrom, existing.getPendingTimezoneEffectiveFrom());
     }
 
     /**

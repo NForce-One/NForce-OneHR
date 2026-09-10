@@ -5,6 +5,7 @@ import com.nforce.onehr.dto.attendance.AttendanceInterpretation;
 import com.nforce.onehr.dto.attendance.InterpretationOutcome;
 import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.repository.ShiftRepository;
 import lombok.RequiredArgsConstructor;
@@ -16,6 +17,7 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.UUID;
 
 /**
  * The single, narrow, shared owner of Shift-relative punch interpretation — replacing what used
@@ -92,32 +94,53 @@ public class AttendanceInterpretationService {
 
     private final ShiftDayPolicy shiftDayPolicy;
     private final ShiftRepository shiftRepository;
+    // Only for the day-aware interpretFreshAction/interpretForKnownWorkDate(UUID, ...) overload
+    // below — never consulted for a historical row, which always resolves via its own snapshotted
+    // shiftId (resolveShiftContextOrNull) instead.
+    private final EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     /**
      * A brand-new Check-In/Web Clock-In click — derives the work-date from {@code context.getNow()}
-     * (against the employee's CURRENT Shift) and delegates to {@link #interpretForKnownWorkDate}
-     * for lateness against that same date/instant/Shift.
+     * and delegates to {@link #interpretForKnownWorkDate(UUID, LocalDate, LocalDateTime)} for
+     * lateness against that same date/instant, both resolved via the employee's Shift Assignment
+     * effective on that specific date (never {@code Employee.shift}, a best-effort display cache —
+     * see that field's own Javadoc) — correct here since there is nothing to preserve yet.
      */
     @Transactional(readOnly = true)
     public AttendanceInterpretation interpretFreshAction(Employee employee, AttendanceContext context) {
-        LocalDate workDate = shiftDayPolicy.shiftDayOf(employee, context.getNow());
-        return interpretForKnownWorkDate(employee, workDate, context.getNow());
+        LocalDate workDate = shiftDayPolicy.shiftDayOf(employee.getUserId(), context.getNow());
+        return interpretForKnownWorkDate(employee.getUserId(), workDate, context.getNow());
     }
 
     /**
-     * Lateness for an employee/work-date/check-in-instant that's already known — used for (a)
-     * {@link #interpretFreshAction}'s own delegation above, and (b) a Regularization-created row
-     * for a date with no prior punch, where the work-date is the employee-picked correction date,
-     * not something to derive from a timestamp. Resolves against the employee's CURRENT Shift —
-     * correct in both cases, since neither has any prior Attendance context to preserve. Mirrors
-     * the exact formula {@link AttendanceService#checkIn} has always used: {@code isLate} is
-     * grace-aware (deadline = shiftStart + grace), {@code lateByMinutes} is the raw,
-     * no-forgiveness minutes past shiftStart itself (an employee-facing display value, never
-     * grace-forgiven) — both anchored to full date-aware instants, never a bare {@link LocalTime},
-     * so an overnight shift's post-midnight arrival is measured correctly.
+     * Lateness for an employee/work-date/check-in-instant that's already known, resolved against
+     * the Shift Assignment effective on {@code workDate} itself (never {@code Employee.shift}) —
+     * used for (a) {@link #interpretFreshAction}'s own delegation above, and (b) a
+     * Regularization-created row for a date with no prior punch, where the work-date is the
+     * employee-picked correction date (which may be backdated — this must resolve against
+     * whichever Shift governed THAT date, not whichever the employee is on today). Correct in
+     * both cases, since neither has any prior Attendance context to preserve; delegates to the
+     * pinned-{@link Employee} overload below once the right Shift for {@code workDate} is known.
      */
     @Transactional(readOnly = true)
-    public AttendanceInterpretation interpretForKnownWorkDate(Employee employee, LocalDate workDate, LocalDateTime checkInAt) {
+    public AttendanceInterpretation interpretForKnownWorkDate(UUID employeeUserId, LocalDate workDate, LocalDateTime checkInAt) {
+        return interpretForKnownWorkDate(pinForDate(employeeUserId, workDate), workDate, checkInAt);
+    }
+
+    /**
+     * Same lateness formula as the {@code UUID}-taking overload above, for an ALREADY-RESOLVED
+     * Shift context — used exclusively by {@link #interpretExistingRecordLateness} with a
+     * historical row's own pinned snapshot (see {@link #resolveShiftContextOrNull}); never called
+     * directly with a real, live {@link Employee} (whose {@code .getShift()} is a best-effort
+     * display cache, not necessarily the assignment effective on {@code workDate} — see the
+     * {@code UUID}-taking overload for that case). Mirrors the exact formula
+     * {@link AttendanceService#checkIn} has always used: {@code isLate} is grace-aware
+     * (deadline = shiftStart + grace), {@code lateByMinutes} is the raw, no-forgiveness minutes
+     * past shiftStart itself (an employee-facing display value, never grace-forgiven) — both
+     * anchored to full date-aware instants, never a bare {@link LocalTime}, so an overnight
+     * shift's post-midnight arrival is measured correctly.
+     */
+    private AttendanceInterpretation interpretForKnownWorkDate(Employee employee, LocalDate workDate, LocalDateTime checkInAt) {
         LocalTime shiftStart = shiftDayPolicy.resolveShiftStart(employee, workDate);
         LocalDateTime shiftStartAt = LocalDateTime.of(workDate, shiftStart);
         int graceMinutes = shiftDayPolicy.resolveLateGraceMinutes(employee, workDate);
@@ -253,11 +276,21 @@ public class AttendanceInterpretationService {
      */
     @Transactional(readOnly = true)
     public boolean belongsToWorkday(Employee employee, Attendance existingRecordOrNull, LocalDate workDate, LocalDateTime timestamp) {
-        Employee shiftContext = resolveShiftContextForValidation(employee, existingRecordOrNull);
-        if (shiftContext == null) {
-            return true;
+        if (existingRecordOrNull != null) {
+            Employee shiftContext = resolveShiftContextOrNull(existingRecordOrNull);
+            if (shiftContext == null) {
+                return true; // legacy row — fails open, exactly like every other legacy case here
+            }
+            return shiftDayPolicy.shiftDayOf(shiftContext, timestamp).equals(workDate);
         }
-        return shiftDayPolicy.shiftDayOf(shiftContext, timestamp).equals(workDate);
+        if (employee == null) {
+            return true; // no employee to validate against — fails open, exactly like the legacy-row case above
+        }
+        // Brand-new correction, no prior row — day-aware resolution against the employee's REAL
+        // assignment history (never Employee.shift, a best-effort display cache — see that
+        // field's own Javadoc), since a reassignment could land exactly on the boundary this
+        // examines. See ShiftDayPolicy#shiftDayOf(UUID, LocalDateTime)'s own Javadoc.
+        return shiftDayPolicy.shiftDayOf(employee.getUserId(), timestamp).equals(workDate);
     }
 
     /**
@@ -269,16 +302,33 @@ public class AttendanceInterpretationService {
      */
     @Transactional(readOnly = true)
     public WorkdayWindow resolveWorkdayWindowFor(Employee employee, Attendance existingRecordOrNull, LocalDate workDate) {
-        Employee shiftContext = resolveShiftContextForValidation(employee, existingRecordOrNull);
-        if (shiftContext == null) {
-            return null;
+        if (existingRecordOrNull != null) {
+            Employee shiftContext = resolveShiftContextOrNull(existingRecordOrNull);
+            if (shiftContext == null) {
+                return null;
+            }
+            return new WorkdayWindow(shiftDayPolicy.workdayStartAt(shiftContext, workDate),
+                    shiftDayPolicy.workdayEndAt(shiftContext, workDate));
         }
-        return new WorkdayWindow(shiftDayPolicy.workdayStartAt(shiftContext, workDate),
-                shiftDayPolicy.workdayEndAt(shiftContext, workDate));
+        if (employee == null) {
+            return null; // no employee to validate against — same fail-open case as the legacy-row branch above
+        }
+        // Brand-new correction, no prior row — same day-aware reasoning as belongsToWorkday above.
+        LocalDateTime start = shiftDayPolicy.workdayStartAt(employee.getUserId(), workDate);
+        LocalDateTime end = shiftDayPolicy.workdayEndAt(pinForDate(employee.getUserId(), workDate), workDate);
+        return new WorkdayWindow(start, end);
     }
 
-    private Employee resolveShiftContextForValidation(Employee employee, Attendance existingRecordOrNull) {
-        return existingRecordOrNull != null ? resolveShiftContextOrNull(existingRecordOrNull) : employee;
+    /**
+     * Resolves the Shift Assignment effective on {@code date} and builds a minimal pinned
+     * {@link Employee} stand-in carrying only that Shift — the same idiom
+     * {@link #resolveShiftContextOrNull} uses for a historical row's own snapshot, here sourced
+     * from the effective-dated assignment instead. Safe because {@link ShiftDayPolicy} reads
+     * nothing else off {@code Employee} (see its own class Javadoc).
+     */
+    private Employee pinForDate(UUID employeeUserId, LocalDate date) {
+        EmployeeShiftAssignment assignment = employeeShiftAssignmentResolver.resolve(employeeUserId, date);
+        return Employee.builder().userId(employeeUserId).shift(assignment.getShift()).build();
     }
 
     /**

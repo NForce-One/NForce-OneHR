@@ -45,12 +45,13 @@ interface Location { id: string; name: string; active?: boolean; }
 // exclusively via Organization Masters → Locations (see OrgSetupPage). `token` is accepted for
 // signature compatibility with call sites, even though this component no longer calls the API.
 function CreatableLocationSelect({
-  locations, value, onChange,
+  locations, value, onChange, disabled,
 }: {
   locations: Location[];
   value: string | undefined;
   onChange: (id: string | undefined) => void;
   token: string;
+  disabled?: boolean;
 }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
@@ -78,15 +79,16 @@ function CreatableLocationSelect({
     <div ref={ref} style={{ position: 'relative' }}>
       <div style={{ position: 'relative' }}>
         <input
-          style={{ ...inputStyle, paddingRight: 32 }}
+          style={{ ...inputStyle, paddingRight: 32, opacity: disabled ? 0.6 : 1, cursor: disabled ? 'not-allowed' : 'text' }}
           placeholder="Select a location…"
+          disabled={disabled}
           value={open ? query : currentName}
           onFocus={() => { setOpen(true); setQuery(currentName); }}
           onChange={e => { setQuery(e.target.value); setOpen(true); if (!e.target.value) onChange(undefined); }}
         />
         <ChevronDown size={14} style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--txt-dim)', pointerEvents: 'none' }} />
       </div>
-      {open && (
+      {!disabled && open && (
         <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4, background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 7, boxShadow: '0 8px 24px rgba(0,0,0,.3)', zIndex: 100, maxHeight: 240, overflowY: 'auto' }}>
           {filtered.length === 0 && (
             <div style={{ padding: '10px 14px', fontSize: 13, color: 'var(--txt-dim)' }}>
@@ -197,7 +199,11 @@ function EditModal({ emp, onClose, onUpdated, token }: { emp: EmployeeRecord; on
                 value={form.locationId}
                 onChange={id => setForm(f => ({ ...f, locationId: id }))}
                 token={token}
+                disabled
               />
+              <div style={{ fontSize: 11, color: 'var(--txt-mut)', marginTop: 4 }}>
+                Location changes are currently unavailable when updating an employee. Contact an administrator.
+              </div>
             </Field>
           </div>
           <div style={{ gridColumn: '1/-1', fontSize: 11, color: 'var(--txt-dim)' }}>

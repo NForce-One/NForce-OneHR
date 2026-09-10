@@ -1,6 +1,7 @@
 package com.nforce.onehr.service;
 
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.LeaveDurationType;
 import com.nforce.onehr.entity.LeaveRequest;
 import com.nforce.onehr.entity.Shift;
@@ -18,6 +19,7 @@ import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,12 +61,37 @@ class ExpectedWorkHoursServiceTest {
     // 9:00-18:00 = 540 minutes (9 hours).
     private final Shift nineHourShift = shift("Regular", LocalTime.of(9, 0), LocalTime.of(18, 0));
 
+    // A minimal, real (not mocked) assignment resolver — mirrors the ShiftVersionResolver fake
+    // above one layer up: shiftMinutes now resolves the Shift from the employee's ASSIGNMENT
+    // effective on the date in question (never employee.getShift()), so every test needs a
+    // matching assignment registered — see employeeWithShift below.
+    private final List<EmployeeShiftAssignment> assignments = new ArrayList<>();
+    private final EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver = new EmployeeShiftAssignmentResolver(null) {
+        @Override
+        public Optional<EmployeeShiftAssignment> resolveIfPresent(UUID employeeUserId, LocalDate workDate) {
+            return assignments.stream()
+                    .filter(a -> a.getEmployeeUserId().equals(employeeUserId))
+                    .filter(a -> !a.getEffectiveFrom().isAfter(workDate))
+                    .max(java.util.Comparator.comparing(EmployeeShiftAssignment::getEffectiveFrom));
+        }
+
+        @Override
+        public EmployeeShiftAssignment resolve(UUID employeeUserId, LocalDate workDate) {
+            return resolveIfPresent(employeeUserId, workDate)
+                    .orElseThrow(() -> new IllegalStateException("no assignment effective on or before " + workDate));
+        }
+    };
+
     @BeforeEach
     void setUp() {
-        service = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
+        service = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver, employeeShiftAssignmentResolver);
     }
 
+    /** Registers a Shift Assignment for the shared test employee (effective from the dawn of time, matching the shift() fixture's own convention) and builds the Employee — null clears any assignment (no-shift case). */
     private Employee employeeWithShift(Shift shift) {
+        if (shift != null) {
+            assignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeId).shift(shift).effectiveFrom(LocalDate.MIN).build());
+        }
         return Employee.builder().userId(employeeId).fullName("Test Employee").shift(shift).build();
     }
 
@@ -188,5 +215,25 @@ class ExpectedWorkHoursServiceTest {
 
         assertEquals(540L, service.shiftMinutes(employee, date), "before the new version's effectiveFrom — must still resolve the OLD (9-18) duration");
         assertEquals(540L, service.shiftMinutes(employee, date.plusDays(10)), "on/after the new version's effectiveFrom — resolves the NEW (6-15) duration, same 9h span here");
+    }
+
+    /**
+     * The historical-integrity invariant one layer up from Shift Versioning: a later EMPLOYEE
+     * REASSIGNMENT (a different Shift entity entirely, not just a new timing version of the same
+     * one) must never retroactively change an expected-hours figure already applicable to a past
+     * date. The employee was on Shift A (9h) on {@code date}; a reassignment to Shift B (4h)
+     * becomes effective the day after — {@code shiftMinutes} for {@code date} itself must still
+     * resolve Shift A's own duration, proving it resolves the ASSIGNMENT effective on that
+     * specific date, never the employee's current one.
+     */
+    @Test
+    void shiftMinutes_employeeReassignedSinceThisDate_stillResolvesTheAssignmentEffectiveOnThatDate() {
+        Shift shiftA = shift("Nine Hour", LocalTime.of(9, 0), LocalTime.of(18, 0));
+        Shift shiftB = shift("Four Hour", LocalTime.of(9, 0), LocalTime.of(13, 0));
+        Employee employee = employeeWithShift(shiftA);
+        assignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeId).shift(shiftB).effectiveFrom(date.plusDays(1)).build());
+
+        assertEquals(540L, service.shiftMinutes(employee, date), "still Shift A's own 9h duration — the reassignment hasn't taken effect yet as of this date");
+        assertEquals(240L, service.shiftMinutes(employee, date.plusDays(1)), "Shift B governs from its own effective date onward");
     }
 }

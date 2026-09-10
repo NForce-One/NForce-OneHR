@@ -5,6 +5,7 @@ import com.nforce.onehr.dto.org.UpdateAttendanceRulesRequest;
 import com.nforce.onehr.dto.org.UpdateDefaultTimezoneRequest;
 import com.nforce.onehr.entity.AttendanceRules;
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.Location;
 import com.nforce.onehr.repository.AttendanceRulesRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -13,6 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.DateTimeException;
+import java.time.LocalDate;
 import java.time.ZoneId;
 
 /**
@@ -101,8 +103,8 @@ public class AttendanceRulesService {
      */
     @Transactional(readOnly = true)
     public ZoneId resolveEmployeeZoneId(Employee employee) {
-        String locationTimezone = employee != null && employee.getLocation() != null
-                ? employee.getLocation().getTimezone() : null;
+        Location location = employee != null ? employee.getLocation() : null;
+        String locationTimezone = location != null ? effectiveTimezone(location) : null;
         if (locationTimezone != null && !locationTimezone.isBlank()) {
             try {
                 return ZoneId.of(locationTimezone);
@@ -113,6 +115,21 @@ public class AttendanceRulesService {
             }
         }
         return getDefaultZoneId();
+    }
+
+    /**
+     * A Location's authoritative timezone AS OF TODAY: the pending value once
+     * {@code pendingTimezoneEffectiveFrom <= today}, otherwise the live one — resolved inline, by
+     * date, on every call. No promotion/sync job exists or is required for this to be correct: a
+     * pending change is simply never exposed before its own effective date, by construction, every
+     * single time this is evaluated (see {@code Location.pendingTimezone}'s own Javadoc).
+     */
+    private String effectiveTimezone(Location location) {
+        LocalDate effectiveFrom = location.getPendingTimezoneEffectiveFrom();
+        if (effectiveFrom != null && !effectiveFrom.isAfter(LocalDate.now())) {
+            return location.getPendingTimezone();
+        }
+        return location.getTimezone();
     }
 
     private AttendanceRules loadSingleton() {

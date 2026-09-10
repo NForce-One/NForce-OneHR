@@ -49,7 +49,7 @@ public class EmployeeAssignmentController {
     @PostMapping("/bulk-update-shift")
     @PreAuthorize("hasAnyRole('MANAGER', 'HR_ADMIN', 'SUPER_ADMIN')")
     public AssignmentBulkResultResponse bulkUpdateShift(@Valid @RequestBody BulkAssignmentRequest req, Principal principal) {
-        return service.bulkUpdateShift(principal.getName(), req.getEmployeeUserIds(), req.getPolicyId());
+        return service.bulkUpdateShift(principal.getName(), req.getEmployeeUserIds(), req.getPolicyId(), req.getEffectiveFrom());
     }
 
     @PostMapping("/bulk-update-weekly-off")
