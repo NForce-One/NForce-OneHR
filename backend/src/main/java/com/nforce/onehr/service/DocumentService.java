@@ -84,6 +84,9 @@ public class DocumentService {
     @Transactional
     public EmployeeDocumentResponse uploadDocument(String actorEmail, Integer documentTypeId,
                                                    MultipartFile file, LocalDate issueDate, LocalDate expiryDate) throws IOException {
+        if (issueDate != null && expiryDate != null && expiryDate.isBefore(issueDate)) {
+            throw new IllegalArgumentException("Expiry date cannot be earlier than issue date");
+        }
         UUID actorId = requireUser(actorEmail).getId();
         DocumentType dt = docTypeRepo.findById(documentTypeId)
                 .orElseThrow(() -> new NoSuchElementException("Document type not found: " + documentTypeId));

@@ -293,11 +293,84 @@ function EmployeeDetailModal({ row, onClose }: { row: RosterRow; onClose: () => 
   );
 }
 
+/**
+ * Employment details for one employee — what clicking an avatar in either "Not in yet today"
+ * card opens instead of EmployeeDetailModal's attendance/requests view. No personal fields (DOB,
+ * personal email, address, emergency contact) — employment info only, same field set as the
+ * Directory tab's own detail panel (DirectoryPage.tsx), and available for any employee since
+ * DirectoryEntry itself already comes from the org-wide, unrestricted "/employees/directory" and
+ * "/employees/my-peers" endpoints — no manager-only gating needed.
+ */
+function EmployeeDetailsModal({ entry, onClose }: { entry: DirectoryEntry; onClose: () => void }) {
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={modalStyle} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: 18, borderBottom: '1px solid var(--line)' }}>
+          <Avatar userId={entry.userId} name={entry.fullName} size={40} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontFamily: 'Inter, sans-serif', fontWeight: 700, fontSize: 15, color: 'var(--txt)' }}>{entry.fullName}</div>
+            <div style={{ fontSize: 12, color: 'var(--txt-mut)', marginTop: 2 }}>{entry.designationName ?? '—'}</div>
+            <div style={{ fontSize: 10.5, color: 'var(--txt-dim)', fontFamily: 'Inter, sans-serif', marginTop: 2 }}>{entry.employeeCode}</div>
+          </div>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-mut)', padding: 5, borderRadius: 6 }}><X size={16} /></button>
+        </div>
+        <div style={{ padding: 18 }}>
+          <div style={labelStyle}>Employment details</div>
+          <Row label="Employee code" value={entry.employeeCode || '—'} />
+          <Row label="Work email" value={entry.email || '—'} />
+          <Row label="Department" value={entry.departmentName || '—'} />
+          <Row label="Designation" value={entry.designationName || '—'} />
+          <Row label="Location" value={entry.locationName || '—'} />
+          <Row label="Work mode" value={entry.workMode ? entry.workMode.replace('_', ' ') : '—'} />
+          <Row label="Employment type" value={entry.employmentType ? entry.employmentType.replace('_', ' ') : '—'} />
+          <Row label="Manager" value={entry.managerName || '—'} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '7px 0', borderBottom: '1px solid var(--line)', fontSize: 12.5 }}>
       <span style={{ color: 'var(--txt-mut)' }}>{label}</span>
       <span style={{ color: 'var(--txt)', fontWeight: 600 }}>{value}</span>
+    </div>
+  );
+}
+
+/**
+ * Full "Not in yet today" roster — the card itself only previews a handful of avatars, this is
+ * what "View employees" opens so a 100+-person team stays scrollable instead of growing the
+ * card (or this modal) without bound. Reuses the same overlay/modal chrome and Avatar as
+ * EmployeeDetailModal rather than introducing a second list/modal system.
+ */
+function NotInYetListModal({ people, onSelect, onClose }: {
+  people: { userId: string; fullName: string }[];
+  onSelect: (userId: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={{ ...modalStyle, maxWidth: 420 }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 18, borderBottom: '1px solid var(--line)' }}>
+          <span style={panelTitleStyle}>Employees not in yet today</span>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-mut)', padding: 5, borderRadius: 6 }}><X size={16} /></button>
+        </div>
+        <div style={{ maxHeight: '60vh', overflowY: 'auto' }}>
+          {people.map(p => (
+            <button
+              key={p.userId}
+              title={p.fullName}
+              onClick={() => onSelect(p.userId)}
+              style={{ all: 'unset', boxSizing: 'border-box', width: '100%', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, padding: '11px 18px', borderBottom: '1px solid var(--line)' }}
+            >
+              <Avatar userId={p.userId} name={p.fullName} size={30} />
+              <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--txt)' }}>{p.fullName}</span>
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1257,6 +1330,8 @@ function PeersView({ token }: { token: string }) {
 
   const [search, setSearch] = useState('');
   const [kudosTarget, setKudosTarget] = useState<KudosTarget | null>(null);
+  const [viewingEmployeeDetails, setViewingEmployeeDetails] = useState<DirectoryEntry | null>(null);
+  const [showAllNotIn, setShowAllNotIn] = useState(false);
 
   useEffect(() => {
     directoryApi.myPeers(token).then(setPeers).catch(() => setPeers([]));
@@ -1364,27 +1439,51 @@ function PeersView({ token }: { token: string }) {
           ) : notInYet.length === 0 ? (
             <div style={{ padding: '16px 18px', fontSize: 12.5, color: 'var(--txt-dim)' }}>Everyone's checked in.</div>
           ) : (
-            <div style={{ padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex' }}>
-                {notInYet.slice(0, OVERFLOW_LIMIT).map((r, i) => (
-                  <div key={r.peer.userId} title={r.peer.fullName} style={{ marginLeft: i === 0 ? 0 : -8, border: '2px solid var(--panel)', borderRadius: '50%' }}>
-                    <Avatar userId={r.peer.userId} name={r.peer.fullName} size={30} />
-                  </div>
-                ))}
-              </div>
-              {notInYet.length > OVERFLOW_LIMIT && (
-                <span style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--txt-mut)', background: 'var(--raised2)', padding: '4px 9px', borderRadius: 20 }}>
-                  +{notInYet.length - OVERFLOW_LIMIT} more
+            <div style={{ padding: '14px 18px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex' }}>
+                  {notInYet.slice(0, OVERFLOW_LIMIT).map((r, i) => (
+                    <div
+                      key={r.peer.userId}
+                      title={r.peer.fullName}
+                      onClick={() => setViewingEmployeeDetails(r.peer)}
+                      style={{ marginLeft: i === 0 ? 0 : -8, border: '2px solid var(--panel)', borderRadius: '50%', cursor: 'pointer' }}
+                    >
+                      <Avatar userId={r.peer.userId} name={r.peer.fullName} size={30} />
+                    </div>
+                  ))}
+                </div>
+                {notInYet.length > OVERFLOW_LIMIT && (
+                  <span style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--txt-mut)', background: 'var(--raised2)', padding: '4px 9px', borderRadius: 20 }}>
+                    +{notInYet.length - OVERFLOW_LIMIT} more
+                  </span>
+                )}
+                <span style={{ fontSize: 12, color: 'var(--txt-dim)', flexBasis: '100%' }}>
+                  {notInYet.slice(0, OVERFLOW_LIMIT).map(r => r.peer.fullName).join(', ')}
+                  {notInYet.length > OVERFLOW_LIMIT ? `, +${notInYet.length - OVERFLOW_LIMIT} more` : ''}
                 </span>
-              )}
-              <span style={{ fontSize: 12, color: 'var(--txt-dim)', flexBasis: '100%' }}>
-                {notInYet.slice(0, OVERFLOW_LIMIT).map(r => r.peer.fullName).join(', ')}
-                {notInYet.length > OVERFLOW_LIMIT ? `, +${notInYet.length - OVERFLOW_LIMIT} more` : ''}
-              </span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <button onClick={() => setShowAllNotIn(true)} style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 11.5, fontWeight: 600, color: 'var(--info)' }}>
+                  View employees
+                </button>
+              </div>
             </div>
           )}
         </div>
       </div>
+      {viewingEmployeeDetails && <EmployeeDetailsModal entry={viewingEmployeeDetails} onClose={() => setViewingEmployeeDetails(null)} />}
+      {showAllNotIn && (
+        <NotInYetListModal
+          people={notInYet.map(r => ({ userId: r.peer.userId, fullName: r.peer.fullName }))}
+          onSelect={userId => {
+            const row = notInYet.find(r => r.peer.userId === userId);
+            if (row) setViewingEmployeeDetails(row.peer);
+            setShowAllNotIn(false);
+          }}
+          onClose={() => setShowAllNotIn(false)}
+        />
+      )}
 
       {/* KPI row — fixed 4-column grid (not auto-fit) so 4 cards always fill one row evenly,
        * instead of auto-fit computing more tracks than there are cards and leaving a gap.
@@ -1878,6 +1977,11 @@ export default function MyTeamPage() {
     return (['all', 'IN', 'OUT', 'NOT_IN_YET', 'LEAVE'] as string[]).includes(s ?? '') ? (s as any) : 'all';
   });
   const [viewing, setViewing] = useState<RosterRow | null>(null);
+  const [showAllNotIn, setShowAllNotIn] = useState(false);
+  // Separate from `viewing`/EmployeeDetailModal (the main roster's "View" button, unchanged) —
+  // avatars inside the "Not in yet today" card open employment details instead.
+  const [viewingEmployeeDetails, setViewingEmployeeDetails] = useState<DirectoryEntry | null>(null);
+  const [directory, setDirectory] = useState<DirectoryEntry[]>([]);
 
   // Direct Reports / Peers toggle (ONEHR-73) — every employee can see Peers; Direct Reports
   // only appears once we know the caller actually has any (reuses ONEHR-72 as-is otherwise).
@@ -1911,6 +2015,13 @@ export default function MyTeamPage() {
     attendanceApi.team(today, token).then(setTodayRecords).catch(() => setTodayRecords([])).finally(() => setLoading(false));
   }, [token, today]);
 
+  // Org-wide directory (same unrestricted endpoint the Directory tab itself uses) — backs the
+  // "Not in yet today" card's employment-details click-through, since DirectReport itself only
+  // carries name/code/designation/department, not location/work mode/employment type/manager.
+  useEffect(() => {
+    directoryApi.list(token).then(setDirectory).catch(() => setDirectory([]));
+  }, [token]);
+
   useEffect(() => {
     leaveApi.team(today, today, token).then(setTodayLeave).catch(() => setTodayLeave([]));
   }, [token, today]);
@@ -1941,6 +2052,7 @@ export default function MyTeamPage() {
   }, [token, viewDate]);
 
   const attendanceByEmployee = useMemo(() => new Map(todayRecords.map(r => [r.employeeUserId, r])), [todayRecords]);
+  const directoryByEmployee = useMemo(() => new Map(directory.map(d => [d.userId, d])), [directory]);
   const onLeaveToday = useMemo(() => new Map(todayLeave.map(l => [l.employeeUserId, l])), [todayLeave]);
   const attentionItems = useMemo(() => pendingItems.filter(i => i.requestType === 'LEAVE' || i.requestType === 'REGULARIZATION'), [pendingItems]);
   const requestsByEmployee = useMemo(() => {
@@ -2092,12 +2204,29 @@ export default function MyTeamPage() {
           ) : notInYet.length === 0 ? (
             <div style={{ padding: '16px 18px', fontSize: 12.5, color: 'var(--txt-dim)' }}>Everyone has checked in.</div>
           ) : (
-            notInYet.map(r => (
-              <div key={r.dr.userId} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 18px', borderBottom: '1px solid var(--line)' }}>
-                <Avatar userId={r.dr.userId} name={r.dr.fullName} size={30} />
-                <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--txt)', flex: 1 }}>{r.dr.fullName}</span>
+            <>
+              {/* Capped height + scroll so a 100+-person team can't grow this card without
+                  bound or push neighboring cards around — see NotInYetListModal for the full,
+                  independently-scrollable list opened by "View employees" below. */}
+              <div style={{ maxHeight: 258, overflowY: 'auto' }}>
+                {notInYet.map(r => (
+                  <div
+                    key={r.dr.userId}
+                    title={r.dr.fullName}
+                    onClick={() => { const entry = directoryByEmployee.get(r.dr.userId); if (entry) setViewingEmployeeDetails(entry); }}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '11px 18px', borderBottom: '1px solid var(--line)', cursor: 'pointer' }}
+                  >
+                    <Avatar userId={r.dr.userId} name={r.dr.fullName} size={30} />
+                    <span style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--txt)', flex: 1 }}>{r.dr.fullName}</span>
+                  </div>
+                ))}
               </div>
-            ))
+              <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '10px 18px', borderTop: '1px solid var(--line)' }}>
+                <button onClick={() => setShowAllNotIn(true)} style={{ background: 'none', border: 'none', padding: 0, cursor: 'pointer', fontSize: 11.5, fontWeight: 600, color: 'var(--info)' }}>
+                  View employees
+                </button>
+              </div>
+            </>
           )}
         </div>
       </div>
@@ -2303,6 +2432,18 @@ export default function MyTeamPage() {
       </div>
 
       {viewing && <EmployeeDetailModal row={viewing} onClose={() => setViewing(null)} />}
+      {viewingEmployeeDetails && <EmployeeDetailsModal entry={viewingEmployeeDetails} onClose={() => setViewingEmployeeDetails(null)} />}
+      {showAllNotIn && (
+        <NotInYetListModal
+          people={notInYet.map(r => ({ userId: r.dr.userId, fullName: r.dr.fullName }))}
+          onSelect={userId => {
+            const entry = directoryByEmployee.get(userId);
+            if (entry) setViewingEmployeeDetails(entry);
+            setShowAllNotIn(false);
+          }}
+          onClose={() => setShowAllNotIn(false)}
+        />
+      )}
       </>)}
 
       {tab === 'effort' && <EffortTab token={token} />}
