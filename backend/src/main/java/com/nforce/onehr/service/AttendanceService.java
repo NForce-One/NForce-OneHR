@@ -228,16 +228,15 @@ public class AttendanceService {
                             .source("SYSTEM")
                             .build()));
         }
-        // Not filtered by status (PENDING/APPROVED/REJECTED all included) — a Web Clock-In
-        // session is real the moment it's submitted (see WebClockInService#submit's doc
-        // comment); HR review only sets a separate approval record, it isn't a gate on whether
-        // the session happened or how long it ran.
+        // Web Clock-In needs no approval at all (see WebClockInService's own class Javadoc) — the
+        // session is real, and shown here, the moment it's submitted.
         webClockInRequestRepository.findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(employeeId, workDate)
                 .forEach(req -> punches.add(PunchResponse.builder()
                         .id(req.getId())
                         .checkInAt(req.getRequestedCheckIn())
                         .checkOutAt(req.getCheckedOutAt())
                         .source("WEB_REMOTE")
+                        .note(req.getReason())
                         .build()));
         punches.sort(Comparator.comparing(PunchResponse::getCheckInAt));
         return punches;

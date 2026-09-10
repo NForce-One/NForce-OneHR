@@ -65,6 +65,7 @@ public class NotificationService {
         m.put("ACCOUNT",                          "MEDIUM");
         // LOW — purely informational
         m.put("SECURITY",                         "LOW");
+        m.put("WEB_CLOCK_IN_NOTICE",               "LOW");  // goes to manager: informational only, no action
         return java.util.Collections.unmodifiableMap(m);
     }
 

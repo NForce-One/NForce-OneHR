@@ -3,7 +3,6 @@ package com.nforce.onehr.repository;
 import com.nforce.onehr.entity.WebClockInRequest;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.time.LocalDate;
@@ -30,19 +29,12 @@ public interface WebClockInRequestRepository extends JpaRepository<WebClockInReq
     @Query("SELECT r.id FROM WebClockInRequest r WHERE r.employeeUserId IN :employeeUserIds")
     Set<UUID> findIdsByEmployeeUserIdIn(Collection<UUID> employeeUserIds);
 
-    // Backs WebClockInService#listPendingForApprover's company-wide (not manager-scoped) HR/
-    // Super Admin branch — joins User to exclude soft-deleted requesters' web clock-in requests.
-    @Query("SELECT r FROM WebClockInRequest r JOIN User u ON u.id = r.employeeUserId "
-         + "WHERE r.status = :status AND u.deletedAt IS NULL")
-    List<WebClockInRequest> findByStatus(@Param("status") String status);
-
     // Every Web Clock-In cycle for the day, oldest first — an employee can Web Clock-In and
     // Web Clock-Out more than once per day (see WebClockInService#submit), so this is a List,
-    // not a single Optional result. Backs AttendanceService#collectPunches's punch-history merge.
-    // Deliberately NOT filtered by status: the attendance effect (and the worked time it
-    // represents) is applied the moment the request is submitted, regardless of PENDING/
-    // APPROVED/REJECTED — HR review is a separate, parallel record, not a gate on whether the
-    // session happened or how long it ran. See WebClockInService's class Javadoc.
+    // not a single Optional result. Backs AttendanceService#collectPunches's punch-history merge,
+    // and WebClockInService#submit's own "is this the first cycle of the day" check (an empty
+    // list here is what gates the mandatory first-cycle note and the once-per-day manager
+    // notification — see its own Javadoc).
     List<WebClockInRequest> findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(
             UUID employeeUserId, LocalDate workDate);
 
@@ -52,12 +44,9 @@ public interface WebClockInRequestRepository extends JpaRepository<WebClockInReq
             Collection<UUID> employeeUserIds, LocalDate from, LocalDate to);
 
     // The employee's currently-open request (submitted but not yet checked out), if any —
-    // independent of calendar date AND of review status: whether HR has approved, rejected, or
-    // not yet looked at it, the employee must still be able to check out (or cancel) their own
-    // real, in-progress session — review status is never a gate on that. Independent of calendar
-    // date because a web clock-in from before midnight (shift crosses into the next day) is
-    // still filed under *yesterday's* work_date once the clock rolls over, so "today" is the
-    // wrong key to look it up by. See WebClockInService.checkOut/cancel.
+    // independent of calendar date, because a web clock-in from before midnight (shift crosses
+    // into the next day) is still filed under *yesterday's* work_date once the clock rolls over,
+    // so "today" is the wrong key to look it up by. See WebClockInService.checkOut/cancel.
     //
     // "findFirst...OrderBy..." (LIMIT 1), not a bare uniqueness-assuming lookup — same reasoning
     // as AttendanceRepository.findFirstByEmployeeUserIdAndCheckOutAtIsNullOrderByWorkDateDesc:

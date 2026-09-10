@@ -129,11 +129,11 @@ function WebClockInRow({ webToday, onSubmitted }: {
   const [showModal, setShowModal] = useState(false);
   const [checkingOut, setCheckingOut] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  // Web Clock Out / Resubmit / Web Clock In are mutually exclusive (see the three branches
-  // below) — never more than one of these text-links is mounted at once — so one shared hover
-  // flag is enough. Base color is high-contrast white (matches HeroCard's other high-emphasis
-  // text, e.g. the headline) since the previous var(--brand) red-on-near-black had poor
-  // contrast here (WCAG-failing); red is kept only as the hover accent, not the resting state.
+  // Web Clock Out / Web Clock In are mutually exclusive (see the two branches below) — never
+  // more than one of these text-links is mounted at once — so one shared hover flag is enough.
+  // Base color is high-contrast white (matches HeroCard's other high-emphasis text, e.g. the
+  // headline) since the previous var(--brand) red-on-near-black had poor contrast here
+  // (WCAG-failing); red is kept only as the hover accent, not the resting state.
   const [linkHovered, setLinkHovered] = useState(false);
   const actionLinkStyle: React.CSSProperties = {
     fontSize: 12, fontWeight: 600, color: linkHovered ? 'var(--brand)' : '#E8EAED',
@@ -141,21 +141,15 @@ function WebClockInRow({ webToday, onSubmitted }: {
     transition: 'color 120ms ease',
   };
 
-  // PENDING counts as "currently open" alongside APPROVED — the attendance effect is immediate
-  // regardless of HR review status (see WebClockInService.submit's doc comment).
+  // No approval/review status at all anymore (see WebClockInService's own class Javadoc) — the
+  // only thing that matters is whether the most recent cycle today is still open.
   const openWeb = useMemo(
-    () => webToday.find(r => (r.status === 'APPROVED' || r.status === 'PENDING') && !r.checkedOutAt) ?? null,
+    () => webToday.find(r => !r.checkedOutAt) ?? null,
     [webToday]);
-  const legacy = useMemo(
-    () => webToday.find(r => r.status === 'REJECTED' && !r.checkedOutAt) ?? null,
-    [webToday]);
-  // Most recent Web Clock-In of the day, regardless of status/checked-out — its reason is reused
-  // for every later cycle the same day/shift so the employee is only asked once (per requirement:
-  // "If Web Clock-In is performed again during the same day/shift, do not ask for the reason
-  // again"). `webToday` is already newest-first (see webClockInApi.mine), so [0] is the most
-  // recent cycle's reason. Null once a NEW calendar/shift day starts, since the parent's workDate
-  // filter no longer matches any of today's records.
-  const reusableReason = webToday[0]?.reason ?? null;
+  // Whether this employee has ANY Web Clock-In cycle on file today — the note is mandatory only
+  // for the very first cycle of the resolved work day (enforced server-side); every later cycle
+  // needs no note at all, so this click can skip the modal entirely and clock in immediately.
+  const isFirstCycleToday = webToday.length === 0;
 
   // Synchronous re-entrancy guards, checked/set BEFORE any state update — the `disabled`
   // attribute alone only blocks a real click once React has committed it, which isn't
@@ -188,14 +182,14 @@ function WebClockInRow({ webToday, onSubmitted }: {
     }
   }
 
-  // Reason already on file for today (a prior cycle this same day/shift) — skip the modal
-  // entirely and resubmit straight away, reusing it.
-  async function handleQuickWebClockIn(reason: string) {
+  // Not the first cycle of the day — no note required at all, so skip the modal entirely and
+  // clock in immediately.
+  async function handleQuickWebClockIn() {
     if (submittingRef.current) return;
     submittingRef.current = true;
     setSubmitting(true);
     try {
-      const resp = await webClockInApi.submit(reason, token);
+      const resp = await webClockInApi.submit(undefined, token);
       const at = formatClockTime(resp.requestedCheckIn);
       // Same ordering as handleCheckOut above — await the refetch before the finally block
       // re-enables the button, so it never shows the pre-submit label/state while clickable.
@@ -215,7 +209,6 @@ function WebClockInRow({ webToday, onSubmitted }: {
         <>
           <span style={{ fontSize: 12, color: 'var(--txt-dim)' }}>
             Web clocked in since {formatClockTime(openWeb.requestedCheckIn) ?? '—'}
-            {openWeb.status === 'PENDING' ? ' (awaiting HR approval)' : ''}
           </span>
           <button
             onClick={handleCheckOut}
@@ -228,22 +221,9 @@ function WebClockInRow({ webToday, onSubmitted }: {
           </button>
         </>
       )}
-      {!openWeb && legacy && (
-        <>
-          <span style={{ fontSize: 12, color: 'var(--risk)' }}>Web clock-in rejected{legacy.reviewComment ? `: ${legacy.reviewComment}` : '.'}</span>
-          <button
-            onClick={() => setShowModal(true)}
-            onMouseEnter={() => setLinkHovered(true)}
-            onMouseLeave={() => setLinkHovered(false)}
-            style={actionLinkStyle}
-          >
-            Resubmit →
-          </button>
-        </>
-      )}
-      {!openWeb && !legacy && (
+      {!openWeb && (
         <button
-          onClick={() => (reusableReason ? handleQuickWebClockIn(reusableReason) : setShowModal(true))}
+          onClick={() => (isFirstCycleToday ? setShowModal(true) : handleQuickWebClockIn())}
           disabled={submitting}
           onMouseEnter={() => setLinkHovered(true)}
           onMouseLeave={() => setLinkHovered(false)}
@@ -335,14 +315,11 @@ export function AttendanceHeroBanner() {
   }
 
   const record     = today?.record ?? null;
-  // sessionStartedAt (not checkInAt) — checkInAt is the day's *original* check-in, deliberately
-  // frozen across a same-day resume (see AttendanceRecord's own doc comment and
-  // AttendanceService.checkIn's "resume" branch), so it never reflects a later Check-In → Check-
-  // Out → Check-In again cycle. Every display below reads this one value, so it was showing the
-  // stale original time immediately after a resumed check-in (and after a refresh — this wasn't
-  // a caching bug, checkInAt genuinely never updates). sessionStartedAt updates on every check-in
-  // including a resume, so it's what "Checked in at" should actually show.
-  const checkInAt  = record?.sessionStartedAt ?? record?.checkInAt ?? null;
+  // checkInAt (not sessionStartedAt) — the day's original check-in, deliberately frozen across
+  // every resume regardless of source (see AttendanceService.checkIn's own doc comment), is
+  // exactly what "locked for the entire resolved work day" requires: Check In must always show
+  // the day's FIRST presence and must never be replaced by a later Check-In/Web Clock-In cycle.
+  const checkInAt  = record?.checkInAt ?? null;
   const checkOutAt = record?.checkOutAt ?? null;
 
   // The later of the normal Check-Out and the most recent closed Web Clock-Out today, whichever

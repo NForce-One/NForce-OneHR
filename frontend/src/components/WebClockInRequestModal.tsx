@@ -17,10 +17,12 @@ function formatClockTime(iso: string | null): string | null {
 
 /**
  * Web Clock-In Request (Keka reference): a comment explaining the remote check-in, Cancel and
- * Confirm. The attendance effect is immediate — worked time starts counting the moment this is
- * confirmed — but the request itself starts PENDING and is routed to HR/the employee's manager
- * for a real approve/reject decision, see WebClockInService.submit. Shared by DashboardPage and
- * AttendancePage's own Web Check-In action.
+ * Confirm. No approval needed at all — the attendance effect is immediate, worked time starts
+ * counting the moment this is confirmed, and the employee's Reporting Manager just gets an
+ * informational notification (see WebClockInService.submit). This modal is only ever shown for
+ * the FIRST Web Clock-In of the employee's resolved work day, where a note/reason is mandatory —
+ * every later cycle the same day skips this modal entirely (see the caller). Shared by
+ * DashboardPage and AttendancePage's own Web Check-In action.
  */
 export function WebClockInRequestModal({ onClose, onSubmitted }: { onClose: () => void; onSubmitted: (r: WebClockInRecord) => void }) {
   const token = useAuthStore(s => s.token) ?? '';

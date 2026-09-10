@@ -80,6 +80,8 @@ export interface Punch {
   checkOutAt: string | null;
   /** "SYSTEM" (normal Check-In/Check-Out) or "WEB_REMOTE" (Web Check-In/Check-Out). */
   source: 'SYSTEM' | 'WEB_REMOTE';
+  /** The Web Clock-In note, if one was provided — always null for a "SYSTEM" source punch. */
+  note: string | null;
 }
 
 export interface TodayAttendance {

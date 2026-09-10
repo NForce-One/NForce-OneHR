@@ -19,37 +19,21 @@ public class WebClockInRequest {
     @Column(name = "employee_user_id", nullable = false)
     private UUID employeeUserId;
 
-    // Resolved once at submission time, same as RegularizationRequest: the employee's
-    // current manager via EmployeeManagerHistory, else NULL (HR/Super Admin have blanket
-    // override visibility regardless — see WebClockInService.listPendingForApprover).
-    @Column(name = "assigned_approver_id")
-    private UUID assignedApproverId;
-
     @Column(name = "work_date", nullable = false)
     private LocalDate workDate;
 
     @Column(name = "requested_check_in", nullable = false)
     private LocalDateTime requestedCheckIn;
 
-    @Column(nullable = false, columnDefinition = "TEXT")
+    // Mandatory on the first Web Clock-In cycle of an employee's resolved work day, optional on
+    // every later cycle that same day — enforced in WebClockInService#submit, not a column
+    // constraint (see its own Javadoc). Purely an informational attendance note now, no approval
+    // attached to it.
+    @Column(columnDefinition = "TEXT")
     private String reason;
 
-    @Column(nullable = false)
-    @Builder.Default
-    private String status = "PENDING";
-
-    // Set via the no-approval-needed "Web Clock Out" action, only once approved.
     @Column(name = "checked_out_at")
     private LocalDateTime checkedOutAt;
-
-    @Column(name = "reviewed_by")
-    private UUID reviewedBy;
-
-    @Column(name = "reviewed_at")
-    private LocalDateTime reviewedAt;
-
-    @Column(name = "review_comment", columnDefinition = "TEXT")
-    private String reviewComment;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
