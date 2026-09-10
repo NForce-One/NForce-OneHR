@@ -23,9 +23,14 @@ public class Attendance {
     @Column(name = "work_date", nullable = false)
     private LocalDate workDate;
 
+    // WallClockDateTimeConverter — see its own Javadoc: without it, this naive-wall-clock value
+    // (the employee's actual local check-in time, no zone attached) reads back corrupted by the
+    // reading JVM's own default timezone offset whenever that JVM's default isn't UTC.
+    @Convert(converter = WallClockDateTimeConverter.class)
     @Column(name = "check_in_at", nullable = false)
     private LocalDateTime checkInAt;
 
+    @Convert(converter = WallClockDateTimeConverter.class)
     @Column(name = "check_out_at")
     private LocalDateTime checkOutAt;
 
@@ -35,6 +40,7 @@ public class Attendance {
     // When the currently-open session began — only meaningful while checkOutAt is null.
     // Lets a later session in the same day (e.g. after a lunch break) compute its own
     // duration without disturbing checkInAt, which stays the day's first check-in.
+    @Convert(converter = WallClockDateTimeConverter.class)
     @Column(name = "session_started_at")
     private LocalDateTime sessionStartedAt;
 
@@ -74,6 +80,10 @@ public class Attendance {
     @Column(name = "shift_id")
     private UUID shiftId;
 
+    // Deliberately NOT WallClockDateTimeConverter — these are plain JVM/DB bookkeeping instants
+    // (LocalDateTime.now(), no explicit business zone — see onCreate/onUpdate below), never
+    // exposed via any API response and never read by any lateness/business computation, unlike
+    // checkInAt/checkOutAt/sessionStartedAt's employee-facing wall-clock contract above.
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 

@@ -3,6 +3,7 @@ package com.nforce.onehr.entity;
 import jakarta.persistence.*;
 import lombok.*;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
@@ -44,6 +45,19 @@ public class Location {
      */
     @Column(length = 50, nullable = false)
     private String timezone;
+
+    // A queued future timezone change (ONEHR-336 follow-up) — set together, cleared together.
+    // Never read directly for attendance resolution: AttendanceRulesService#resolveEmployeeZoneId
+    // is the only reader, and it resolves this pair by date on demand (no promotion/sync job —
+    // correctness never depends on one having run). At most one pending change per Location,
+    // exactly like ShiftVersion's own "at most one pending version" rule — OrgService#updateLocation
+    // replaces it (never stacks) on a re-edit, and clears it outright if the resubmitted timezone
+    // matches the current live one (a deliberate "cancel the pending change" action).
+    @Column(name = "pending_timezone", length = 50)
+    private String pendingTimezone;
+
+    @Column(name = "pending_timezone_effective_from")
+    private LocalDate pendingTimezoneEffectiveFrom;
 
     @Column(name = "is_active", nullable = false)
     @Builder.Default

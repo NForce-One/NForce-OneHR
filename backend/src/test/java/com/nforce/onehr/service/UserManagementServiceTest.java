@@ -190,22 +190,52 @@ class UserManagementServiceTest {
         assertForcedLogout(req);
     }
 
+    // TEMPORARY (ONEHR-336 follow-up): Shift and Location reassignment via Employee update is
+    // disabled for now — see UserManagementService.updateUser's own guard comment for why
+    // (pending a proper reassignment flow that correctly effective-dates attendance-relevant
+    // history). Employee CREATION (createUser) is unaffected by this restriction — see the
+    // CreateUser nested test class below, whose shift/location assignment tests are untouched.
+
     @Test
-    void updateUser_locationChange_forcesLogout() {
+    void updateUser_locationChange_isRejected() {
         UpdateUserRequest req = new UpdateUserRequest();
         req.setLocationId(newLocationId);
 
-        assertForcedLogout(req);
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> userManagementService.updateUser(targetUserId, req, actorEmail));
+
+        assertTrue(ex.getMessage().contains("Location"));
+        assertEquals(currentLocation, targetEmployee.getLocation());
+        verify(userRepository, never()).save(any());
+        verifyNoInteractions(forceLogoutBroadcaster);
     }
 
     @Test
-    void updateUser_shiftChange_forcesLogout() {
+    void updateUser_unchangedLocation_isStillAllowed_doesNotThrowOrForceLogout() {
+        // Resubmitting the SAME location already on the employee (e.g. an edit form that always
+        // sends the current value) must keep working — only a genuine change is rejected.
+        UpdateUserRequest req = new UpdateUserRequest();
+        req.setLocationId(currentLocationId);
+
+        userManagementService.updateUser(targetUserId, req, actorEmail);
+
+        assertEquals(currentLocation, targetEmployee.getLocation());
+        assertEquals(3, targetUser.getTokenVersion());
+        verifyNoInteractions(forceLogoutBroadcaster);
+    }
+
+    @Test
+    void updateUser_shiftChange_isRejected() {
         UpdateUserRequest req = new UpdateUserRequest();
         req.setShiftId(activeShiftId);
 
-        assertForcedLogout(req);
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> userManagementService.updateUser(targetUserId, req, actorEmail));
 
-        assertEquals(activeShift, targetEmployee.getShift());
+        assertTrue(ex.getMessage().contains("Shift"));
+        assertNull(targetEmployee.getShift());
+        verify(userRepository, never()).save(any());
+        verifyNoInteractions(forceLogoutBroadcaster);
     }
 
     // Employee no longer carries a timezone field at all — the finalized Location/Timezone model
@@ -214,10 +244,11 @@ class UserManagementServiceTest {
     // See LocationValidationTest for the create/update rejection of an invalid/inactive/
     // timezone-less Location, and AttendanceRulesServiceTest for the resolution chain itself.
 
-    // Inactive shifts must not be assignable — see UserManagementService.updateUser's own
-    // shift-change branch. Only guarded on an actual change (the employee had no shift before),
-    // so this also implicitly covers "assigning a genuinely new shift" rather than "re-saving an
-    // already-inactive existing assignment untouched" (see the next test for that case).
+    // The temporary blanket restriction above rejects EVERY actual shift change, including one
+    // that targets an inactive shift — the active/inactive distinction this test originally
+    // exercised is now moot (unreachable: the restriction throws before any active/inactive check
+    // would even run), but the outcome (throws, no modification, no force logout) is unchanged, so
+    // this is kept as regression coverage for that outcome specifically.
     @Test
     void updateUser_changingToInactiveShift_throwsAndDoesNotModifyEmployeeOrForceLogout() {
         UpdateUserRequest req = new UpdateUserRequest();

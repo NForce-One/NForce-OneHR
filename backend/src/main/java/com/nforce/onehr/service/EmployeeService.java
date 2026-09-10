@@ -221,12 +221,17 @@ public class EmployeeService {
             }
         }
         if (req.getLocationId() != null) {
-            Location newLocation = locationRepository.findById(req.getLocationId())
-                    .orElseThrow(() -> new IllegalArgumentException("Selected location was not found."));
+            // TEMPORARY (ONEHR-336 follow-up): see UserManagementService#updateUser's identical
+            // guard — Location reassignment via Employee update is disabled for now, pending a
+            // proper reassignment flow that correctly effective-dates attendance-relevant history
+            // instead of silently changing an employee's current config out from under in-flight/
+            // historical Attendance. Only a genuine CHANGE is rejected — resubmitting the SAME
+            // location already on the employee is unaffected. Employee CREATION (createEmployee
+            // above) is unaffected.
             UUID currentLocationId = emp.getLocation() != null ? emp.getLocation().getId() : null;
-            if (!Objects.equals(currentLocationId, newLocation.getId())) {
-                validateAssignableLocation(newLocation);
-                emp.setLocation(newLocation);
+            if (!Objects.equals(currentLocationId, req.getLocationId())) {
+                throw new IllegalArgumentException(
+                        "Location changes are currently unavailable when updating an employee. Contact an administrator.");
             }
         }
 

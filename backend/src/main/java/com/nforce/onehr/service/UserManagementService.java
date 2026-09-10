@@ -284,31 +284,28 @@ public class UserManagementService {
             }
         }
         if (req.getLocationId() != null) {
-            Location newLocation = locationRepository.findById(req.getLocationId())
-                    .orElseThrow(() -> new IllegalArgumentException("Selected location was not found."));
+            // TEMPORARY (ONEHR-336 follow-up): Location reassignment via Employee update is
+            // disabled for now — pending a proper reassignment flow that correctly effective-dates
+            // attendance-relevant history (see ShiftVersion's own versioning design, which Location
+            // has no equivalent of yet) instead of silently changing an employee's current
+            // config out from under in-flight/historical Attendance. Only a genuine CHANGE is
+            // rejected — resubmitting the SAME location already on the employee (e.g. an edit form
+            // that always sends the current value) is unaffected, exactly like the change-detection
+            // every other field here uses. Employee CREATION (createUser above) is unaffected.
             UUID currentLocationId = emp.getLocation() != null ? emp.getLocation().getId() : null;
-            if (!Objects.equals(currentLocationId, newLocation.getId())) {
-                validateAssignableLocation(newLocation);
-                emp.setLocation(newLocation);
-                forceLogoutRequired = true;
+            if (!Objects.equals(currentLocationId, req.getLocationId())) {
+                throw new IllegalArgumentException(
+                        "Location changes are currently unavailable when updating an employee. Contact an administrator.");
             }
         }
         if (req.getShiftId() != null) {
-            // A bogus/stale shift id must never silently clear the employee's assignment to null
-            // — every employee having a real assigned Shift is a hard invariant now (see
-            // createUser's identical fix and ShiftDayPolicy, which throws for a null-shift
-            // employee everywhere).
-            Shift newShift = shiftRepository.findById(req.getShiftId())
-                    .orElseThrow(() -> new IllegalArgumentException("Shift not found"));
+            // TEMPORARY (ONEHR-336 follow-up): see the identical Location guard above — same
+            // reasoning, applied to Shift reassignment. Employee CREATION (createUser above) is
+            // unaffected.
             UUID currentShiftId = emp.getShift() != null ? emp.getShift().getId() : null;
-            if (!Objects.equals(currentShiftId, newShift.getId())) {
-                // Only guarded on an actual change — re-saving an employee whose existing
-                // assignment already points at a since-deactivated shift (shiftId unchanged)
-                // must keep working untouched, not get blocked by this check.
-                if (!newShift.isActive())
-                    throw new IllegalArgumentException("This shift is inactive and cannot be assigned. Choose an active shift.");
-                emp.setShift(newShift);
-                forceLogoutRequired = true;
+            if (!Objects.equals(currentShiftId, req.getShiftId())) {
+                throw new IllegalArgumentException(
+                        "Shift changes are currently unavailable when updating an employee. Contact an administrator.");
             }
         }
 

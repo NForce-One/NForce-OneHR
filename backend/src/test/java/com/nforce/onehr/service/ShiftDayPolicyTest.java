@@ -1,6 +1,7 @@
 package com.nforce.onehr.service;
 
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.entity.ShiftWeeklyOffRules;
@@ -50,18 +51,54 @@ class ShiftDayPolicyTest {
                 ShiftWeeklyOffRules.builder().maximumShiftDayDurationHours(BigDecimal.valueOf(18)).build()));
         // A minimal, real (not mocked) resolver — the "latest effectiveFrom <= day" query implemented
         // in-memory against whatever versions withShift/withVersions registered, exactly mirroring
-        // ShiftVersionRepository's own query semantics.
+        // ShiftVersionRepository's own query semantics. resolveIfPresent is the actual override
+        // point (matching the real class, resolve() now delegates to it) so ShiftDayPolicy's own
+        // "did the Shift already exist as of yesterday" pre-check is exercised for real too, not
+        // against the real class's null-repository field.
         ShiftVersionResolver resolver = new ShiftVersionResolver(null) {
             @Override
-            public ShiftVersion resolve(Shift shift, LocalDate workDate) {
+            public Optional<ShiftVersion> resolveIfPresent(Shift shift, LocalDate workDate) {
                 return allVersions.stream()
                         .filter(v -> v.getShift().getId().equals(shift.getId()))
                         .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
-                        .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                        .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom));
+            }
+
+            @Override
+            public ShiftVersion resolve(Shift shift, LocalDate workDate) {
+                return resolveIfPresent(shift, workDate)
                         .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
             }
         };
-        policy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), resolver);
+        policy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), resolver, employeeShiftAssignmentResolver);
+    }
+
+    // A minimal, real (not mocked) assignment resolver — mirrors the ShiftVersionResolver fake
+    // above one layer up: an in-memory "latest effectiveFrom <= day" lookup against whatever
+    // withAssignment registered, exercising ShiftDayPolicy's new day-aware UUID-taking overloads
+    // for real rather than asserting whatever a mock was told to say.
+    private final List<EmployeeShiftAssignment> allAssignments = new ArrayList<>();
+    private final EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver = new EmployeeShiftAssignmentResolver(null) {
+        @Override
+        public Optional<EmployeeShiftAssignment> resolveIfPresent(UUID employeeUserId, LocalDate workDate) {
+            return allAssignments.stream()
+                    .filter(a -> a.getEmployeeUserId().equals(employeeUserId))
+                    .filter(a -> !a.getEffectiveFrom().isAfter(workDate))
+                    .max(java.util.Comparator.comparing(EmployeeShiftAssignment::getEffectiveFrom));
+        }
+
+        @Override
+        public EmployeeShiftAssignment resolve(UUID employeeUserId, LocalDate workDate) {
+            return resolveIfPresent(employeeUserId, workDate)
+                    .orElseThrow(() -> new IllegalStateException("no assignment effective on or before " + workDate));
+        }
+    };
+
+    /** Registers a Shift Assignment for a brand-new random employee, effective from {@code effectiveFrom}. Returns the employee's id (the day-aware overloads take a UUID, not an Employee). */
+    private UUID withAssignment(Shift shift, LocalDate effectiveFrom) {
+        UUID employeeUserId = UUID.randomUUID();
+        allAssignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeUserId).shift(shift).effectiveFrom(effectiveFrom).build());
+        return employeeUserId;
     }
 
     /** A single-version shift, effective from the dawn of time (LocalDate.MIN) — the common case for tests that never touch versioning directly. */
@@ -76,6 +113,20 @@ class ShiftDayPolicyTest {
         Shift shift = Shift.builder().id(UUID.randomUUID()).name("Test Shift").build();
         allVersions.add(ShiftVersion.builder().shift(shift).startTime(oldStart).endTime(oldEnd).effectiveFrom(LocalDate.MIN).build());
         allVersions.add(ShiftVersion.builder().shift(shift).startTime(newStart).endTime(newEnd).effectiveFrom(newEffectiveFrom).build());
+        return Employee.builder().userId(UUID.randomUUID()).fullName("Test Employee").shift(shift).build();
+    }
+
+    /**
+     * A shift with exactly ONE version, effective from {@code effectiveFrom} itself — no version
+     * at all before it. Mirrors {@code OrgService#createShift}'s real behavior (its first version
+     * is effective {@code LocalDate.now()}, never any earlier date) — used to reproduce the
+     * ONEHR-336 follow-up bug: a Shift created (and assigned) TODAY has no version covering
+     * yesterday, unlike every {@code withShift}/{@code withVersions} fixture above (which starts
+     * at {@code LocalDate.MIN}, always covering "yesterday" implicitly).
+     */
+    private Employee withBrandNewShift(LocalTime start, LocalTime end, LocalDate effectiveFrom) {
+        Shift shift = Shift.builder().id(UUID.randomUUID()).name("test").build();
+        allVersions.add(ShiftVersion.builder().shift(shift).startTime(start).endTime(end).effectiveFrom(effectiveFrom).build());
         return Employee.builder().userId(UUID.randomUUID()).fullName("Test Employee").shift(shift).build();
     }
 
@@ -277,7 +328,7 @@ class ShiftDayPolicyTest {
 
     @Test
     void workdayStartAt_noShiftEmployee_throws() {
-        assertThrows(IllegalStateException.class, () -> policy.workdayStartAt(null, day));
+        assertThrows(IllegalStateException.class, () -> policy.workdayStartAt((Employee) null, day));
     }
 
     @Test
@@ -298,7 +349,7 @@ class ShiftDayPolicyTest {
     @Test
     void shiftDayOf_noShiftEmployee_throwsRatherThanFallingBackToAnyFixedClockTime() {
         LocalDateTime anyTimestamp = LocalDateTime.of(day.plusDays(1), LocalTime.of(6, 59));
-        assertThrows(IllegalStateException.class, () -> policy.shiftDayOf(null, anyTimestamp));
+        assertThrows(IllegalStateException.class, () -> policy.shiftDayOf((Employee) null, anyTimestamp));
     }
 
     @Test
@@ -351,6 +402,140 @@ class ShiftDayPolicyTest {
      * @Transactional) — asserted here by simply calling every method twice and getting identical,
      * side-effect-free results.
      */
+    // ── Brand-new Shift (ONEHR-336 follow-up): no version before its own creation date ───────
+    // Reproduces the reported bug: a Shift created TODAY (effective only from today onward, no
+    // version at all before it — see withBrandNewShift) assigned to an employee whose onboarding
+    // date predates the Shift's own creation. A fresh check-in must never fail merely because
+    // "yesterday" (before the Shift ever existed) has no version to resolve — see ShiftDayPolicy's
+    // own Javadoc, "Brand-new Shift case".
+
+    @Test
+    void shiftDayOf_brandNewShift_earlyPunchBeforeTodaysOwnStart_stillResolvesToToday() {
+        // The exact failure mode reported: Shift "test" created (and assigned) today, employee
+        // checks in before today's own shift start. Rule 1 fails (timestamp < today's start), so
+        // Rule 2 would previously try to resolve yesterday's boundary and throw
+        // IllegalStateException("... has no version effective on or before <yesterday> ...") since
+        // no version covers a date before the Shift's own creation.
+        Employee employee = withBrandNewShift(LocalTime.of(9, 0), LocalTime.of(18, 0), day);
+        assertEquals(day, policy.shiftDayOf(employee, LocalDateTime.of(day, LocalTime.of(7, 0))),
+                "an early punch on a brand-new Shift's own first day must resolve to today, not throw for a nonexistent yesterday");
+    }
+
+    @Test
+    void shiftDayOf_brandNewShift_punchAfterTodaysOwnStart_resolvesToTodayViaRuleOne() {
+        // Never even reaches Rule 2 (today's own start already covers it) — included as the
+        // unaffected counterpart to the early-punch case above.
+        Employee employee = withBrandNewShift(LocalTime.of(9, 0), LocalTime.of(18, 0), day);
+        assertEquals(day, policy.shiftDayOf(employee, LocalDateTime.of(day, LocalTime.of(9, 0))));
+    }
+
+    @Test
+    void workdayStartAt_brandNewShift_hasNoEarlierBoundary_startsAtItsOwnShiftStart() {
+        // workdayStartAt(day) normally equals the PREVIOUS day's maximumAttendanceBoundary (see
+        // workdayStartAt_equalsThePreviousDaysOwnWorkdayEnd_forAStableShift above) — but a
+        // brand-new Shift has no version for the previous day at all, so there is no earlier
+        // boundary to roll over from; the workday can only start at the Shift's own first start.
+        Employee employee = withBrandNewShift(LocalTime.of(9, 0), LocalTime.of(18, 0), day);
+        assertEquals(LocalDateTime.of(day, LocalTime.of(9, 0)), policy.workdayStartAt(employee, day));
+    }
+
+    @Test
+    void resolveShiftStart_dateBeforeABrandNewShiftExisted_stillThrows_invariantNotWeakened() {
+        // The underlying "every applicable work date must resolve a version" invariant
+        // (ShiftVersionResolver#resolve) is untouched by the fix above — only shiftDayOf's/
+        // workdayStartAt's own "did the Shift already exist as of yesterday" pre-check treats that
+        // absence as expected; a caller asking to resolve an actually-applicable date must still
+        // throw exactly as before.
+        Employee employee = withBrandNewShift(LocalTime.of(9, 0), LocalTime.of(18, 0), day);
+        assertThrows(IllegalStateException.class, () -> policy.resolveShiftStart(employee, day.minusDays(1)));
+    }
+
+    @Test
+    void shiftDayOf_dayAfterABrandNewShiftWasCreated_ordinaryOvernightRolloverStillWorks() {
+        // One day further out: Rule 2's boundary for the shift's OWN creation day (not before it)
+        // does exist, so an ordinary overnight rollover into the day after next is unaffected —
+        // confirms the fix is scoped to the exact "no version at all yet" case, not a blanket
+        // skip of Rule 2.
+        LocalDate createdOn = day;
+        Employee employee = withBrandNewShift(LocalTime.of(15, 30), LocalTime.of(0, 30), createdOn);
+        LocalDate dayAfter = createdOn.plusDays(1);
+        assertEquals(createdOn, policy.shiftDayOf(employee, LocalDateTime.of(dayAfter, LocalTime.of(0, 20))),
+                "a post-midnight punch still rolls back to the shift's own creation day, exactly like an ordinary overnight shift");
+    }
+
+    // ── Day-aware UUID-taking overloads (EmployeeShiftAssignment effective-dating) ───────────
+
+    /**
+     * The exact walkthrough from the design gate: yesterday's ASSIGNMENT (not just Version) is a
+     * completely different Shift entity than today's — Shift A (22:00-06:00 overnight, 18h max)
+     * yesterday, reassigned to Shift B (09:00-18:00) effective today. A 05:00 check-in today fails
+     * Rule 1 under B (05:00 < 09:00), so Rule 2 must resolve YESTERDAY's own boundary under A —
+     * 22:00 + 18h = 16:00 the next day (today) — 05:00 is within it, so this is still yesterday's
+     * overtime tail, not a fresh start of today. Reusing B (resolved once for "today") instead
+     * would compute a materially different, wrong boundary (09:00 + 18h = 03:00 today), flipping
+     * the attribution — proving Rule 1 and Rule 2 must resolve their own day independently.
+     */
+    @Test
+    void shiftDayOf_uuidOverload_assignmentBoundaryCrossing_rule2ResolvesYesterdaysOwnShift() {
+        Shift shiftA = Shift.builder().id(UUID.randomUUID()).name("A-Overnight").build();
+        allVersions.add(ShiftVersion.builder().shift(shiftA).startTime(LocalTime.of(22, 0)).endTime(LocalTime.of(6, 0)).effectiveFrom(LocalDate.MIN).build());
+        Shift shiftB = Shift.builder().id(UUID.randomUUID()).name("B-Morning").build();
+        allVersions.add(ShiftVersion.builder().shift(shiftB).startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).effectiveFrom(LocalDate.MIN).build());
+
+        UUID employeeUserId = UUID.randomUUID();
+        allAssignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeUserId).shift(shiftA).effectiveFrom(LocalDate.MIN).build());
+        allAssignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeUserId).shift(shiftB).effectiveFrom(day).build());
+
+        LocalDateTime earlyPunchToday = LocalDateTime.of(day, LocalTime.of(5, 0));
+        assertEquals(day.minusDays(1), policy.shiftDayOf(employeeUserId, earlyPunchToday),
+                "still yesterday's overtime tail under Shift A — Rule 2 must not reuse Shift B (today's assignment)");
+    }
+
+    /** The mirror, unaffected-by-the-fix case: a punch AFTER today's own (new-assignment) start never even reaches Rule 2. */
+    @Test
+    void shiftDayOf_uuidOverload_assignmentBoundaryCrossing_onTimeArrivalUnderNewAssignmentBelongsToToday() {
+        Shift shiftA = Shift.builder().id(UUID.randomUUID()).name("A-Overnight").build();
+        allVersions.add(ShiftVersion.builder().shift(shiftA).startTime(LocalTime.of(22, 0)).endTime(LocalTime.of(6, 0)).effectiveFrom(LocalDate.MIN).build());
+        Shift shiftB = Shift.builder().id(UUID.randomUUID()).name("B-Morning").build();
+        allVersions.add(ShiftVersion.builder().shift(shiftB).startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).effectiveFrom(LocalDate.MIN).build());
+
+        UUID employeeUserId = UUID.randomUUID();
+        allAssignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeUserId).shift(shiftA).effectiveFrom(LocalDate.MIN).build());
+        allAssignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeUserId).shift(shiftB).effectiveFrom(day).build());
+
+        assertEquals(day, policy.shiftDayOf(employeeUserId, LocalDateTime.of(day, LocalTime.of(9, 0))));
+    }
+
+    /** Mirrors the brand-new-Shift ShiftVersion fix, one layer up: a brand-new employee/assignment's early punch on its own first day must resolve to today, not throw for a nonexistent yesterday. */
+    @Test
+    void shiftDayOf_uuidOverload_brandNewAssignment_earlyPunchBeforeTodaysStart_stillResolvesToToday() {
+        UUID employeeUserId = withAssignment(withShift(LocalTime.of(9, 0), LocalTime.of(18, 0)).getShift(), day);
+        assertEquals(day, policy.shiftDayOf(employeeUserId, LocalDateTime.of(day, LocalTime.of(7, 0))));
+    }
+
+    /** workdayStartAt(UUID, ...) needs the identical per-day resolution — same walkthrough as shiftDayOf above. */
+    @Test
+    void workdayStartAt_uuidOverload_assignmentBoundaryCrossing_resolvesYesterdaysOwnShift() {
+        Shift shiftA = Shift.builder().id(UUID.randomUUID()).name("A-Overnight").build();
+        allVersions.add(ShiftVersion.builder().shift(shiftA).startTime(LocalTime.of(22, 0)).endTime(LocalTime.of(6, 0)).effectiveFrom(LocalDate.MIN).build());
+        Shift shiftB = Shift.builder().id(UUID.randomUUID()).name("B-Morning").build();
+        allVersions.add(ShiftVersion.builder().shift(shiftB).startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).effectiveFrom(LocalDate.MIN).build());
+
+        UUID employeeUserId = UUID.randomUUID();
+        allAssignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeUserId).shift(shiftA).effectiveFrom(LocalDate.MIN).build());
+        allAssignments.add(EmployeeShiftAssignment.builder().employeeUserId(employeeUserId).shift(shiftB).effectiveFrom(day).build());
+
+        // Yesterday's own boundary under Shift A: 22:00 + 18h = 16:00 the next day (today).
+        assertEquals(LocalDateTime.of(day, LocalTime.of(16, 0)), policy.workdayStartAt(employeeUserId, day));
+    }
+
+    /** Mirrors workdayStartAt(Employee, ...)'s identical brand-new-shift fallback, one layer up. */
+    @Test
+    void workdayStartAt_uuidOverload_brandNewAssignment_hasNoEarlierBoundary_startsAtItsOwnShiftStart() {
+        UUID employeeUserId = withAssignment(withShift(LocalTime.of(9, 0), LocalTime.of(18, 0)).getShift(), day);
+        assertEquals(LocalDateTime.of(day, LocalTime.of(9, 0)), policy.workdayStartAt(employeeUserId, day));
+    }
+
     @Test
     void everyMethod_isPureAndSideEffectFree_callingTwiceGivesIdenticalResults() {
         Employee employee = withShift(LocalTime.of(15, 30), LocalTime.of(0, 30));

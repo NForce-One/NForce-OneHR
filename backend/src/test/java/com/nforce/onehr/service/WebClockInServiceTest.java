@@ -3,6 +3,7 @@ package com.nforce.onehr.service;
 import com.nforce.onehr.dto.attendance.CreateWebClockInRequest;
 import com.nforce.onehr.dto.attendance.WebClockInResponse;
 import com.nforce.onehr.entity.Attendance;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.Role;
 import com.nforce.onehr.entity.User;
 import com.nforce.onehr.entity.WebClockInRequest;
@@ -66,6 +67,11 @@ class WebClockInServiceTest {
     // AttendanceInterpretationService.interpretExistingSession now requires for any "existing
     // record" test scenario to resolve as RESOLVED rather than LEGACY_UNRESOLVED.
     private com.nforce.onehr.entity.Shift defaultShift;
+    // Backs the fake EmployeeShiftAssignmentResolver below — the shared test employee's "as of
+    // right now" assignment for submit()'s interpretFreshAction call. A test that swaps in a
+    // different Shift for a fresh submit() must update this alongside the Employee fixture's own
+    // .shift(...).
+    private com.nforce.onehr.entity.Shift currentEmployeeShift;
 
     private final UUID employeeId = UUID.randomUUID();
     private final UUID hrAdminId = UUID.randomUUID();
@@ -75,11 +81,15 @@ class WebClockInServiceTest {
     private final List<com.nforce.onehr.entity.ShiftVersion> shiftVersions = new java.util.ArrayList<>();
     private final ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
         @Override
-        public com.nforce.onehr.entity.ShiftVersion resolve(com.nforce.onehr.entity.Shift s, LocalDate workDate) {
+        public Optional<com.nforce.onehr.entity.ShiftVersion> resolveIfPresent(com.nforce.onehr.entity.Shift s, LocalDate workDate) {
             return shiftVersions.stream()
                     .filter(v -> v.getShift().getId().equals(s.getId()))
                     .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
-                    .max(java.util.Comparator.comparing(com.nforce.onehr.entity.ShiftVersion::getEffectiveFrom))
+                    .max(java.util.Comparator.comparing(com.nforce.onehr.entity.ShiftVersion::getEffectiveFrom));
+        }
+        @Override
+        public com.nforce.onehr.entity.ShiftVersion resolve(com.nforce.onehr.entity.Shift s, LocalDate workDate) {
+            return resolveIfPresent(s, workDate)
                     .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
         }
     };
@@ -117,7 +127,20 @@ class WebClockInServiceTest {
         lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
                 com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
                         .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver = new EmployeeShiftAssignmentResolver(null) {
+            @Override
+            public Optional<EmployeeShiftAssignment> resolveIfPresent(UUID employeeUserId, LocalDate workDate) {
+                return currentEmployeeShift == null ? Optional.empty()
+                        : Optional.of(EmployeeShiftAssignment.builder()
+                                .employeeUserId(employeeUserId).shift(currentEmployeeShift).effectiveFrom(LocalDate.MIN).build());
+            }
+            @Override
+            public EmployeeShiftAssignment resolve(UUID employeeUserId, LocalDate workDate) {
+                return resolveIfPresent(employeeUserId, workDate)
+                        .orElseThrow(() -> new IllegalStateException("no assignment effective on or before " + workDate));
+            }
+        };
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver, employeeShiftAssignmentResolver);
         // Matches app.attendance.half-day-max-hours' old YAML default (3.5) — see
         // AttendanceRulesService's own Javadoc for why this moved off AttendanceProperties.
         lenient().when(attendanceRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
@@ -134,11 +157,12 @@ class WebClockInServiceTest {
                     .filter(s -> s.getId().equals(id)).findFirst();
         });
         AttendanceInterpretationService attendanceInterpretationService =
-                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository, employeeShiftAssignmentResolver);
         service = new WebClockInService(webClockInRepository, attendanceRepository, attendancePunchRepository,
                 historyRepository, userRepository, employeeRepository, auditService, auditSnapshot,
                 latePenaltyService, notificationService, attendanceService, attendanceRulesService,
                 attendanceInterpretationService);
+        currentEmployeeShift = defaultShift;
         lenient().when(attendanceRepository.findByEmployeeUserIdAndWorkDate(any(), any())).thenReturn(Optional.empty());
         lenient().when(attendanceRepository.save(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
         lenient().when(attendanceRepository.saveAndFlush(any(Attendance.class))).thenAnswer(inv -> inv.getArgument(0));
@@ -581,6 +605,7 @@ class WebClockInServiceTest {
         com.nforce.onehr.entity.Employee employee = com.nforce.onehr.entity.Employee.builder()
                 .userId(employeeId).employeeCode("E1").fullName("Test Employee").shift(overnightShift).location(location).build();
         when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee));
+        currentEmployeeShift = overnightShift;
 
         CreateWebClockInRequest req = CreateWebClockInRequest.builder().reason("Late remote start").timezone(null).build();
 
@@ -614,6 +639,7 @@ class WebClockInServiceTest {
         com.nforce.onehr.entity.Employee employee = com.nforce.onehr.entity.Employee.builder()
                 .userId(employeeId).employeeCode("E1").fullName("Test Employee").shift(dayShift).location(location).build();
         when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee));
+        currentEmployeeShift = dayShift;
         lenient().when(userRepository.findByEmail(employeeEmail)).thenReturn(Optional.of(employeeUser(employeeEmail)));
     }
 

@@ -5,11 +5,13 @@ import com.nforce.onehr.dto.assignments.AssignmentBulkResultResponse;
 import com.nforce.onehr.dto.penalization.BulkAllocationRequest;
 import com.nforce.onehr.dto.assignments.EmployeeAssignmentRow;
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.PenalisationPolicy;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.User;
 import com.nforce.onehr.repository.EmployeeManagerHistoryRepository;
 import com.nforce.onehr.repository.EmployeeRepository;
+import com.nforce.onehr.repository.EmployeeShiftAssignmentRepository;
 import com.nforce.onehr.repository.PenalisationPolicyRepository;
 import com.nforce.onehr.repository.ShiftRepository;
 import com.nforce.onehr.repository.WeeklyOffPolicyRepository;
@@ -41,6 +43,7 @@ class EmployeeAssignmentServiceTest {
     @Mock private EmployeeRepository employeeRepository;
     @Mock private EmployeeManagerHistoryRepository managerHistoryRepository;
     @Mock private ShiftRepository shiftRepository;
+    @Mock private EmployeeShiftAssignmentRepository employeeShiftAssignmentRepository;
     @Mock private WeeklyOffPolicyRepository weeklyOffPolicyRepository;
     @Mock private PenalisationPolicyRepository penalisationPolicyRepository;
     @Mock private AuditService auditService;
@@ -63,47 +66,98 @@ class EmployeeAssignmentServiceTest {
         lenient().when(managerHistoryRepository.findCurrentDirectReportIds(managerId)).thenReturn(List.of(directReportId));
     }
 
+    private final LocalDate tomorrow = LocalDate.now().plusDays(1);
+
     @Test
     void bulkUpdateShift_succeeds_forCurrentDirectReport() {
         UUID shiftId = UUID.randomUUID();
-        Shift shift = Shift.builder().id(shiftId).name("Regular Shift").build();
-        Employee employee = Employee.builder().userId(directReportId).fullName("Report One").build();
+        Shift shift = Shift.builder().id(shiftId).name("Regular Shift").active(true).build();
         when(shiftRepository.findById(shiftId)).thenReturn(Optional.of(shift));
-        when(employeeRepository.findById(directReportId)).thenReturn(Optional.of(employee));
+        when(employeeRepository.existsById(directReportId)).thenReturn(true);
 
-        AssignmentBulkResultResponse result = service.bulkUpdateShift(managerEmail, List.of(directReportId), shiftId);
+        AssignmentBulkResultResponse result = service.bulkUpdateShift(managerEmail, List.of(directReportId), shiftId, tomorrow);
 
         assertEquals(1, result.getSucceededIds().size());
         assertTrue(result.getFailed().isEmpty());
-        assertEquals(shift, employee.getShift());
-        verify(employeeRepository).save(employee);
+        // Future-effective (ONEHR-336 follow-up): a new EmployeeShiftAssignment row is written —
+        // Employee.shift_id (a non-authoritative display cache) is never touched by this path.
+        ArgumentCaptor<EmployeeShiftAssignment> captor = ArgumentCaptor.forClass(EmployeeShiftAssignment.class);
+        verify(employeeShiftAssignmentRepository).save(captor.capture());
+        assertEquals(directReportId, captor.getValue().getEmployeeUserId());
+        assertEquals(shift, captor.getValue().getShift());
+        assertEquals(tomorrow, captor.getValue().getEffectiveFrom());
+        verify(employeeRepository, never()).save(any());
+    }
+
+    @Test
+    void bulkUpdateShift_replacesAnyExistingPendingAssignment_ratherThanStackingASecondOne() {
+        UUID shiftId = UUID.randomUUID();
+        Shift shift = Shift.builder().id(shiftId).name("Regular Shift").active(true).build();
+        when(shiftRepository.findById(shiftId)).thenReturn(Optional.of(shift));
+        when(employeeRepository.existsById(directReportId)).thenReturn(true);
+
+        service.bulkUpdateShift(managerEmail, List.of(directReportId), shiftId, tomorrow);
+
+        verify(employeeShiftAssignmentRepository).deleteByEmployeeUserIdAndEffectiveFromGreaterThan(directReportId, LocalDate.now());
+    }
+
+    @Test
+    void bulkUpdateShift_rejectsToday() {
+        UUID shiftId = UUID.randomUUID();
+        when(shiftRepository.findById(shiftId))
+                .thenReturn(Optional.of(Shift.builder().id(shiftId).name("Regular Shift").active(true).build()));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.bulkUpdateShift(managerEmail, List.of(directReportId), shiftId, LocalDate.now()));
+        verifyNoInteractions(employeeShiftAssignmentRepository);
+    }
+
+    @Test
+    void bulkUpdateShift_rejectsPastDate() {
+        UUID shiftId = UUID.randomUUID();
+        when(shiftRepository.findById(shiftId))
+                .thenReturn(Optional.of(Shift.builder().id(shiftId).name("Regular Shift").active(true).build()));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.bulkUpdateShift(managerEmail, List.of(directReportId), shiftId, LocalDate.now().minusDays(1)));
+        verifyNoInteractions(employeeShiftAssignmentRepository);
+    }
+
+    @Test
+    void bulkUpdateShift_rejectsNullEffectiveFrom() {
+        UUID shiftId = UUID.randomUUID();
+        when(shiftRepository.findById(shiftId))
+                .thenReturn(Optional.of(Shift.builder().id(shiftId).name("Regular Shift").active(true).build()));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.bulkUpdateShift(managerEmail, List.of(directReportId), shiftId, null));
+        verifyNoInteractions(employeeShiftAssignmentRepository);
     }
 
     @Test
     void bulkUpdateShift_fails_forEmployeeNotACurrentDirectReport() {
         UUID shiftId = UUID.randomUUID();
         when(shiftRepository.findById(shiftId))
-                .thenReturn(Optional.of(Shift.builder().id(shiftId).name("Regular Shift").build()));
+                .thenReturn(Optional.of(Shift.builder().id(shiftId).name("Regular Shift").active(true).build()));
 
-        AssignmentBulkResultResponse result = service.bulkUpdateShift(managerEmail, List.of(strangerId), shiftId);
+        AssignmentBulkResultResponse result = service.bulkUpdateShift(managerEmail, List.of(strangerId), shiftId, tomorrow);
 
         assertTrue(result.getSucceededIds().isEmpty());
         assertEquals(1, result.getFailed().size());
         assertEquals(strangerId, result.getFailed().get(0).getEmployeeUserId());
-        verify(employeeRepository, never()).findById(strangerId);
-        verify(employeeRepository, never()).save(any());
+        verify(employeeRepository, never()).existsById(strangerId);
+        verifyNoInteractions(employeeShiftAssignmentRepository);
     }
 
     @Test
     void bulkUpdateShift_isPartial_whenOneOfTwoEmployeesIsNotADirectReport() {
         UUID shiftId = UUID.randomUUID();
-        Shift shift = Shift.builder().id(shiftId).name("Regular Shift").build();
-        Employee employee = Employee.builder().userId(directReportId).fullName("Report One").build();
+        Shift shift = Shift.builder().id(shiftId).name("Regular Shift").active(true).build();
         when(shiftRepository.findById(shiftId)).thenReturn(Optional.of(shift));
-        when(employeeRepository.findById(directReportId)).thenReturn(Optional.of(employee));
+        when(employeeRepository.existsById(directReportId)).thenReturn(true);
 
         AssignmentBulkResultResponse result =
-                service.bulkUpdateShift(managerEmail, List.of(directReportId, strangerId), shiftId);
+                service.bulkUpdateShift(managerEmail, List.of(directReportId, strangerId), shiftId, tomorrow);
 
         assertEquals(1, result.getSucceededIds().size());
         assertEquals(directReportId, result.getSucceededIds().get(0));
@@ -117,8 +171,19 @@ class EmployeeAssignmentServiceTest {
         when(shiftRepository.findById(unknownShiftId)).thenReturn(Optional.empty());
 
         assertThrows(IllegalArgumentException.class,
-                () -> service.bulkUpdateShift(managerEmail, List.of(directReportId), unknownShiftId));
-        verify(employeeRepository, never()).findById(any());
+                () -> service.bulkUpdateShift(managerEmail, List.of(directReportId), unknownShiftId, tomorrow));
+        verify(employeeRepository, never()).existsById(any());
+    }
+
+    @Test
+    void bulkUpdateShift_throws_whenShiftIsInactive() {
+        UUID shiftId = UUID.randomUUID();
+        when(shiftRepository.findById(shiftId))
+                .thenReturn(Optional.of(Shift.builder().id(shiftId).name("Retired Shift").active(false).build()));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.bulkUpdateShift(managerEmail, List.of(directReportId), shiftId, tomorrow));
+        verifyNoInteractions(employeeShiftAssignmentRepository);
     }
 
     // ── Section 26: Penalisation Policy bulk-assign routes through the Allocation service ────

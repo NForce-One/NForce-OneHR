@@ -5,6 +5,7 @@ import com.nforce.onehr.dto.attendance.AttendanceInterpretation;
 import com.nforce.onehr.dto.attendance.InterpretationOutcome;
 import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.ShiftVersion;
 import com.nforce.onehr.repository.ShiftRepository;
@@ -42,6 +43,7 @@ class AttendanceInterpretationServiceTest {
     @Mock private ShiftRepository shiftRepository;
 
     private final List<ShiftVersion> shiftVersions = new ArrayList<>();
+    private final List<EmployeeShiftAssignment> assignments = new ArrayList<>();
     private AttendanceInterpretationService service;
 
     // Matches the pre-migration global app.attendance.late-grace-minutes default (10) — every
@@ -61,6 +63,16 @@ class AttendanceInterpretationServiceTest {
         return s;
     }
 
+    /** A fresh employee with an EmployeeShiftAssignment effective since the dawn of time — for
+     * tests exercising the day-aware {@code UUID}-taking overloads, which resolve solely via
+     * {@link EmployeeShiftAssignmentResolver}, never {@code Employee.shift}. */
+    private Employee employeeWithShift(Shift shift) {
+        UUID employeeUserId = UUID.randomUUID();
+        assignments.add(EmployeeShiftAssignment.builder()
+                .employeeUserId(employeeUserId).shift(shift).effectiveFrom(LocalDate.MIN).build());
+        return Employee.builder().userId(employeeUserId).shift(shift).build();
+    }
+
     @BeforeEach
     void setUp() {
         lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
@@ -68,20 +80,38 @@ class AttendanceInterpretationServiceTest {
                         .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
         ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
             @Override
-            public ShiftVersion resolve(Shift s, LocalDate workDate) {
+            public Optional<ShiftVersion> resolveIfPresent(Shift s, LocalDate workDate) {
                 return shiftVersions.stream()
                         .filter(v -> v.getShift().getId().equals(s.getId()))
                         .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
-                        .max(Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                        .max(Comparator.comparing(ShiftVersion::getEffectiveFrom));
+            }
+            @Override
+            public ShiftVersion resolve(Shift s, LocalDate workDate) {
+                return resolveIfPresent(s, workDate)
                         .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
             }
         };
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver = new EmployeeShiftAssignmentResolver(null) {
+            @Override
+            public Optional<EmployeeShiftAssignment> resolveIfPresent(UUID employeeUserId, LocalDate workDate) {
+                return assignments.stream()
+                        .filter(a -> a.getEmployeeUserId().equals(employeeUserId))
+                        .filter(a -> !a.getEffectiveFrom().isAfter(workDate))
+                        .max(Comparator.comparing(EmployeeShiftAssignment::getEffectiveFrom));
+            }
+            @Override
+            public EmployeeShiftAssignment resolve(UUID employeeUserId, LocalDate workDate) {
+                return resolveIfPresent(employeeUserId, workDate)
+                        .orElseThrow(() -> new IllegalStateException("no assignment effective on or before " + workDate));
+            }
+        };
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver, employeeShiftAssignmentResolver);
         lenient().when(shiftRepository.findById(any())).thenAnswer(inv -> {
             UUID id = inv.getArgument(0);
             return shiftVersions.stream().map(ShiftVersion::getShift).filter(s -> s.getId().equals(id)).findFirst();
         });
-        service = new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+        service = new AttendanceInterpretationService(shiftDayPolicy, shiftRepository, employeeShiftAssignmentResolver);
     }
 
     // ── Fresh action: resolves against the employee's CURRENT Shift ──────────
@@ -89,7 +119,7 @@ class AttendanceInterpretationServiceTest {
     @Test
     void interpretFreshAction_snapshotsTheEmployeesCurrentShift() {
         Shift shiftA = shift("Shift A", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true);
-        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        Employee employee = employeeWithShift(shiftA);
         LocalDateTime now = LocalDateTime.of(2026, 3, 10, 9, 5);
 
         AttendanceInterpretation interpretation = service.interpretFreshAction(
@@ -106,16 +136,41 @@ class AttendanceInterpretationServiceTest {
         // A Regularization-created row for a date with no prior punch: the work-date is already
         // known (the employee-picked correction date) — nothing to derive.
         Shift shiftA = shift("Shift A", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true);
-        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        Employee employee = employeeWithShift(shiftA);
         LocalDate correctionDate = LocalDate.of(2026, 1, 5);
         LocalDateTime checkInAt = LocalDateTime.of(correctionDate, LocalTime.of(9, 20));
 
-        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee, correctionDate, checkInAt);
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), correctionDate, checkInAt);
 
         assertEquals(InterpretationOutcome.RESOLVED, interpretation.getOutcome());
         assertEquals(shiftA.getId(), interpretation.getShiftId());
         assertEquals(correctionDate, interpretation.getWorkDate(), "work-date must be exactly the given date, never re-derived");
         assertTrue(interpretation.getIsLate());
+    }
+
+    /**
+     * The backdated-regularization fix this whole {@code UUID}-taking overload exists for: a
+     * brand-new (backdated) correction must resolve against the Shift Assignment EFFECTIVE ON
+     * the correction date itself — never the employee's CURRENT assignment — when the employee
+     * has since been reassigned. Shift A (9:00, strict 0-grace) governed the correction date;
+     * Shift B (9:00, 30-minute grace) only takes over the day after. A 9:20 check-in must still
+     * read LATE (Shift A's own grace), proving Shift B was never consulted.
+     */
+    @Test
+    void interpretForKnownWorkDate_employeeReassignedSinceThisDate_stillResolvesTheAssignmentEffectiveOnThatDate() {
+        Shift shiftA = shift("Shift A (strict)", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true, 0);
+        Shift shiftB = shift("Shift B (generous)", LocalTime.of(9, 0), LocalTime.of(18, 0), LocalDate.MIN, true, 30);
+        Employee employee = employeeWithShift(shiftA);
+        LocalDate correctionDate = LocalDate.of(2026, 1, 5);
+        // Reassigned to Shift B effective the day AFTER the correction date.
+        assignments.add(EmployeeShiftAssignment.builder()
+                .employeeUserId(employee.getUserId()).shift(shiftB).effectiveFrom(correctionDate.plusDays(1)).build());
+        LocalDateTime checkInAt = LocalDateTime.of(correctionDate, LocalTime.of(9, 20));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), correctionDate, checkInAt);
+
+        assertEquals(shiftA.getId(), interpretation.getShiftId(), "must resolve Shift A, the assignment effective on the correction date");
+        assertTrue(interpretation.getIsLate(), "Shift A's 0-minute grace makes this LATE — Shift B's 30-minute grace would have forgiven it");
     }
 
     @Test
@@ -418,7 +473,7 @@ class AttendanceInterpretationServiceTest {
         // No existing Attendance row for this date — resolves against the employee's CURRENT
         // shift, exactly like interpretForKnownWorkDate does.
         Shift shiftA = shift("Shift A", LocalTime.of(10, 0), LocalTime.of(19, 0), LocalDate.MIN, true);
-        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        Employee employee = employeeWithShift(shiftA);
         LocalDate workDate = LocalDate.of(2026, 9, 8);
 
         // The spec's own worked example: 12:21 AM/3:30 AM the NEXT calendar day still belong to
@@ -462,7 +517,7 @@ class AttendanceInterpretationServiceTest {
     @Test
     void resolveWorkdayWindowFor_newRecord_matchesTheSpecWorkedExample() {
         Shift shiftA = shift("Shift A", LocalTime.of(10, 0), LocalTime.of(19, 0), LocalDate.MIN, true);
-        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(shiftA).build();
+        Employee employee = employeeWithShift(shiftA);
         LocalDate workDate = LocalDate.of(2026, 9, 8);
 
         AttendanceInterpretationService.WorkdayWindow window = service.resolveWorkdayWindowFor(employee, null, workDate);
@@ -485,11 +540,11 @@ class AttendanceInterpretationServiceTest {
         // 10-minute-grace fixtures elsewhere in this file where the same 20-minute delay IS late.
         Shift generousShift = shift("Generous Shift", LocalTime.of(9, 0), LocalTime.of(18, 0),
                 LocalDate.MIN, true, 30);
-        Employee employee = Employee.builder().userId(UUID.randomUUID()).shift(generousShift).build();
+        Employee employee = employeeWithShift(generousShift);
         LocalDate workDate = LocalDate.of(2026, 3, 10);
         LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(9, 20));
 
-        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee, workDate, checkInAt);
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), workDate, checkInAt);
 
         assertFalse(interpretation.getIsLate(), "20 minutes late must be forgiven under a 30-minute grace");
         assertEquals(20, interpretation.getLateByMinutes(), "raw lateByMinutes is never grace-forgiven, regardless of the grace value");
@@ -503,12 +558,84 @@ class AttendanceInterpretationServiceTest {
         LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(9, 10));
 
         AttendanceInterpretation strictInterpretation = service.interpretForKnownWorkDate(
-                Employee.builder().userId(UUID.randomUUID()).shift(strictShift).build(), workDate, checkInAt);
+                employeeWithShift(strictShift).getUserId(), workDate, checkInAt);
         AttendanceInterpretation generousInterpretation = service.interpretForKnownWorkDate(
-                Employee.builder().userId(UUID.randomUUID()).shift(generousShift).build(), workDate, checkInAt);
+                employeeWithShift(generousShift).getUserId(), workDate, checkInAt);
 
         assertTrue(strictInterpretation.getIsLate(), "0-minute grace: even 1 minute late is LATE");
         assertFalse(generousInterpretation.getIsLate(), "30-minute grace forgives the same 10-minute delay");
+    }
+
+    // ── lateByMinutes: whole elapsed minutes, never inclusive/rounded-up counting ─────────────
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_49MinutesLate_isNotRoundedUpTo50() {
+        // The exact regression this covers: shift starts 15:30, check-in at 16:19:00 is 49
+        // whole minutes late — must never be reported as 50.
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = employeeWithShift(shiftA);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(16, 19, 0));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), workDate, checkInAt);
+
+        assertEquals(49, interpretation.getLateByMinutes());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_59SecondsIntoTheSameMinute_staysAt49() {
+        // 4:19:59 has not yet completed the 50th minute of lateness — must still read 49, never
+        // rounded up because of the trailing seconds (whole ELAPSED minutes, not inclusive count).
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = employeeWithShift(shiftA);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(16, 19, 59));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), workDate, checkInAt);
+
+        assertEquals(49, interpretation.getLateByMinutes());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_exactly50MinutesLate_reads50() {
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = employeeWithShift(shiftA);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(16, 20, 0));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), workDate, checkInAt);
+
+        assertEquals(50, interpretation.getLateByMinutes());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_exactShiftStart_isZero() {
+        Shift shiftA = shift("Shift A", LocalTime.of(15, 30), LocalTime.of(23, 30), LocalDate.MIN, true);
+        Employee employee = employeeWithShift(shiftA);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime checkInAt = LocalDateTime.of(workDate, LocalTime.of(15, 30, 0));
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), workDate, checkInAt);
+
+        assertEquals(0, interpretation.getLateByMinutes());
+        assertFalse(interpretation.getIsLate());
+    }
+
+    @Test
+    void interpretForKnownWorkDate_lateByMinutes_overnightShift_49MinutesPastMidnightRolloverStart() {
+        // Overnight shift starting 23:30 — check-in 00:19:59 the next calendar day (49 minutes
+        // and change past shift start) must still read 49, exercising the same seconds-truncation
+        // rule across a date rollover.
+        Shift overnight = shift("Overnight", LocalTime.of(23, 30), LocalTime.of(7, 30), LocalDate.MIN, true);
+        Employee employee = employeeWithShift(overnight);
+        LocalDate workDate = LocalDate.of(2026, 3, 10);
+        LocalDateTime shiftStartAt = LocalDateTime.of(workDate, LocalTime.of(23, 30, 0));
+        LocalDateTime checkInAt = shiftStartAt.plusMinutes(49).plusSeconds(59);
+
+        AttendanceInterpretation interpretation = service.interpretForKnownWorkDate(employee.getUserId(), workDate, checkInAt);
+
+        assertEquals(LocalDate.of(2026, 3, 11), checkInAt.toLocalDate(), "sanity check: check-in rolled onto the next calendar day");
+        assertEquals(49, interpretation.getLateByMinutes());
     }
 
     @Test

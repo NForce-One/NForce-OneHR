@@ -59,10 +59,16 @@ class MultiPolicyAssignmentIsolationTest {
     @Mock private NotificationService notificationService;
     @Mock private EmployeeService employeeService;
     @Mock private AttendancePenaltyService attendancePenaltyService;
-    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private ShiftRepository shiftRepository;
     @Mock private ShiftVersionResolver shiftVersionResolver;
+    @Mock private EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     private ExceptionService exceptionService;
+    // Tracks whatever Shift employee() most recently built for a given id, so
+    // employeeShiftAssignmentResolver's stub (below) always resolves the SAME shift the test's
+    // own Employee fixture carries, without needing a real assignment-history fake (this file
+    // doesn't exercise assignment history itself).
+    private final java.util.Map<UUID, Shift> currentShiftByEmployee = new java.util.HashMap<>();
 
     private final UUID employeeAId = UUID.randomUUID();
     private final UUID employeeBId = UUID.randomUUID();
@@ -86,19 +92,15 @@ class MultiPolicyAssignmentIsolationTest {
         lenient().when(allocationRepository.findEffectiveAt(any(), any())).thenReturn(List.of());
         PenalizationPolicyResolutionService policyResolutionService =
                 new PenalizationPolicyResolutionService(versionRepository, allocationRepository, penalizationPolicyService, employeeRepository, attendanceProperties);
-        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
+        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver, employeeShiftAssignmentResolver);
         WorkHoursShortageCalculationService workHoursShortageCalculationService =
-                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
-        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
-                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
-                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver, shiftRepository);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, penaltyEvaluationService,
                 workingDayService, holidayRepository, policyResolutionService, expectedWorkHoursService,
                 workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService,
-                shiftDayPolicy, shiftVersionResolver);
+                shiftVersionResolver, shiftRepository);
 
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeAId, employeeBId));
@@ -122,6 +124,21 @@ class MultiPolicyAssignmentIsolationTest {
         // the exact start/end values don't matter here, only that resolution doesn't throw.
         lenient().when(shiftVersionResolver.resolve(any(), any()))
                 .thenReturn(ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0)).build());
+        // ONEHR-336 follow-up: ShiftDayPolicy's own Rule 2 pre-check now calls resolveIfPresent
+        // (not resolve) directly — an unstubbed @Mock answers Optional.empty() regardless of the
+        // resolve() stub above, silently breaking any overnight-rollover check. Delegates to
+        // whatever resolve() is stubbed to return instead of duplicating it.
+        lenient().when(shiftVersionResolver.resolveIfPresent(any(), any())).thenAnswer(inv -> {
+            try {
+                return Optional.of(shiftVersionResolver.resolve(inv.getArgument(0), inv.getArgument(1)));
+            } catch (IllegalStateException e) {
+                return Optional.empty();
+            }
+        });
+        lenient().when(employeeShiftAssignmentResolver.resolve(any(), any())).thenAnswer(inv -> {
+            UUID id = inv.getArgument(0);
+            return EmployeeShiftAssignment.builder().employeeUserId(id).shift(currentShiftByEmployee.get(id)).effectiveFrom(LocalDate.MIN).build();
+        });
     }
 
     private User hrUser() {
@@ -132,6 +149,7 @@ class MultiPolicyAssignmentIsolationTest {
     private Employee employee(UUID id, PenalisationPolicy policy) {
         User user = User.builder().id(id).email(id + "@test.com").build();
         Shift shift = Shift.builder().id(UUID.randomUUID()).name(Shift.DEFAULT_SHIFT_NAME).active(true).build();
+        currentShiftByEmployee.put(id, shift);
         return Employee.builder().userId(id).user(user).employeeCode("NF-" + id).fullName("Employee " + id)
                 .joiningDate(date.minusYears(1)).penalisationPolicy(policy).shift(shift).build();
     }

@@ -59,9 +59,14 @@ class ExceptionServiceDetectionTest {
     @Mock private NotificationService notificationService;
     @Mock private EmployeeService employeeService;
     @Mock private AttendancePenaltyService attendancePenaltyService;
-    @Mock private com.nforce.onehr.repository.ShiftWeeklyOffRulesRepository shiftWeeklyOffRulesRepository;
+    @Mock private ShiftRepository shiftRepository;
+    @Mock private EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver;
 
     private ExceptionService exceptionService;
+    // Tracks whatever Shift employee() most recently built — this file has only one test employee,
+    // so employeeShiftAssignmentResolver's stub (below) always resolves the SAME shift the
+    // current test's own Employee fixture carries.
+    private Shift currentEmployeeShift;
 
     // A minimal, real (not mocked) Shift Version resolver shared by every real (non-mocked)
     // service this test constructs (ExpectedWorkHoursService, WorkHoursShortageCalculationService,
@@ -71,11 +76,15 @@ class ExceptionServiceDetectionTest {
     private final List<ShiftVersion> shiftVersions = new java.util.ArrayList<>();
     private final ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
         @Override
-        public ShiftVersion resolve(Shift s, LocalDate workDate) {
+        public Optional<ShiftVersion> resolveIfPresent(Shift s, LocalDate workDate) {
             return shiftVersions.stream()
                     .filter(v -> v.getShift().getId().equals(s.getId()))
                     .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
-                    .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                    .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom));
+        }
+        @Override
+        public ShiftVersion resolve(Shift s, LocalDate workDate) {
+            return resolveIfPresent(s, workDate)
                     .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
         }
     };
@@ -117,20 +126,25 @@ class ExceptionServiceDetectionTest {
         lenient().when(allocationRepository.findEffectiveAt(any(), any())).thenReturn(List.of());
         PenalizationPolicyResolutionService policyResolutionService =
                 new PenalizationPolicyResolutionService(versionRepository, allocationRepository, penalizationPolicyService, employeeRepository, attendanceProperties);
-        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver);
+        ExpectedWorkHoursService expectedWorkHoursService = new ExpectedWorkHoursService(leaveRequestRepository, shiftVersionResolver, employeeShiftAssignmentResolver);
         WorkHoursShortageCalculationService workHoursShortageCalculationService =
-                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver);
-        lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
-                com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
-                        .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+                new WorkHoursShortageCalculationService(attendanceRepository, expectedWorkHoursService, workingDayService, shiftVersionResolver, shiftRepository);
         exceptionService = new ExceptionService(userRepository, employeeRepository, historyRepository,
                 attendanceExceptionRepository, attendanceRepository, leaveRequestRepository,
                 regularizationRequestRepository, attendanceProperties, emailService, penaltyEvaluationService,
                 workingDayService, holidayRepository, policyResolutionService, expectedWorkHoursService,
                 workHoursShortageCalculationService, policyEngine, attendancePenaltyRepository, attendancePenaltyService,
-                shiftDayPolicy, shiftVersionResolver);
+                shiftVersionResolver, shiftRepository);
 
+        lenient().when(employeeShiftAssignmentResolver.resolve(any(), any())).thenAnswer(inv ->
+                EmployeeShiftAssignment.builder().employeeUserId(employeeId).shift(currentEmployeeShift).effectiveFrom(LocalDate.MIN).build());
+        // ExpectedWorkHoursService.shiftMinutes calls resolveIfPresent (not resolve) — an unstubbed
+        // @Mock answers that with Optional.empty() regardless of the resolve() stub above, which
+        // would silently null out every shortage-detection test in this file. Mirrors resolve()'s
+        // own currentEmployeeShift-backed answer, empty only when no shift has been set at all.
+        lenient().when(employeeShiftAssignmentResolver.resolveIfPresent(any(), any())).thenAnswer(inv ->
+                currentEmployeeShift == null ? Optional.empty()
+                        : Optional.of(EmployeeShiftAssignment.builder().employeeUserId(employeeId).shift(currentEmployeeShift).effectiveFrom(LocalDate.MIN).build()));
         lenient().when(attendanceProperties.getZone()).thenReturn("Asia/Kolkata");
         lenient().when(userRepository.findEmployeeRoleUserIds()).thenReturn(Set.of(employeeId));
         lenient().when(userRepository.findByEmail(hrEmail)).thenReturn(Optional.of(hrUser()));
@@ -156,6 +170,7 @@ class ExceptionServiceDetectionTest {
     }
 
     private Employee employee(Shift shift) {
+        currentEmployeeShift = shift;
         User user = User.builder().id(employeeId).email("employee@test.com").build();
         return Employee.builder().userId(employeeId).user(user).employeeCode("NF-1").fullName("Test Employee")
                 .joiningDate(targetDate.minusYears(1)).shift(shift).build();
@@ -722,6 +737,7 @@ class ExceptionServiceDetectionTest {
     // ── Phase 3: Weekly/Monthly Work Hours Shortage frequency ──────────────────────────────────
 
     private Employee employeeWithShift(Shift shift) {
+        currentEmployeeShift = shift;
         return Employee.builder().userId(employeeId).user(User.builder().id(employeeId).email("employee@test.com").build())
                 .employeeCode("NF-1").fullName("Test Employee").joiningDate(LocalDate.of(2020, 1, 1)).shift(shift).build();
     }
@@ -992,12 +1008,19 @@ class ExceptionServiceDetectionTest {
                 .effectiveFrom(targetDate.plusDays(1)).build());
         Attendance record = Attendance.builder().employeeUserId(employeeId).workDate(targetDate)
                 .checkInAt(targetDate.atTime(9, 0)).checkOutAt(targetDate.atTime(17, 0))
+                // Snapshotted shiftId — ExceptionService now resolves the display's "expected"
+                // time from THIS record's own snapshot (resolveSnapshotShift), never the
+                // employee's current/live assignment, so this must be set for that resolution to
+                // find the shift at all (a null shiftId would mean "cannot be evaluated" and
+                // suppress the assertion below, not exercise the invariant this test protects).
+                .shiftId(shift.getId())
                 .workedMinutes(480).lateByMinutes(0).build();
         when(attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(List.of(employeeId), targetDate, targetDate))
                 .thenReturn(List.of(record));
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(employeeId, targetDate)).thenReturn(Optional.of(record));
         when(employeeRepository.findAllByIdWithScheduleDetails(any())).thenReturn(List.of(employee(shift)));
         lenient().when(employeeRepository.findById(employeeId)).thenReturn(Optional.of(employee(shift)));
+        lenient().when(shiftRepository.findById(shift.getId())).thenReturn(Optional.of(shift));
         PenalizationPolicyVersion version = basisVersion("GROSS_HOURS");
         when(versionRepository.findVersionsEffectiveAt(any())).thenReturn(List.of(version));
         when(tierRepository.findByPolicyVersionIdOrderBySortOrderAsc(version.getId())).thenReturn(List.of(

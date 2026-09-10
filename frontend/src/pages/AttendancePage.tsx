@@ -35,8 +35,8 @@ import { profileApi } from '../api/profile';
 import { useAuthStore } from '../store/authStore';
 import { useToast } from '../context/ToastContext';
 import { toShellRole } from '../lib/nav.config';
-import { TimeFormatProvider, useTimeFormat } from '../context/TimeFormatContext';
-import { minutesSinceMidnight, shiftMarkerPositions, segmentBarPosition, breakMarkerPosition, resolveWorkdayWindow, punchCalendarDateIfDiffers } from '../utils/shiftMarkers';
+import { TimeFormatProvider, useTimeFormat, formatLateBySeconds } from '../context/TimeFormatContext';
+import { minutesSinceMidnight, secondsBetween, shiftMarkerPositions, segmentBarPosition, breakMarkerPosition, resolveWorkdayWindow, punchCalendarDateIfDiffers } from '../utils/shiftMarkers';
 
 // ─── Formatting helpers ───────────────────────────────────────────────────────
 // Server timestamps are wall-clock strings in the business timezone (no offset), so they are
@@ -423,19 +423,28 @@ function StatusPill({ status }: { status: AttendanceStatus | null }) {
  * see AttendanceService.checkIn), so a check-in inside the grace window still has minutes > 0
  * and must NOT show as late here. `minutes > graceMinutes` is exactly the backend's own
  * `isLate` check (past shiftStart + graceMinutes) re-derived from data already on hand,
- * without needing `status` (which HALF_DAY can override — see AttendanceService.checkOut).
+ * without needing `status` (which HALF_DAY can override — see AttendanceService.checkOut). This
+ * gate is deliberately still minute-based (unchanged) — only the displayed TEXT below is
+ * seconds-precise, computed directly from `checkInAt`/`shiftStartAt` (both already on
+ * AttendanceResponse, resolved against the record's own snapshotted Shift — see
+ * shiftMarkers.ts's secondsBetween) rather than the whole-minute `minutes` figure, so "Late by
+ * 50m" (49m55s previously rounded up) reads as "Late by 49m 55s" instead. Falls back to the
+ * coarser minute-only text when either timestamp is missing (a legacy record).
  */
-function LateBadge({ minutes, graceMinutes, workedMinutes, config }: {
-  minutes: number | null | undefined; graceMinutes: number | null | undefined;
+function LateBadge({ minutes, checkInAt, shiftStartAt, graceMinutes, workedMinutes, config }: {
+  minutes: number | null | undefined; checkInAt?: string | null; shiftStartAt?: string | null;
+  graceMinutes: number | null | undefined;
   workedMinutes?: number | null; config?: AttendanceConfig | null;
 }) {
   const { formatDuration } = useTimeFormat();
   const grace = graceMinutes ?? 10;
   if (!minutes || minutes <= grace) return null;
   const fullDay = hasMetFullEffectiveHours(workedMinutes, config ?? null);
+  const seconds = checkInAt && shiftStartAt ? secondsBetween(shiftStartAt, checkInAt) : null;
+  const text = (seconds != null ? formatLateBySeconds(seconds) : null) ?? formatDuration(minutes);
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, fontWeight: 600, color: '#E0A93B' }}>
-      {!fullDay && <Turtle size={18} aria-label="Late" style={{ flexShrink: 0 }} />} Late by {formatDuration(minutes)}
+      {!fullDay && <Turtle size={18} aria-label="Late" style={{ flexShrink: 0 }} />} Late by {text}
     </div>
   );
 }
@@ -3083,7 +3092,7 @@ function DayDetailsBody({ info, config, punches, onRegularize, onApplyPartialDay
             <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--txt)' }}>{formatDuration(info.record.workedMinutes) ?? dash}</div>
           </div>
           <StatusPill status={info.record.status} />
-          <LateBadge minutes={info.record.lateByMinutes} graceMinutes={config?.lateGraceMinutes} workedMinutes={info.record.workedMinutes} config={config} />
+          <LateBadge minutes={info.record.lateByMinutes} checkInAt={info.record.checkInAt} shiftStartAt={info.record.shiftStartAt} graceMinutes={config?.lateGraceMinutes} workedMinutes={info.record.workedMinutes} config={config} />
           <DayShiftAndActions info={info} config={config} onRegularize={onRegularize} onApplyPartialDay={onApplyPartialDay} />
           <DayPunchIntervals info={info} punches={punches} />
         </>
@@ -3179,9 +3188,11 @@ function ArrivalCell({ record, graceMinutes, config }: {
   const grace = graceMinutes ?? 10;
   if (late > grace) {
     const fullDay = hasMetFullEffectiveHours(record.workedMinutes, config ?? null);
+    const seconds = record.shiftStartAt ? secondsBetween(record.shiftStartAt, record.checkInAt) : null;
+    const text = (seconds != null ? formatLateBySeconds(seconds) : null) ?? formatDuration(late);
     return (
       <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: '#E0A93B', fontSize: 11.5, fontWeight: 600 }}>
-        {!fullDay && <Turtle size={16} style={{ flexShrink: 0 }} />} {formatDuration(late)} late
+        {!fullDay && <Turtle size={16} style={{ flexShrink: 0 }} />} {text} late
       </span>
     );
   }
@@ -3748,7 +3759,7 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
                       </div>
                     </div>
                     {today.record?.status && <StatusPill status={today.record.status} />}
-                    <LateBadge minutes={today.record?.lateByMinutes} graceMinutes={config?.lateGraceMinutes} workedMinutes={workedMinutesToday} config={config} />
+                    <LateBadge minutes={today.record?.lateByMinutes} checkInAt={today.record?.checkInAt} shiftStartAt={today.record?.shiftStartAt} graceMinutes={config?.lateGraceMinutes} workedMinutes={workedMinutesToday} config={config} />
                     {/* The button is driven only by the server's canCheckIn / canCheckOut flags. */}
                     <div>
                       {today.canCheckIn && (

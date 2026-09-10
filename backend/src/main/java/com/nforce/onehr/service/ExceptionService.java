@@ -64,10 +64,11 @@ public class ExceptionService {
     private final AttendancePolicyEngine attendancePolicyEngine;
     private final AttendancePenaltyRepository attendancePenaltyRepository;
     private final AttendancePenaltyService attendancePenaltyService;
-    // Single source of truth for shift-start resolution — see its own Javadoc.
-    private final ShiftDayPolicy shiftDayPolicy;
     // Resolves a Shift's timing for a SPECIFIC date (Shift Versioning) — see its own Javadoc.
     private final ShiftVersionResolver shiftVersionResolver;
+    // Only for resolveSnapshotShift's historical Attendance.shiftId lookup below — never for
+    // resolving an employee's current/live Shift.
+    private final ShiftRepository shiftRepository;
 
     /**
      * Gap-033/034: every discrepancy type a corrected Attendance record could invalidate — a
@@ -239,14 +240,7 @@ public class ExceptionService {
                         .map(date -> leave.getEmployeeUserId() + "|" + date))
                 .collect(Collectors.toSet());
 
-        // Was attendanceProperties.getShiftStart() (the org-wide fallback) for every employee
-        // regardless of their own assigned Shift — the LATE_ARRIVAL decision/count themselves
-        // were unaffected (reused correctly from record.getLateByMinutes() below), but the
-        // "expected" time shown/emailed for this exception was wrong for anyone not on the
-        // default shift. Mirrors AttendanceService.resolveShiftStart's own fallback rule.
         List<Employee> employees = employeeRepository.findAllByIdWithScheduleDetails(scopeIdList);
-        Map<UUID, Employee> employeesById = employees.stream()
-                .collect(Collectors.toMap(Employee::getUserId, e -> e));
 
         // Unclamped [from, to] — deliberately not reusing detectNoAttendanceAndShortage's own
         // yesterday-clamped range below, since a late arrival can legitimately be for *today*.
@@ -265,8 +259,16 @@ public class ExceptionService {
             // late arrival" threshold, for an arrival still within the employee's allowed-late
             // privilege, contradicting that privilege's whole purpose.
             if (isWorkingDay && STATUS_LATE.equals(record.getStatus())) {
-                Employee employee = employeesById.get(record.getEmployeeUserId());
-                LocalTime expectedShiftStart = shiftDayPolicy.resolveShiftStart(employee, record.getWorkDate());
+                // Resolved from THIS record's own snapshotted shiftId (never the employee's
+                // current/live Shift) — an employee reassigned since this historical date must
+                // never change what "expected start" this already-decided LATE_ARRIVAL displays.
+                // Null (legacy row, no snapshot) means "cannot be evaluated" — the exception is
+                // still raised (the LATE decision itself is independent and already final), just
+                // without a resolvable expected-start figure, same as MISSING_PUNCH/
+                // LEAVE_ATTENDANCE_CONFLICT below already pass null for fields they can't supply.
+                LocalTime expectedShiftStart = resolveSnapshotShift(record)
+                        .map(shift -> shiftVersionResolver.resolve(shift, record.getWorkDate()).getStartTime())
+                        .orElse(null);
                 upsertException(record, ExceptionType.LATE_ARRIVAL,
                         expectedShiftStart, record.getCheckInAt().toLocalTime(),
                         record.getLateByMinutes());
@@ -341,12 +343,16 @@ public class ExceptionService {
                     Long expectedMinutes = expectedWorkHoursService.adjustedExpectedMinutes(
                             employee, date, partialHourLeaveByEmployeeDate.get(employee.getUserId() + "|" + date));
                     if (expectedMinutes != null && existing.getWorkedMinutes() < expectedMinutes) {
-                        // Version effective on THIS date, not the employee's current/live shift —
-                        // adjustedExpectedMinutes above already resolved the same date's version
-                        // for the shortage decision itself; this must display the same date's
-                        // version, not whatever the shift has since changed to (see
-                        // ShiftVersionResolver's own Javadoc).
-                        LocalTime expectedShiftEnd = shiftVersionResolver.resolve(employee.getShift(), date).getEndTime();
+                        // Resolved from THIS record's own snapshotted shiftId (never the
+                        // employee's current/live Shift) — an employee reassigned since this
+                        // historical date must never change what "expected end" an
+                        // already-decided shortage displays. Null (legacy row) means "cannot be
+                        // evaluated" for display only; the shortage itself was already decided
+                        // above from expectedMinutes, which is independently date-correct (see
+                        // ExpectedWorkHoursService#shiftMinutes).
+                        LocalTime expectedShiftEnd = resolveSnapshotShift(existing)
+                                .map(shift -> shiftVersionResolver.resolve(shift, date).getEndTime())
+                                .orElse(null);
                         upsertException(existing, ExceptionType.WORK_HOURS_SHORTAGE,
                                 expectedShiftEnd, existing.getCheckOutAt().toLocalTime(), null);
                     }
@@ -555,6 +561,27 @@ public class ExceptionService {
         return java.util.Arrays.stream(policy.getOffDays().split(","))
                 .map(String::trim).filter(s -> !s.isEmpty()).map(DayOfWeek::valueOf)
                 .collect(Collectors.toSet());
+    }
+
+    /**
+     * Resolves the Shift referenced by {@code record}'s own snapshotted {@code shiftId} — never
+     * the employee's current/live assignment — for a historical display or calculation tied to
+     * this specific record. Empty for a legacy row with no snapshot (see {@code Attendance
+     * .shiftId}'s own Javadoc); callers must treat that as "cannot be evaluated," never fall back
+     * to the employee's current Shift. Mirrors {@code AttendanceInterpretationService
+     * .resolveShiftContextOrNull}'s identical reasoning/error message for the same class of
+     * "references a shift that no longer exists" data-corruption signal.
+     */
+    private Optional<Shift> resolveSnapshotShift(Attendance record) {
+        if (record.getShiftId() == null) {
+            return Optional.empty();
+        }
+        return Optional.of(shiftRepository.findById(record.getShiftId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "Attendance " + record.getId() + " references shift " + record.getShiftId()
+                                + " which no longer exists — Shift deletion should be blocked once any "
+                                + "Attendance references it (see OrgService#deleteShift); this indicates "
+                                + "data corruption, not a case to fall back from.")));
     }
 
     private void upsertException(Attendance record, String exceptionType,

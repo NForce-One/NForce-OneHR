@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   minutesSinceMidnight,
   minutesBetween,
+  secondsBetween,
   resolveWorkdayWindow,
   shiftMarkerPositions,
   segmentBarPosition,
@@ -56,6 +57,28 @@ describe('minutesBetween', () => {
 
   it('is immune to the browser/system timezone: pure calendar-field arithmetic, no real Date/offset involved', () => {
     expect(minutesBetween(iso('2026-03-10', '09:00:00'), iso('2026-03-10', '18:00:00'))).toBe(9 * 60);
+  });
+});
+
+describe('secondsBetween', () => {
+  it('the exact worked example: 15:30:00 -> 15:31:37 is 1m37s (97 seconds), never rounded to whole minutes', () => {
+    expect(secondsBetween(iso('2026-03-10', '15:30:00'), iso('2026-03-10', '15:31:37'))).toBe(97);
+  });
+
+  it('the other worked example: 15:30:00 -> 16:19:55 is 49m55s (2995 seconds)', () => {
+    expect(secondsBetween(iso('2026-03-10', '15:30:00'), iso('2026-03-10', '16:19:55'))).toBe(2995);
+  });
+
+  it('exact minute boundary has no leftover seconds', () => {
+    expect(secondsBetween(iso('2026-03-10', '15:00:00'), iso('2026-03-10', '15:30:00'))).toBe(1800);
+  });
+
+  it('same instant is zero', () => {
+    expect(secondsBetween(iso('2026-03-10', '15:30:00'), iso('2026-03-10', '15:30:00'))).toBe(0);
+  });
+
+  it('null when either side is unparseable', () => {
+    expect(secondsBetween('not-an-iso', iso('2026-03-10', '15:30:00'))).toBeNull();
   });
 });
 

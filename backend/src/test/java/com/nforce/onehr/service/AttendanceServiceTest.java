@@ -5,6 +5,7 @@ import com.nforce.onehr.dto.TodayAttendanceResponse;
 import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.AttendancePunch;
 import com.nforce.onehr.entity.Employee;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.Location;
 import com.nforce.onehr.entity.Shift;
 import com.nforce.onehr.entity.ShiftVersion;
@@ -72,6 +73,13 @@ class AttendanceServiceTest {
     // than LEGACY_UNRESOLVED.
     private Shift defaultShift;
 
+    // Backs the fake EmployeeShiftAssignmentResolver below — the shared test employee's "as of
+    // right now" assignment for the day-aware interpretFreshAction/getConfig/historyFor call
+    // sites. A test that reassigns the employee to a different Shift for a FRESH check-in/out (no
+    // prior Attendance record) must update this alongside the Employee fixture's own .shift(...);
+    // a test resolving against an EXISTING record's own snapshotted shiftId never touches it.
+    private Shift currentEmployeeShift;
+
     private final UUID employeeId = UUID.randomUUID();
     private final String employeeEmail = "employee@test.com";
     // A minimal, real (not mocked) Shift Version resolver — a single-version-per-shift, in-memory
@@ -101,15 +109,32 @@ class AttendanceServiceTest {
                         .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
         ShiftVersionResolver shiftVersionResolver = new ShiftVersionResolver(null) {
             @Override
-            public ShiftVersion resolve(Shift s, LocalDate workDate) {
+            public Optional<ShiftVersion> resolveIfPresent(Shift s, LocalDate workDate) {
                 return shiftVersions.stream()
                         .filter(v -> v.getShift().getId().equals(s.getId()))
                         .filter(v -> !v.getEffectiveFrom().isAfter(workDate))
-                        .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom))
+                        .max(java.util.Comparator.comparing(ShiftVersion::getEffectiveFrom));
+            }
+            @Override
+            public ShiftVersion resolve(Shift s, LocalDate workDate) {
+                return resolveIfPresent(s, workDate)
                         .orElseThrow(() -> new IllegalStateException("no version effective on or before " + workDate));
             }
         };
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver = new EmployeeShiftAssignmentResolver(null) {
+            @Override
+            public Optional<EmployeeShiftAssignment> resolveIfPresent(UUID employeeUserId, LocalDate workDate) {
+                return currentEmployeeShift == null ? Optional.empty()
+                        : Optional.of(EmployeeShiftAssignment.builder()
+                                .employeeUserId(employeeUserId).shift(currentEmployeeShift).effectiveFrom(LocalDate.MIN).build());
+            }
+            @Override
+            public EmployeeShiftAssignment resolve(UUID employeeUserId, LocalDate workDate) {
+                return resolveIfPresent(employeeUserId, workDate)
+                        .orElseThrow(() -> new IllegalStateException("no assignment effective on or before " + workDate));
+            }
+        };
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver, employeeShiftAssignmentResolver);
         // Matches app.attendance.half-day-max-hours' old YAML default (3.5) — see
         // AttendanceRulesService's own Javadoc for why this moved off AttendanceProperties.
         lenient().when(attendanceRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
@@ -126,13 +151,14 @@ class AttendanceServiceTest {
                     .filter(s -> s.getId().equals(id)).findFirst();
         });
         AttendanceInterpretationService attendanceInterpretationService =
-                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+                new AttendanceInterpretationService(shiftDayPolicy, shiftRepository, employeeShiftAssignmentResolver);
         service = new AttendanceService(attendanceRepository, attendancePunchRepository, webClockInRequestRepository,
                 attendanceExceptionRepository, employeeRepository, managerHistoryRepository,
                 auditService, auditSnapshot, latePenaltyService, workingDayService, expectedWorkHoursService,
-                shiftDayPolicy, attendanceRulesService, attendanceInterpretationService);
+                shiftDayPolicy, attendanceRulesService, attendanceInterpretationService, employeeShiftAssignmentResolver);
 
         defaultShift = shift("Regular", LocalTime.of(15, 30), LocalTime.of(0, 30));
+        currentEmployeeShift = defaultShift;
         // Active, non-deleted User by default — every checkIn/checkOut test implicitly exercises
         // assertEligibleToPunch's gate; tests that specifically want an inactive/deleted account
         // override this with their own Employee/User fixture.
@@ -565,6 +591,7 @@ class AttendanceServiceTest {
                 .user(User.builder().id(employeeId).active(true).build()).build();
         when(employeeRepository.findByUser_Email(employeeEmail)).thenReturn(Optional.of(reassignedEmployee));
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(any(), any())).thenReturn(Optional.empty());
+        currentEmployeeShift = reassignedDayShift; // the fresh check-in must resolve via the NEW assignment
 
         AttendanceResponse resp = service.checkIn(employeeEmail, null);
 
@@ -913,6 +940,7 @@ class AttendanceServiceTest {
         Employee employee = Employee.builder().userId(employeeId).employeeCode("E1").fullName("Test Employee").shift(overnightShift).location(location).user(User.builder().id(employeeId).active(true).build()).build();
         when(employeeRepository.findByUser_Email(employeeEmail)).thenReturn(Optional.of(employee));
         when(attendanceRepository.findByEmployeeUserIdAndWorkDate(any(), any())).thenReturn(Optional.empty());
+        currentEmployeeShift = overnightShift; // the fresh check-in must resolve via this assignment
 
         AttendanceResponse resp = service.checkIn(employeeEmail, null);
 

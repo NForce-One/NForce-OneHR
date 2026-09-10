@@ -181,4 +181,48 @@ class AttendanceRulesServiceTest {
 
         assertEquals(java.time.ZoneId.of("Asia/Kolkata"), service.resolveEmployeeZoneId(null));
     }
+
+    // ── Future-effective timezone (ONEHR-336 follow-up): pending-timezone resolved inline by
+    // date, on every call — no scheduler/promotion job anywhere in this path. ──────────────────
+
+    @Test
+    void resolveEmployeeZoneId_pendingTimezoneNotYetEffective_stillUsesTheLiveTimezone() {
+        Location office = Location.builder().name("Office").timezone("Asia/Kolkata")
+                .pendingTimezone("America/New_York").pendingTimezoneEffectiveFrom(java.time.LocalDate.now().plusDays(1))
+                .build();
+        Employee employee = Employee.builder().location(office).build();
+
+        assertEquals(java.time.ZoneId.of("Asia/Kolkata"), service.resolveEmployeeZoneId(employee),
+                "a pending change effective tomorrow must never be exposed by a fresh resolution today");
+    }
+
+    @Test
+    void resolveEmployeeZoneId_pendingTimezoneEffectiveAsOfToday_usesThePendingOne() {
+        Location office = Location.builder().name("Office").timezone("Asia/Kolkata")
+                .pendingTimezone("America/New_York").pendingTimezoneEffectiveFrom(java.time.LocalDate.now())
+                .build();
+        Employee employee = Employee.builder().location(office).build();
+
+        assertEquals(java.time.ZoneId.of("America/New_York"), service.resolveEmployeeZoneId(employee));
+    }
+
+    @Test
+    void resolveEmployeeZoneId_pendingTimezoneEffectiveInThePast_usesThePendingOne() {
+        // Resolved inline by date on every call — correctness never depends on any job having run
+        // to "promote" a since-passed pending value into the live column.
+        Location office = Location.builder().name("Office").timezone("Asia/Kolkata")
+                .pendingTimezone("America/New_York").pendingTimezoneEffectiveFrom(java.time.LocalDate.now().minusDays(5))
+                .build();
+        Employee employee = Employee.builder().location(office).build();
+
+        assertEquals(java.time.ZoneId.of("America/New_York"), service.resolveEmployeeZoneId(employee));
+    }
+
+    @Test
+    void resolveEmployeeZoneId_noPendingTimezone_usesTheLiveTimezone() {
+        Location office = Location.builder().name("Office").timezone("Asia/Kolkata").build();
+        Employee employee = Employee.builder().location(office).build();
+
+        assertEquals(java.time.ZoneId.of("Asia/Kolkata"), service.resolveEmployeeZoneId(employee));
+    }
 }

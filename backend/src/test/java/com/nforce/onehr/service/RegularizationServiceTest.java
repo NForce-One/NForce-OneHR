@@ -5,6 +5,7 @@ import com.nforce.onehr.dto.attendance.RegularizationResponse;
 import com.nforce.onehr.entity.Attendance;
 import com.nforce.onehr.entity.Employee;
 import com.nforce.onehr.entity.EmployeeManagerHistory;
+import com.nforce.onehr.entity.EmployeeShiftAssignment;
 import com.nforce.onehr.entity.RegularizationRequest;
 import com.nforce.onehr.entity.Role;
 import com.nforce.onehr.entity.Shift;
@@ -34,6 +35,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -96,6 +98,13 @@ class RegularizationServiceTest {
     // employeeId's default assigned Shift (set up below) — a field so individual @Test methods
     // can reference its id, e.g. to assert a fresh regularization-created row snapshots it.
     private Shift defaultShift;
+    // Backs the fake EmployeeShiftAssignmentResolver below — every "brand-new record" test in
+    // this file resolves against defaultShift for both employeeId and superAdminId; no test here
+    // exercises a genuinely different assignment as of the correction date (the tests that swap
+    // in a different Shift for employeeId all stub an EXISTING Attendance record, which resolves
+    // via that record's own snapshotted shiftId, never this resolver — see e.g.
+    // submit_correctingAnExistingRecord_validatesAgainstItsOwnSnapshottedShift_notTheEmployeesCurrentOne).
+    private final Map<UUID, Shift> currentShiftByEmployee = new HashMap<>();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -129,6 +138,21 @@ class RegularizationServiceTest {
         ShiftVersion defaultShiftVersion = ShiftVersion.builder().startTime(LocalTime.of(9, 0)).endTime(LocalTime.of(18, 0))
                 .lateGraceMinutes(15).build();
         lenient().when(shiftVersionResolver.resolve(any(), any())).thenReturn(defaultShiftVersion);
+        // ONEHR-336 follow-up: ShiftDayPolicy's own "did the Shift already exist as of yesterday"
+        // pre-check now calls resolveIfPresent (not resolve) directly — a plain @Mock leaves it
+        // unstubbed, which Mockito answers with Optional.empty() regardless of whatever resolve()
+        // was told to return, silently breaking Rule 2's overnight-rollover check everywhere in
+        // this file. Delegates to whatever resolve() stub is active for that call (this default,
+        // or any test-specific override registered later) instead of duplicating it, so every
+        // existing resolve()-based fixture keeps behaving exactly as it did before that method
+        // existed.
+        lenient().when(shiftVersionResolver.resolveIfPresent(any(), any())).thenAnswer(inv -> {
+            try {
+                return Optional.of(shiftVersionResolver.resolve(inv.getArgument(0), inv.getArgument(1)));
+            } catch (IllegalStateException e) {
+                return Optional.empty();
+            }
+        });
         lenient().when(employeeRepository.findById(employeeId))
                 .thenReturn(Optional.of(Employee.builder().userId(employeeId).shift(defaultShift).build()));
         // Super Admin also holds EMPLOYEE (see superAdminUser above) and is used as the
@@ -152,7 +176,23 @@ class RegularizationServiceTest {
         lenient().when(shiftWeeklyOffRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
                 com.nforce.onehr.entity.ShiftWeeklyOffRules.builder()
                         .maximumShiftDayDurationHours(java.math.BigDecimal.valueOf(18)).build()));
-        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver);
+        currentShiftByEmployee.put(employeeId, defaultShift);
+        currentShiftByEmployee.put(superAdminId, defaultShift);
+        EmployeeShiftAssignmentResolver employeeShiftAssignmentResolver = new EmployeeShiftAssignmentResolver(null) {
+            @Override
+            public Optional<EmployeeShiftAssignment> resolveIfPresent(UUID employeeUserId, LocalDate workDate) {
+                Shift s = currentShiftByEmployee.get(employeeUserId);
+                return s == null ? Optional.empty()
+                        : Optional.of(EmployeeShiftAssignment.builder()
+                                .employeeUserId(employeeUserId).shift(s).effectiveFrom(LocalDate.MIN).build());
+            }
+            @Override
+            public EmployeeShiftAssignment resolve(UUID employeeUserId, LocalDate workDate) {
+                return resolveIfPresent(employeeUserId, workDate)
+                        .orElseThrow(() -> new IllegalStateException("no assignment effective on or before " + workDate));
+            }
+        };
+        ShiftDayPolicy shiftDayPolicy = new ShiftDayPolicy(new ShiftWeeklyOffRulesService(shiftWeeklyOffRulesRepository), shiftVersionResolver, employeeShiftAssignmentResolver);
         lenient().when(attendanceRulesRepository.findBySingletonTrue()).thenReturn(Optional.of(
                 com.nforce.onehr.entity.AttendanceRules.builder()
                         .halfDayMaxHours(java.math.BigDecimal.valueOf(4.0))
@@ -168,7 +208,7 @@ class RegularizationServiceTest {
         // record approve() test in this file currently stubs an empty Attendance lookup (always
         // hitting the brand-new-record/interpretForKnownWorkDate path) rather than an existing one.
         lenient().when(shiftRepository.findById(defaultShift.getId())).thenReturn(Optional.of(defaultShift));
-        attendanceInterpretationService = new AttendanceInterpretationService(shiftDayPolicy, shiftRepository);
+        attendanceInterpretationService = new AttendanceInterpretationService(shiftDayPolicy, shiftRepository, employeeShiftAssignmentResolver);
 
         // Default Clock for every test that doesn't care about the future-timestamp guard (see
         // RegularizationService#resolveTimes): a fixed instant a decade past whatever "now" is
