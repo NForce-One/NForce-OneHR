@@ -155,6 +155,14 @@ function getRequestedDates(item: ApprovalItem) {
   if (item.requestType === 'EXPENSE') {
     return item.expenseDate ?? EMPTY_VALUE;
   }
+  // Asset requests only ever collect Category + Reason (see RequestAssetModal) — there's no
+  // separate "requested date" field to show. Rather than leave the column looking blank/broken,
+  // fall back to the submission date, which is a real, already-captured date for every request
+  // (item.createdAt is always populated). Sliced to a plain date to match the un-formatted
+  // ISO date strings the other branches above show in this same column.
+  if (item.requestType === 'ASSET_REQUEST') {
+    return item.createdAt.slice(0, 10);
+  }
   return EMPTY_VALUE;
 }
 

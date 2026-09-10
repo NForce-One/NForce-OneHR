@@ -185,6 +185,9 @@ public class EmailService {
     }
 
     private String buildResetHtml(String fullName, String email, String tempPassword, String baseUrl) {
+        // Carries the email as a query param so the linked page (ResetPasswordPage in the
+        // frontend) never has to ask the user to type it again — see forgot-password flow.
+        String resetLink = baseUrl + "/reset-password?email=" + java.net.URLEncoder.encode(email, java.nio.charset.StandardCharsets.UTF_8);
         return """
                 <!DOCTYPE html>
                 <html lang="en">
@@ -224,13 +227,13 @@ public class EmailService {
                           <table width="100%%" cellpadding="0" cellspacing="0" role="presentation" style="background-color:#2d2216;border-radius:4px;margin-bottom:23px;">
                             <tr><td style="border-left:3px solid #d97706;padding:12px 16px;">
                               <p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#f59e0b;">⚠️ Temporary Password Notice</p>
-                              <p style="margin:0;font-size:13px;color:#9ca3af;line-height:1.4;">This password is for one-time use only. For your security, you will be required to set a new password immediately after signing in.</p>
+                              <p style="margin:0;font-size:13px;color:#9ca3af;line-height:1.4;">This password is for one-time use only. Enter it on the next page along with your new password to finish resetting your account.</p>
                             </td></tr>
                           </table>
 
                           <table width="100%%" cellpadding="0" cellspacing="0" role="presentation">
                             <tr><td>
-                              <a href="%s/login" style="display:block;width:100%%;box-sizing:border-box;background-color:#b91c1c;color:#ffffff;text-align:center;padding:6.5px 12px;border-radius:6px;text-decoration:none;font-weight:600;font-size:15px;">Sign in to OneHR →</a>
+                              <a href="%s" style="display:block;width:100%%;box-sizing:border-box;background-color:#b91c1c;color:#ffffff;text-align:center;padding:6.5px 12px;border-radius:6px;text-decoration:none;font-weight:600;font-size:15px;">Reset your password →</a>
                             </td></tr>
                           </table>
 
@@ -245,7 +248,7 @@ public class EmailService {
                   </table>
                 </body>
                 </html>
-                """.formatted(baseUrl, fullName, email, tempPassword, baseUrl);
+                """.formatted(baseUrl, fullName, email, tempPassword, resetLink);
     }
 
     private String buildLateArrivalHtml(String fullName, LocalDate date, LocalTime expectedTime,

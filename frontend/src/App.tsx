@@ -4,6 +4,7 @@ import LandingPage from './pages/LandingPage';
 import RoleGuidePage from './pages/RoleGuidePage';
 import Login from './pages/auth/Login';
 import ForgotPasswordPage from './pages/auth/ForgotPasswordPage';
+import ResetPasswordPage from './pages/auth/ResetPasswordPage';
 import ChangePasswordPage from './pages/ChangePasswordPage';
 import DashboardPage from './pages/DashboardPage';
 import AttendancePage from './pages/AttendancePage';
@@ -93,6 +94,7 @@ export default function App() {
         <Route path="/role-guide/:role" element={<RoleGuidePage />} />
         <Route path="/login" element={<Login />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/reset-password" element={<ResetPasswordPage />} />
 
         {/* Auth required, password-change gate */}
         <Route
@@ -134,6 +136,11 @@ export default function App() {
           <Route path="/directory"      element={<DirectoryPage />} />
           <Route path="/hierarchy"      element={<HierarchyPage />} />
           <Route path="/documents"      element={<DocumentsRouter />} />
+          {/* HR Admin/Super Admin's own "My Documents & Policies" (see nav.config.ts) — distinct
+              from /documents, which is their Documents & Compliance admin view. DocumentsPage is
+              self-scoped (fetches only the caller's own documents/policies), so it's safe to reuse
+              verbatim for these roles too. */}
+          <Route path="/my-documents"   element={<DocumentsPage />} />
           <Route path="/policies"       element={<PoliciesPage />} />
           <Route path="/onboarding"     element={<OnboardingPage />} />
           <Route path="/audit"          element={<AuditRouter />} />
