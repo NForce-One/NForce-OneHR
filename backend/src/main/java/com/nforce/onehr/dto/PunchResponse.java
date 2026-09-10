@@ -14,4 +14,6 @@ public class PunchResponse {
     private LocalDateTime checkOutAt;
     /** "SYSTEM" (normal Check-In/Check-Out) or "WEB_REMOTE" (Web Check-In/Check-Out) — mirrors Attendance.source. */
     private String source;
+    /** The Web Clock-In note, if one was provided — always null for a "SYSTEM" source punch. */
+    private String note;
 }

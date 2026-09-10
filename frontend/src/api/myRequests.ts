@@ -12,7 +12,10 @@ async function handle<T>(res: Response): Promise<T> {
   return body as T;
 }
 
-export type RequestType = 'LEAVE' | 'REGULARIZATION' | 'WEB_CLOCK_IN' | 'WFH' | 'PARTIAL_DAY' | 'OVERTIME';
+// WEB_CLOCK_IN is deliberately absent — it needs no approval and has no decision to track (see
+// WebClockInService's own class Javadoc); the employee sees it directly in the Attendance page's
+// punch history instead.
+export type RequestType = 'LEAVE' | 'REGULARIZATION' | 'WFH' | 'PARTIAL_DAY' | 'OVERTIME';
 
 export interface MyRequestItem {
   id: string;

@@ -1,0 +1,23 @@
+-- NForce OneHR — Flyway Migration V175
+-- Drops `idx_web_clock_in_one_per_date`, a full UNIQUE INDEX on
+-- web_clock_in_requests(employee_user_id, work_date) that landed on the shared dev database via
+-- a migration (a "V150 — one web clock in request per employee per day") that never made it into
+-- this branch's own migration history (see V40/V47/V130's header comments on this shared-DB
+-- numbering hazard — this is exactly that scenario, just discovered post-hoc via
+-- flyway_schema_history rather than a version-number collision at merge time).
+--
+-- That constraint directly contradicts the current, explicit requirement: an employee must be
+-- able to Web Clock-In and Web Clock-Out multiple times within the same resolved work day, each
+-- cycle its own row (see WebClockInService's own class Javadoc). With this unconditional
+-- unique index in place, the SECOND Web Clock-In of any day fails at the database layer with a
+-- unique-constraint violation the instant it's attempted — regardless of what the application
+-- code does — which is the confirmed root cause of "cannot perform a second Web Clock In."
+--
+-- Safe to drop outright: the real invariant — only one *open* (not-yet-checked-out) Web session
+-- at a time — is already enforced at the application layer via
+-- WebClockInService#submit's own open-session guard (against
+-- WebClockInRequest.checkedOutAt), which has always been the actual source of truth for
+-- "already checked in." This index was never that check; it only ever blocked a second row for
+-- the same day outright, open or closed, which is exactly what multi-cycle Web Clock-In/Out
+-- requires.
+DROP INDEX IF EXISTS idx_web_clock_in_one_per_date;

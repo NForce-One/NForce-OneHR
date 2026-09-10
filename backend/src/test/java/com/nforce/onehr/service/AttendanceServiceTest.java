@@ -1294,7 +1294,7 @@ class AttendanceServiceTest {
                 .id(UUID.randomUUID()).employeeUserId(employeeId).workDate(workDate)
                 .requestedCheckIn(LocalDateTime.of(workDate, LocalTime.of(22, 7)))
                 .checkedOutAt(LocalDateTime.of(workDate, LocalTime.of(22, 8)))
-                .reason("test").status("PENDING").build();
+                .reason("test").build();
         when(webClockInRequestRepository.findByEmployeeUserIdAndWorkDateOrderByRequestedCheckInAsc(employeeId, workDate))
                 .thenReturn(List.of(webCycle));
 

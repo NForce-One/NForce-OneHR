@@ -12,8 +12,10 @@ async function handle<T>(res: Response): Promise<T> {
   return body as T;
 }
 
+// WEB_CLOCK_IN is deliberately absent — Web Clock-In needs no approval at all anymore (see
+// WebClockInService's own class Javadoc) and can never appear in this queue.
 export type RequestType =
-  | 'LEAVE' | 'REGULARIZATION' | 'WEB_CLOCK_IN' | 'EXPENSE' | 'ASSET_REQUEST'
+  | 'LEAVE' | 'REGULARIZATION' | 'EXPENSE' | 'ASSET_REQUEST'
   | 'WFH' | 'PARTIAL_DAY' | 'OVERTIME' | 'HELP_CONTENT';
 
 export interface ApprovalItem {

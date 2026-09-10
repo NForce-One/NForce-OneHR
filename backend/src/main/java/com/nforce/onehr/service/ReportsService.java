@@ -70,7 +70,10 @@ public class ReportsService {
                                 .checkIn(r.getRequestedCheckIn())
                                 .checkOut(r.getCheckedOutAt())
                                 .reason(r.getReason())
-                                .status(r.getStatus())
+                                // Web Clock-In has no review status at all (see
+                                // WebClockInService's own class Javadoc) — this column instead
+                                // reflects the session's own completion state.
+                                .status(r.getCheckedOutAt() != null ? "Checked Out" : "Checked In")
                                 .build())
                         .toList();
 

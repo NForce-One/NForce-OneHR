@@ -26,6 +26,7 @@ const CATEGORY_BY_TYPE: Record<string, NotificationCategory> = {
   REGULARIZATION_PARTIALLY_APPROVED:'Leave & Attendance',
   REGULARIZATION_REJECTED:          'Leave & Attendance',
   PENALIZATION_POLICY_CHANGED:      'Leave & Attendance',
+  WEB_CLOCK_IN_NOTICE:              'Leave & Attendance',
   // Expense & Assets
   EXPENSE_SUBMITTED:                 'Expense & Assets',
   EXPENSE_MANAGER_APPROVED:          'Expense & Assets',

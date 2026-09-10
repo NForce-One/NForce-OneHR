@@ -11,7 +11,6 @@ import com.nforce.onehr.dto.helpcontent.ApprovalAttemptDto;
 import com.nforce.onehr.entity.Role;
 import com.nforce.onehr.entity.User;
 import com.nforce.onehr.repository.UserRepository;
-import com.nforce.onehr.dto.attendance.WebClockInResponse;
 import com.nforce.onehr.service.AssetService;
 import com.nforce.onehr.service.AttendanceRequestService;
 import com.nforce.onehr.service.ExpenseService;
@@ -19,7 +18,6 @@ import com.nforce.onehr.service.HelpContentService;
 import com.nforce.onehr.service.LeaveService;
 import com.nforce.onehr.service.OvertimeRequestService;
 import com.nforce.onehr.service.RegularizationService;
-import com.nforce.onehr.service.WebClockInService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
@@ -45,7 +43,6 @@ public class ApprovalCenterController {
 
     private final LeaveService leaveService;
     private final RegularizationService regularizationService;
-    private final WebClockInService webClockInService;
     private final ExpenseService expenseService;
     private final AssetService assetService;
     private final AttendanceRequestService attendanceRequestService;
@@ -78,9 +75,6 @@ public class ApprovalCenterController {
             // Regularization — managers see own reports' pending requests
             regularizationService.listPendingForApprover(email).stream()
                     .map(this::regularizationToApprovalItem).forEach(items::add);
-            // Web Clock-In — managers see own reports' pending requests
-            webClockInService.listPendingForApprover(email).stream()
-                    .map(this::webClockInToApprovalItem).forEach(items::add);
             // Expense — manager stage only
             expenseService.pendingForManager(email).stream()
                     .map(c -> expenseToApprovalItem(c, "MANAGER")).forEach(items::add);
@@ -105,9 +99,6 @@ public class ApprovalCenterController {
             // Regularization — HR/SA see all pending
             regularizationService.listPendingForApprover(email).stream()
                     .map(this::regularizationToApprovalItem).forEach(items::add);
-            // Web Clock-In — HR/SA see all pending
-            webClockInService.listPendingForApprover(email).stream()
-                    .map(this::webClockInToApprovalItem).forEach(items::add);
             // Expense — HR/SA see claims at both stages now (SUBMITTED and MANAGER_APPROVED), so
             // tag each item with its ACTUAL stage rather than hardcoding "FINAL" — the frontend
             // routes the approve/reject click through managerApprove/managerReject vs
@@ -173,20 +164,6 @@ public class ApprovalCenterController {
                 .attendanceDate(r.getAttendanceDate())
                 .requestedCheckIn(r.getRequestedCheckIn())
                 .requestedCheckOut(r.getRequestedCheckOut())
-                .regularizationReason(r.getReason())
-                .build();
-    }
-
-    private ApprovalItemDto webClockInToApprovalItem(WebClockInResponse r) {
-        return ApprovalItemDto.builder()
-                .id(r.getId().toString())
-                .requestType("WEB_CLOCK_IN")
-                .employeeUserId(r.getEmployeeUserId())
-                .employeeName(r.getEmployeeName())
-                .createdAt(r.getCreatedAt() != null
-                        ? r.getCreatedAt().atZone(ZoneId.of("UTC")).toInstant() : null)
-                .attendanceDate(r.getWorkDate())
-                .requestedCheckIn(r.getRequestedCheckIn())
                 .regularizationReason(r.getReason())
                 .build();
     }
