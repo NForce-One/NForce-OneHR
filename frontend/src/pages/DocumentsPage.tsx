@@ -419,15 +419,20 @@ export default function DocumentsPage() {
                   </div>
                 </div>
                 <div style={{ flexShrink: 0 }}>
-                  {p.acknowledged === false ? (
-                    <button onClick={() => setAckTarget(p)}
-                      style={{ padding: '7px 16px', background: '#A01418', border: 'none', borderRadius: 6, color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
-                      Review & Acknowledge
-                    </button>
-                  ) : (
-                    <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: '#22c55e', fontSize: 13, fontWeight: 600 }}>
-                      <CheckCircle size={14} /> Acknowledged
-                    </span>
+                  {/* Acknowledgment wasn't enabled when this policy was published — it's viewable
+                      only, so no action is shown and it never counts as pending (see p.required
+                      gating on pendingPolicies above and the backend's countPendingRequired* queries). */}
+                  {p.required && (
+                    p.acknowledged === false ? (
+                      <button onClick={() => setAckTarget(p)}
+                        style={{ padding: '7px 16px', background: '#A01418', border: 'none', borderRadius: 6, color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+                        Review & Acknowledge
+                      </button>
+                    ) : (
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 5, color: '#22c55e', fontSize: 13, fontWeight: 600 }}>
+                        <CheckCircle size={14} /> Acknowledged
+                      </span>
+                    )
                   )}
                 </div>
               </div>
