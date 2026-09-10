@@ -427,8 +427,7 @@ export default function DocumentsCompliancePage() {
                     <td style={tdS}>{d.expiryDate ? new Date(d.expiryDate).toLocaleDateString() : '—'}</td>
                     <td style={{ ...tdS, width: 48 }}>
                       <KebabMenu items={[
-                        { label: 'Review & Verify', onClick: () => setDetailDoc(d) },
-                        { label: 'Review & Reject', onClick: () => setDetailDoc(d), danger: true },
+                        { label: 'Review', onClick: () => setDetailDoc(d) },
                       ]} />
                     </td>
                   </tr>
