@@ -23,6 +23,7 @@ import { directoryApi, type DirectoryEntry } from '../api/directory';
 import { kudosApi } from '../api/kudos';
 import { StatusBadge, inactiveDimStyle } from '../components/EmployeeStatus';
 import { EmployeeAvatar } from '../components/EmployeeAvatar';
+import { TypeBadge, groupRequestsByType } from '../components/TypeBadge';
 
 /* ── Date helpers (local to this page, matching the codebase's per-page convention) ── */
 function todayIsoDate(): string {
@@ -91,18 +92,6 @@ const panelStyle: React.CSSProperties = { background: 'var(--panel)', border: '1
 const panelHeadStyle: React.CSSProperties = { padding: '14px 18px', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 };
 const panelTitleStyle: React.CSSProperties = { fontFamily: 'Inter, sans-serif', fontWeight: 700, fontSize: 14, color: 'var(--txt)' };
 const panelCountStyle: React.CSSProperties = { fontSize: 11, fontWeight: 700, color: 'var(--txt-mut)', background: 'var(--raised2)', padding: '2px 8px', borderRadius: 20 };
-
-const TYPE_LABELS: Record<'LEAVE' | 'REGULARIZATION', string> = { LEAVE: 'Leave', REGULARIZATION: 'Attendance Reg.' };
-const TYPE_COLORS: Record<'LEAVE' | 'REGULARIZATION', string> = { LEAVE: 'rgba(99,102,241,.18)', REGULARIZATION: 'rgba(245,158,11,.18)' };
-const TYPE_TEXT: Record<'LEAVE' | 'REGULARIZATION', string> = { LEAVE: '#818CF8', REGULARIZATION: '#F59E0B' };
-
-function TypeBadge({ type }: { type: 'LEAVE' | 'REGULARIZATION' }) {
-  return (
-    <span style={{ fontSize: 10.5, fontWeight: 700, padding: '3px 8px', borderRadius: 20, background: TYPE_COLORS[type], color: TYPE_TEXT[type], whiteSpace: 'nowrap' }}>
-      {TYPE_LABELS[type]}
-    </span>
-  );
-}
 
 function Avatar({ userId, name, size = 34 }: { userId?: string | null; name: string; size?: number }) {
   return (
@@ -2368,7 +2357,9 @@ export default function MyTeamPage() {
                 </div>
                 {row.requests.length > 0 && (
                   <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-                    {row.requests.map(r => <TypeBadge key={`${r.requestType}:${r.id}`} type={r.requestType as 'LEAVE' | 'REGULARIZATION'} />)}
+                    {groupRequestsByType(row.requests).map(({ type, count }) => (
+                      <TypeBadge key={type} type={type} count={count} />
+                    ))}
                   </div>
                 )}
                 <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -2417,7 +2408,7 @@ export default function MyTeamPage() {
                     {weekDayDates.map((d, i) => {
                       const on = toISO(d) >= l.startDate && toISO(d) <= l.endDate;
                       return (
-                        <div key={i} style={{ width: 18, height: 18, borderRadius: 4, display: 'grid', placeItems: 'center', fontSize: 8.5, fontWeight: 700, background: on ? 'var(--info)' : 'var(--raised2)', color: on ? '#fff' : 'var(--txt-dim)' }}>
+                        <div key={i} style={{ width: 18, height: 18, borderRadius: 4, display: 'grid', placeItems: 'center', fontSize: 8.5, fontWeight: 700, background: on ? DAY_COLORS.leave : 'var(--raised2)', color: on ? '#fff' : 'var(--txt-dim)' }}>
                           {WEEK_CHIPS[i]}
                         </div>
                       );
