@@ -888,8 +888,13 @@ public class AttendanceService {
         List<Employee> reports = employeeRepository.findAllById(reportIds).stream()
                 .filter(e -> e.getUser() != null && e.getUser().getDeletedAt() == null)
                 .toList();
-        List<Attendance> records =
-                attendanceRepository.findByWorkDateAndEmployeeUserIdIn(day, reportIds);
+        // Widened +/-1 day around the business-zone day (not just an exact match) — see
+        // resolveRosterRecord's doc comment: an employee whose Location timezone sits on the
+        // other side of local midnight from the business zone gets their check-in's workDate
+        // stamped a day off from `day`, and a narrower exact-day query would miss it entirely,
+        // wrongly leaving them in "Not in yet today" despite already having checked in.
+        List<Attendance> records = attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(
+                reportIds, day.minusDays(1), day.plusDays(1));
         return joinRoster(reports, records, day);
     }
 
@@ -940,8 +945,10 @@ public class AttendanceService {
         List<Employee> team = employeeRepository.findAllById(teamIds).stream()
                 .filter(e -> e.getUser() != null && e.getUser().getDeletedAt() == null)
                 .toList();
-        List<Attendance> records =
-                attendanceRepository.findByWorkDateAndEmployeeUserIdIn(day, teamIds);
+        // Widened +/-1 day around the business-zone day — see getDayForMyTeam's identical
+        // comment and resolveRosterRecord's doc comment for why.
+        List<Attendance> records = attendanceRepository.findByEmployeeUserIdInAndWorkDateBetween(
+                teamIds, day.minusDays(1), day.plusDays(1));
         return joinRoster(team, records, day);
     }
 
@@ -1462,12 +1469,12 @@ public class AttendanceService {
     /** Left-joins a day's records onto an employee list so non-punchers still appear as a row. */
     private List<AttendanceResponse> joinRoster(List<Employee> employees, List<Attendance> records,
                                                 LocalDate day) {
-        Map<UUID, Attendance> byEmployee = records.stream()
-                .collect(Collectors.toMap(Attendance::getEmployeeUserId, Function.identity()));
+        Map<UUID, List<Attendance>> byEmployee = records.stream()
+                .collect(Collectors.groupingBy(Attendance::getEmployeeUserId));
 
         List<AttendanceResponse> rows = new ArrayList<>(employees.size());
         for (Employee employee : employees) {
-            Attendance record = byEmployee.get(employee.getUserId());
+            Attendance record = resolveRosterRecord(byEmployee.get(employee.getUserId()), employee, day);
             rows.add(record != null
                     ? toResponse(record, employee)
                     : AttendanceResponse.builder()
@@ -1481,6 +1488,35 @@ public class AttendanceService {
         rows.sort(Comparator.comparing(AttendanceResponse::getFullName,
                 Comparator.nullsLast(String::compareToIgnoreCase)));
         return rows;
+    }
+
+    /**
+     * Picks which of an employee's nearby-day Attendance rows (see getDayForMyTeam/
+     * getDayForPeers's widened +/-1 day query) is "today's" check-in for the roster. An exact
+     * match on the roster's own business-zone {@code day} wins when present (the common case,
+     * and what keeps every other employee's row byte-for-byte identical to before). Otherwise,
+     * falls back to a row dated the employee's OWN configured zone's current calendar date —
+     * purely a same-employee, location-derived TIMEZONE correction (not a location filter): an
+     * employee whose Location timezone sits on the other side of local midnight from the
+     * business zone has their check-in workDate stamped one day off, and must still count as
+     * checked in today rather than wrongly appear in "Not in yet today". A candidate list with
+     * no match on either date means the employee genuinely hasn't punched for either day.
+     */
+    private Attendance resolveRosterRecord(List<Attendance> candidates, Employee employee, LocalDate day) {
+        if (candidates == null || candidates.isEmpty()) {
+            return null;
+        }
+        LocalDate employeeToday = LocalDate.now(attendanceRulesService.resolveEmployeeZoneId(employee));
+        Attendance fallback = null;
+        for (Attendance candidate : candidates) {
+            if (candidate.getWorkDate().equals(day)) {
+                return candidate;
+            }
+            if (candidate.getWorkDate().equals(employeeToday)) {
+                fallback = candidate;
+            }
+        }
+        return fallback;
     }
 
     private AttendanceResponse toResponse(Attendance record, Employee employee) {
