@@ -47,10 +47,15 @@ function UploadModal({
   const [expiryDate, setExpiryDate] = useState(existing?.expiryDate?.split('T')[0] ?? '');
   const [loading, setLoading] = useState(false);
 
+  const dateError = issueDate && expiryDate && expiryDate < issueDate
+    ? 'Expiry date cannot be earlier than issue date'
+    : null;
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     const file = fileRef.current?.files?.[0];
     if (!file) return showToast('error', 'Please select a file');
+    if (dateError) return showToast('error', dateError);
     setLoading(true);
     try {
       const doc = await uploadDocument(token, {
@@ -91,16 +96,20 @@ function UploadModal({
             <div>
               <label style={{ fontSize: 12, color: 'var(--txt-dim)', display: 'block', marginBottom: 5 }}>Expiry Date {requiresExpiry ? '*' : ''}</label>
               <input type="date" value={expiryDate} onChange={e => setExpiryDate(e.target.value)} required={requiresExpiry}
-                style={{ width: '100%', padding: '8px 10px', background: 'var(--shell)', border: '1px solid var(--line)', borderRadius: 6, color: 'var(--txt)', fontSize: 13 }} />
+                min={issueDate || undefined}
+                style={{ width: '100%', padding: '8px 10px', background: 'var(--shell)', border: `1px solid ${dateError ? '#ef4444' : 'var(--line)'}`, borderRadius: 6, color: 'var(--txt)', fontSize: 13 }} />
             </div>
           </div>
+          {dateError && (
+            <p style={{ margin: '-10px 0 14px', fontSize: 12, color: '#ef4444' }}>{dateError}</p>
+          )}
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
             <button type="button" onClick={onClose} disabled={loading}
               style={{ padding: '8px 20px', background: 'var(--shell)', border: '1px solid var(--line)', borderRadius: 6, color: 'var(--txt)', cursor: 'pointer', fontSize: 13 }}>
               Cancel
             </button>
-            <button type="submit" disabled={loading}
-              style={{ padding: '8px 20px', background: '#A01418', border: 'none', borderRadius: 6, color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+            <button type="submit" disabled={loading || !!dateError}
+              style={{ padding: '8px 20px', background: '#A01418', border: 'none', borderRadius: 6, color: '#fff', cursor: loading || dateError ? 'not-allowed' : 'pointer', fontSize: 13, fontWeight: 600, opacity: loading || dateError ? .7 : 1 }}>
               {loading ? 'Uploading…' : 'Upload'}
             </button>
           </div>
