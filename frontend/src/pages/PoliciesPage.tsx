@@ -298,7 +298,7 @@ function AnnounceModal({ initial, onClose, onSaved }: {
 
 // ── Acknowledgment Drawer ─────────────────────────────────
 
-function AckDrawer({ policy, onClose }: { policy: Policy; onClose(): void }) {
+function AckDrawer({ policy, onClose, onReset }: { policy: Policy; onClose(): void; onReset(): void }) {
   const token = useAuthStore(s => s.token)!;
   const { showToast } = useToast();
   const [acks, setAcks] = useState<PolicyAcknowledgment[]>([]);
@@ -318,6 +318,7 @@ function AckDrawer({ policy, onClose }: { policy: Policy; onClose(): void }) {
     try {
       await resetAcknowledgment(token, policy.id, userId);
       setAcks(prev => prev.map(a => a.employeeUserId === userId ? { ...a, acknowledgedAt: null, pending: true } : a));
+      onReset();
       showToast('success', 'Acknowledgment reset');
     } catch (e) {
       showToast('error', e instanceof Error ? e.message : 'Reset failed');
@@ -435,6 +436,12 @@ export default function PoliciesPage() {
       .catch(e => showToast('error', e instanceof Error ? e.message : 'Load failed'))
       .finally(() => setLoading(false));
   }, [token]);
+
+  function refreshPendingAckTotal() {
+    globalPendingAckCount(token)
+      .then(setPendingAckTotal)
+      .catch(e => showToast('error', e instanceof Error ? e.message : 'Load failed'));
+  }
 
   async function doPublishAnn(id: number) {
     setPublishingAnn(id);
@@ -749,7 +756,7 @@ export default function PoliciesPage() {
         <PublishModal
           policies={policies}
           onClose={() => setShowPublish(false)}
-          onPublished={p => setPolicies(prev => [p, ...prev.map(old => old.title === p.title ? { ...old, active: false } : old)])}
+          onPublished={p => { setPolicies(prev => [p, ...prev.map(old => old.title === p.title ? { ...old, active: false } : old)]); refreshPendingAckTotal(); }}
         />
       )}
       {showAnnounce && (
@@ -772,7 +779,7 @@ export default function PoliciesPage() {
           onSaved={updated => { setAnnouncements(prev => prev.map(a => a.id === updated.id ? updated : a)); setEditAnnouncement(null); }}
         />
       )}
-      {ackPolicy && <AckDrawer policy={ackPolicy} onClose={() => setAckPolicy(null)} />}
+      {ackPolicy && <AckDrawer policy={ackPolicy} onClose={() => setAckPolicy(null)} onReset={refreshPendingAckTotal} />}
     </div>
   );
 }

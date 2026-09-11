@@ -612,6 +612,17 @@ export default function ApprovalsPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkAction, setBulkAction] = useState<ReviewMode | null>(null);
 
+  // Background refresh of the pending queue — used after an approve/reject action to correct
+  // `items` (and therefore the badge counts and visible list) against the true server state.
+  // Deliberately silent: no loading spinner and no toast on failure, since this runs after the
+  // optimistic local removal already gave the user feedback and a transient refetch failure
+  // shouldn't interrupt them — the queue simply stays as optimistically updated until the next
+  // successful reload (matches AssetsExpensesPage's reload()/PoliciesPage's
+  // refreshPendingAckTotal() pattern of a silent best-effort refetch).
+  function reloadQueue() {
+    approvalCenterApi.listPending(token).then(setItems).catch(() => {});
+  }
+
   useEffect(() => {
     approvalCenterApi.listPending(token)
       .then(setItems)
@@ -625,8 +636,11 @@ export default function ApprovalsPage() {
   const searched = searchTerm ? items.filter(i => i.employeeName.toLowerCase().includes(searchTerm)) : items;
   const filtered = typeFilter === 'ALL' ? searched : searched.filter(i => i.requestType === typeFilter);
 
-  const counts: Record<string, number> = { ALL: searched.length };
-  ALL_TYPES.forEach(t => { counts[t] = searched.filter(i => i.requestType === t).length; });
+  // Badge counts are totals over the full pending queue (`items`), not the search-narrowed
+  // `searched`/`filtered` subsets — typing in the employee search box should narrow the visible
+  // list below without making the "ALL"/per-type badge numbers shift.
+  const counts: Record<string, number> = { ALL: items.length };
+  ALL_TYPES.forEach(t => { counts[t] = items.filter(i => i.requestType === t).length; });
 
   // "Select all" only ever governs the currently-filtered/searched rows, not the whole queue —
   // selecting under one category filter and switching to another leaves that selection intact
@@ -636,10 +650,15 @@ export default function ApprovalsPage() {
   const someVisibleSelected = visibleKeys.some(k => selected.has(k));
   const selectedItems = items.filter(i => selected.has(rowKey(i)));
 
+  // Removes the acted-on item immediately for a snappy UI, then kicks off a silent background
+  // refetch of the full queue (reloadQueue) so `items` — and therefore the badge counts and
+  // visible list — self-corrects if this optimistic removal turns out to be incomplete, or if
+  // another approver acted on the same queue concurrently in a different session.
   function removeFromQueue(id: string, type: RequestType) {
     const key = `${type}:${id}`;
     setItems(prev => prev.filter(i => !(i.id === id && i.requestType === type)));
     setSelected(prev => { if (!prev.has(key)) return prev; const next = new Set(prev); next.delete(key); return next; });
+    reloadQueue();
   }
 
   function toggleSelected(key: string) {
@@ -667,6 +686,7 @@ export default function ApprovalsPage() {
       succeededKeys.forEach(k => next.delete(k));
       return next;
     });
+    reloadQueue();
   }
 
   return (

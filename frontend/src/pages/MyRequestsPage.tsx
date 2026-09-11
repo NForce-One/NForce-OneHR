@@ -1,9 +1,22 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { X } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
 import { myRequestsApi, type MyRequestItem, type RequestType } from '../api/myRequests';
 import { formatDurationMinutes } from '../context/TimeFormatContext';
+import { subscribeToNewNotifications } from '../lib/notificationEvents';
+
+// Every notification type the backend emits for a decision on one of this page's request types
+// (see NotificationService) — mirrors the LEAVE_APPROVED/LEAVE_REJECTED pattern LeavePage already
+// uses to react to the app-wide notification poll (Shell's bell) instead of running its own
+// separate polling loop. WFH/PARTIAL_DAY are both decided through AttendanceRequestService, which
+// emits ATTENDANCE_REQUEST_APPROVED/REJECTED for either.
+const REQUEST_DECISION_NOTIFICATION_TYPES = new Set([
+  'LEAVE_APPROVED', 'LEAVE_REJECTED',
+  'REGULARIZATION_APPROVED', 'REGULARIZATION_PARTIALLY_APPROVED', 'REGULARIZATION_REJECTED',
+  'ATTENDANCE_REQUEST_APPROVED', 'ATTENDANCE_REQUEST_REJECTED',
+  'OVERTIME_APPROVED', 'OVERTIME_REJECTED',
+]);
 
 const overlayStyle: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,.65)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 500 };
 const modalStyle: React.CSSProperties = { background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 12, width: '94vw', maxWidth: 520, boxShadow: '0 24px 64px rgba(0,0,0,.55)', maxHeight: '90vh', overflowY: 'auto' };
@@ -215,6 +228,40 @@ export default function MyRequestsPage() {
       .then(setItems)
       .finally(() => setLoading(false));
   }, [token]);
+
+  // Re-fetch without disturbing `loading` (no full-page skeleton flash on a background refresh) —
+  // same pattern as LeavePage's refreshLeaveData. Overlap-safe: a refresh that arrives while one
+  // is already in flight is coalesced into a single trailing re-run rather than firing a second
+  // concurrent request.
+  const refreshInFlightRef = useRef(false);
+  const refreshQueuedRef = useRef(false);
+  const refreshItems = useCallback(async () => {
+    if (refreshInFlightRef.current) { refreshQueuedRef.current = true; return; }
+    refreshInFlightRef.current = true;
+    try {
+      setItems(await myRequestsApi.list(token));
+    } finally {
+      refreshInFlightRef.current = false;
+      if (refreshQueuedRef.current) {
+        refreshQueuedRef.current = false;
+        refreshItems();
+      }
+    }
+  }, [token]);
+
+  // React to this employee's own request decisions as the app-wide notification poll (Shell)
+  // detects them, so the table/badges here don't stay stale for the rest of the session when a
+  // manager acts on a request while this page remains open. Notifications for other employees
+  // never reach this listener — the backend's /api/notifications endpoints are scoped to the
+  // authenticated caller — and unrelated notification types (expense/asset/help-content/...) are
+  // filtered out and never trigger a refresh. Unsubscribes on unmount.
+  useEffect(() => {
+    return subscribeToNewNotifications(items => {
+      if (items.some(n => REQUEST_DECISION_NOTIFICATION_TYPES.has(n.type))) {
+        refreshItems();
+      }
+    });
+  }, [refreshItems]);
 
   const filtered = typeFilter === 'ALL' ? items : items.filter(i => i.requestType === typeFilter);
 

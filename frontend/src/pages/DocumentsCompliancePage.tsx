@@ -283,9 +283,9 @@ export default function DocumentsCompliancePage() {
       const updated = await verifyDocument(token, doc.id, 'VERIFY');
       setPending(p => p.filter(d => d.id !== doc.id));
       setVerified(v => [updated, ...v]);
-      setKpis(k => k ? { ...k, pendingVerification: Math.max(0, k.pendingVerification - 1), totalDocuments: k.totalDocuments } : k);
       setDetailDoc(null);
       showToast('success', 'Document verified');
+      getAdminKpis(token).then(setKpis).catch(() => {});
     } catch (e) {
       showToast('error', e instanceof Error ? e.message : 'Verify failed');
     }
@@ -295,9 +295,9 @@ export default function DocumentsCompliancePage() {
     try {
       await verifyDocument(token, doc.id, 'REJECT', reason);
       setPending(p => p.filter(d => d.id !== doc.id));
-      setKpis(k => k ? { ...k, pendingVerification: Math.max(0, k.pendingVerification - 1) } : k);
       setDetailDoc(null);
       showToast('success', 'Document rejected');
+      getAdminKpis(token).then(setKpis).catch(() => {});
     } catch (e) {
       showToast('error', e instanceof Error ? e.message : 'Reject failed');
     }
@@ -345,7 +345,7 @@ export default function DocumentsCompliancePage() {
       {kpis && (
         <div className="nf-kpi-2x2-mobile" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12, marginBottom: 24 }}>
           {[
-            { label: 'Pending Verification', value: kpis.pendingVerification, color: '#eab308' },
+            { label: 'Pending Verification', value: pending.length, color: '#eab308' },
             { label: 'Employees Pending', value: kpis.employeesWithPending, color: '#f97316' },
             { label: 'Expiring in 30 Days', value: kpis.expiringWithin30Days, color: '#ef4444' },
             { label: 'Total Documents', value: kpis.totalDocuments, color: '#22c55e' },

@@ -1565,7 +1565,7 @@ function PeersView({ token }: { token: string }) {
       <div style={panelStyle}>
         <div style={panelHeadStyle}>
           <div>
-            <span style={panelTitleStyle}>Project Team ({peers.length})</span>
+            <span style={panelTitleStyle}>Project Team ({filteredPeers.length})</span>
             <div style={{ fontSize: 11.5, color: 'var(--txt-dim)', marginTop: 3 }}>Avatar, designation, live status, location, department and email — find and reach a teammate without leaving this page.</div>
           </div>
         </div>
@@ -2265,12 +2265,12 @@ export default function MyTeamPage() {
        * On mobile (see .nf-kpi-scroll in index.css) this becomes a horizontally scrollable
        * row of fixed-width cards instead of squeezing all 6 into the narrow viewport. */}
       <div className="nf-kpi-scroll" style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 12, marginBottom: 20 }}>
-        <KpiCard icon={<Users size={14} />} iconColor="var(--brand-bright)" label="Team size" value={directReportCount} note="direct reports" />
+        <KpiCard icon={<Users size={14} />} iconColor="var(--brand-bright)" label="Team size" value={loading ? '—' : directReports.length} note="direct reports" />
         <KpiCard icon={<CheckCircle2 size={14} />} iconColor="var(--ok)" label="Employees on time" value={loading ? '—' : onTimeCount} note="arrived on schedule" />
         <KpiCard icon={<Clock size={14} />} iconColor="var(--warn)" label="Late arrivals" value={loading ? '—' : lateCount} note={todayRecords.find(r => r.status === 'LATE')?.fullName ?? 'none today'} />
         <KpiCard icon={<Home size={14} />} iconColor="var(--info)" label="WFH / On duty" value={loading ? '—' : wfhOnDutyCount} note="remote or hybrid today" />
         <KpiCard icon={<MapPin size={14} />} iconColor="var(--txt-mut)" label="Remote clock-ins" value={loading ? '—' : remoteClockInCount} note="via Web Clock-In today" />
-        <KpiCard icon={<AlertTriangle size={14} />} iconColor="var(--brand-bright)" label="Needs your attention" value={attentionItems.length} note="pending leave & regularization requests" />
+        <KpiCard icon={<AlertTriangle size={14} />} iconColor="var(--brand-bright)" label="Needs your attention" value={loading ? '—' : attentionItems.length} note="pending leave & regularization requests" />
       </div>
 
       {/* Team calendar */}

@@ -212,7 +212,7 @@ function EmployeeView({ token }: { token: string }) {
     try {
       const updated = await assetsApi.acknowledge(id, token);
       setAssignments(prev => prev.map(a => a.id === updated.id ? updated : a));
-      assetsApi.employeeTiles(token).then(setTiles).catch(() => {});
+      reload();
       showToast('success', 'Receipt acknowledged');
     } catch (e) {
       showToast('error', e instanceof Error ? e.message : 'Failed');
@@ -453,7 +453,7 @@ function EmployeeView({ token }: { token: string }) {
           categories={categories}
           token={token}
           onClose={() => setShowRequestModal(false)}
-          onCreated={r => { setRequests(prev => [r, ...prev]); assetsApi.employeeTiles(token).then(setTiles).catch(() => {}); showToast('success', 'Asset request submitted — pending manager approval'); }}
+          onCreated={r => { setRequests(prev => [r, ...prev]); reload(); showToast('success', 'Asset request submitted — pending manager approval'); }}
         />
       )}
       {showExpModal && (
@@ -461,7 +461,7 @@ function EmployeeView({ token }: { token: string }) {
           categories={expCategories}
           token={token}
           onClose={() => setShowExpModal(false)}
-          onCreated={c => { setClaims(prev => [c, ...prev]); expensesApi.employeeTiles(token).then(setExpTiles).catch(() => {}); showToast('success', 'Expense claim submitted'); }}
+          onCreated={c => { setClaims(prev => [c, ...prev]); reload(); showToast('success', 'Expense claim submitted'); }}
         />
       )}
     </div>
@@ -849,7 +849,6 @@ function HRView({ token }: { token: string }) {
   const [assetRequests, setAssetRequests] = useState<AssetRequestResponse[]>([]);
   const [expCategories, setExpCategories] = useState<ExpenseCategory[]>([]);
   const [payrollClaims, setPayrollClaims] = useState<ExpenseClaimResponse[]>([]);
-  const [inventoryFilter, setInventoryFilter] = useState<'ALL' | 'OVERDUE'>('ALL');
   const [inventorySearch, setInventorySearch] = useState('');
   const [inventoryCatFilter, setInventoryCatFilter] = useState('');
   const [inventoryStatusFilter, setInventoryStatusFilter] = useState('');
@@ -879,7 +878,6 @@ function HRView({ token }: { token: string }) {
   const inventoryStatusOptions = Array.from(new Set(inventory.map(a => a.status)));
 
   const filteredInventory = inventory
-    .filter(a => inventoryFilter === 'ALL' || a.status === 'ASSIGNED')
     .filter(a => !inventorySearch || a.assetTag.toLowerCase().includes(inventorySearch.toLowerCase()) || (a.serialNumber ?? '').toLowerCase().includes(inventorySearch.toLowerCase()) || (a.brand ?? '').toLowerCase().includes(inventorySearch.toLowerCase()) || (a.model ?? '').toLowerCase().includes(inventorySearch.toLowerCase()))
     .filter(a => !inventoryCatFilter || a.categoryName === inventoryCatFilter)
     .filter(a => !inventoryStatusFilter || a.status === inventoryStatusFilter);
@@ -888,6 +886,7 @@ function HRView({ token }: { token: string }) {
     try {
       const updated = await assetsApi.retireAsset(assetId, token);
       setInventory(prev => prev.map(a => a.id === updated.id ? updated : a));
+      reload();
       showToast('success', 'Asset retired');
     } catch (e) { showToast('error', e instanceof Error ? e.message : 'Failed'); }
   }
@@ -911,9 +910,14 @@ function HRView({ token }: { token: string }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       {/* Tiles */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
-        <Tile label="Assets Assigned" value={hrTiles?.totalAssigned ?? '—'} clickable onClick={() => { setInventoryFilter('ALL'); setInventoryStatusFilter(''); setActiveTab('inventory'); }} />
-        <Tile label="Available Inventory" value={hrTiles?.available ?? '—'} clickable onClick={() => { setInventoryFilter('ALL'); setInventoryStatusFilter('AVAILABLE'); setActiveTab('inventory'); }} />
-        <Tile label="Overdue Returns" value={hrTiles?.overdueReturns ?? '—'} clickable={!!hrTiles?.overdueReturns} onClick={() => { setInventoryFilter('OVERDUE'); setInventoryStatusFilter(''); setActiveTab('inventory'); }} />
+        <Tile label="Assets Assigned" value={hrTiles?.totalAssigned ?? '—'} clickable onClick={() => { setInventoryStatusFilter(''); setActiveTab('inventory'); }} />
+        <Tile label="Available Inventory" value={hrTiles?.available ?? '—'} clickable onClick={() => { setInventoryStatusFilter('AVAILABLE'); setActiveTab('inventory'); }} />
+        {/* No due-date/expected-return field exists on AssetResponse or in the backend Asset/AssetAssignment
+            model — "overdue" here is computed server-side only (assignments to inactive/deleted employees,
+            see AssetAssignmentRepository#findOverdueAssignments) and cannot be reproduced as a client-side
+            predicate over the inventory list. Navigate to Inventory without applying a fake/misleading
+            filter rather than silently showing "assigned" assets under an "overdue" label. */}
+        <Tile label="Overdue Returns" value={hrTiles?.overdueReturns ?? '—'} clickable={!!hrTiles?.overdueReturns} onClick={() => { setInventoryStatusFilter(''); setActiveTab('inventory'); }} />
         <Tile label="Pending Expense Clearance" value={hrExpTiles?.pendingClearanceCount ?? '—'} sub={hrExpTiles?.pendingClearanceCount ? fmtCurrency(hrExpTiles.pendingAmount) : undefined} clickable={!!hrExpTiles?.pendingClearanceCount} onClick={() => navigate('/approvals?type=EXPENSE&stage=FINAL')} clickHint="Review in Approval Center →" />
         <Tile label="Pending Asset Fulfillment" value={assetRequests.filter(r => r.status === 'APPROVED').length} clickable onClick={() => setActiveTab('requests')} />
       </div>
@@ -951,10 +955,6 @@ function HRView({ token }: { token: string }) {
           <select value={inventoryStatusFilter} onChange={e => setInventoryStatusFilter(e.target.value)} style={{ ...inputStyle, width: 'auto', fontSize: 12, padding: '6px 10px' }}>
             <option value="">All Statuses</option>
             {inventoryStatusOptions.map(s => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
-          </select>
-          <select value={inventoryFilter} onChange={e => setInventoryFilter(e.target.value as 'ALL' | 'OVERDUE')} style={{ ...inputStyle, width: 'auto', fontSize: 12, padding: '6px 10px' }}>
-            <option value="ALL">All Assets</option>
-            <option value="OVERDUE">Overdue Returns</option>
           </select>
         </div>
         <div style={panelStyle}>
@@ -1103,8 +1103,8 @@ function HRView({ token }: { token: string }) {
       {showAddAsset && <AddAssetModal token={token} onClose={() => setShowAddAsset(false)} onCreated={a => { setInventory(prev => [a, ...prev]); showToast('success', 'Asset added'); }} />}
       {showAssignModal && <AssignAssetModal asset={showAssignModal} token={token} mode="assign" onClose={() => setShowAssignModal(null)} onDone={a => { setInventory(prev => prev.map(x => x.id === a.id ? a : x)); reload(); showToast('success', 'Asset assigned'); setShowAssignModal(null); }} />}
       {showReassignModal && <AssignAssetModal asset={showReassignModal} token={token} mode="reassign" onClose={() => setShowReassignModal(null)} onDone={a => { setInventory(prev => prev.map(x => x.id === a.id ? a : x)); reload(); showToast('success', 'Asset reassigned'); setShowReassignModal(null); }} />}
-      {showReturnModal && <MarkReturnedModal asset={showReturnModal} token={token} onClose={() => setShowReturnModal(null)} onDone={a => { setInventory(prev => prev.map(x => x.id === a.id ? a : x)); setShowReturnModal(null); showToast('success', 'Asset marked returned'); }} />}
-      {showFulfillModal && <FulfillRequestModal request={showFulfillModal} token={token} onClose={() => setShowFulfillModal(null)} onDone={r => { setAssetRequests(prev => prev.map(x => x.id === r.id ? r : x)); setShowFulfillModal(null); showToast('success', 'Request fulfilled'); }} />}
+      {showReturnModal && <MarkReturnedModal asset={showReturnModal} token={token} onClose={() => setShowReturnModal(null)} onDone={a => { setInventory(prev => prev.map(x => x.id === a.id ? a : x)); reload(); setShowReturnModal(null); showToast('success', 'Asset marked returned'); }} />}
+      {showFulfillModal && <FulfillRequestModal request={showFulfillModal} token={token} onClose={() => setShowFulfillModal(null)} onDone={r => { setAssetRequests(prev => prev.map(x => x.id === r.id ? r : x)); reload(); setShowFulfillModal(null); showToast('success', 'Request fulfilled'); }} />}
       {showCatModal && <ExpenseCategoryModal category={showCatModal === 'new' ? null : showCatModal} token={token} onClose={() => setShowCatModal(null)} onSaved={c => { setExpCategories(prev => { const idx = prev.findIndex(x => x.id === c.id); return idx >= 0 ? prev.map((x, i) => i === idx ? c : x) : [c, ...prev]; }); showToast('success', 'Category saved'); setShowCatModal(null); }} />}
     </div>
   );
