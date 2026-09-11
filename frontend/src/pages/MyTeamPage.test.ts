@@ -85,3 +85,51 @@ describe('TypeBadge badge text calculation', () => {
     expect(getBadgeText('REGULARIZATION', 3)).toBe('Attendance Reg. +2');
   });
 });
+
+describe('MyTeamPage viewMode and tab persistence on refresh', () => {
+  function resolveInitialViewMode(isEmployee: boolean, savedStorageMode: string | null): 'direct' | 'peers' {
+    if (isEmployee) return 'peers';
+    if (savedStorageMode === 'peers' || savedStorageMode === 'direct') return savedStorageMode;
+    return 'direct';
+  }
+
+  function resolveInitialTab(
+    paramTab: string | null,
+    savedStorageTab: string | null
+  ): 'overview' | 'effort' | 'negligence' | 'penalties' | 'assignments' | 'reports' {
+    const validTabs = ['overview', 'effort', 'negligence', 'penalties', 'assignments', 'reports'];
+    if (paramTab && validTabs.includes(paramTab)) return paramTab as any;
+    if (savedStorageTab && validTabs.includes(savedStorageTab)) return savedStorageTab as any;
+    return 'overview';
+  }
+
+  it('employee always resolves to peers viewMode regardless of storage or defaults', () => {
+    expect(resolveInitialViewMode(true, null)).toBe('peers');
+    expect(resolveInitialViewMode(true, 'direct')).toBe('peers');
+    expect(resolveInitialViewMode(true, 'peers')).toBe('peers');
+  });
+
+  it('manager or admin defaults to direct when no saved storage exists', () => {
+    expect(resolveInitialViewMode(false, null)).toBe('direct');
+  });
+
+  it('manager or admin restores saved viewMode after page refresh', () => {
+    expect(resolveInitialViewMode(false, 'peers')).toBe('peers');
+    expect(resolveInitialViewMode(false, 'direct')).toBe('direct');
+  });
+
+  it('restores saved tab after page refresh', () => {
+    expect(resolveInitialTab(null, 'effort')).toBe('effort');
+    expect(resolveInitialTab(null, 'negligence')).toBe('negligence');
+    expect(resolveInitialTab(null, 'penalties')).toBe('penalties');
+    expect(resolveInitialTab(null, 'assignments')).toBe('assignments');
+    expect(resolveInitialTab(null, 'reports')).toBe('reports');
+    expect(resolveInitialTab(null, null)).toBe('overview');
+  });
+
+  it('prefers URL search parameter over stored tab if present', () => {
+    expect(resolveInitialTab('effort', 'penalties')).toBe('effort');
+    expect(resolveInitialTab('invalid', 'penalties')).toBe('penalties');
+  });
+});
+

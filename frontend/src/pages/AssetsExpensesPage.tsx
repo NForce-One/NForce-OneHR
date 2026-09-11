@@ -45,6 +45,19 @@ function fmtDate(s?: string | null) {
   return new Date(s).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
+export function todayIsoDate(): string {
+  const d = new Date();
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+export function isExpenseDateInFuture(dateStr: string, todayStr: string = todayIsoDate()): boolean {
+  if (!dateStr) return false;
+  return dateStr > todayStr;
+}
+
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { bg: string; color: string }> = {
     SUBMITTED: { bg: 'rgba(245,158,11,.15)', color: '#F59E0B' },
@@ -530,9 +543,15 @@ function SubmitExpenseModal({ categories: propCategories, token, onClose, onCrea
   const selectedCat = categories.find(c => c.id === Number(categoryId));
   const amountNum = parseFloat(amount) || 0;
   const receiptRequired = selectedCat != null && amountNum > selectedCat.requiresReceiptAbove;
+  const maxDate = todayIsoDate();
+  const isFutureDate = isExpenseDateInFuture(expenseDate, maxDate);
 
   async function submit() {
     if (!categoryId || !amount || !expenseDate || !businessPurpose.trim()) return;
+    if (isFutureDate) {
+      showToast('error', 'Expense date cannot be in the future');
+      return;
+    }
     if (receiptRequired && !receiptFile) { showToast('error', `Receipt required for ${selectedCat!.name} amounts above ${fmtCurrency(selectedCat!.requiresReceiptAbove)}`); return; }
     setSubmitting(true);
     try {
@@ -567,7 +586,21 @@ function SubmitExpenseModal({ categories: propCategories, token, onClose, onCrea
       </FormRow>
       <FormRow>
         <label style={labelStyle}>Expense Date *</label>
-        <input type="date" value={expenseDate} onChange={e => setExpenseDate(e.target.value)} style={inputStyle} />
+        <input
+          type="date"
+          max={maxDate}
+          value={expenseDate}
+          onChange={e => setExpenseDate(e.target.value)}
+          style={{
+            ...inputStyle,
+            borderColor: isFutureDate ? '#E4373D' : undefined,
+          }}
+        />
+        {isFutureDate && (
+          <div style={{ fontSize: 11, color: '#E4373D', marginTop: 4 }}>
+            Expense date cannot be in the future.
+          </div>
+        )}
       </FormRow>
       <FormRow>
         <label style={labelStyle}>Business Purpose *</label>
@@ -584,7 +617,7 @@ function SubmitExpenseModal({ categories: propCategories, token, onClose, onCrea
       </FormRow>
       <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
         <BtnGhost onClick={onClose}>Cancel</BtnGhost>
-        <BtnPrimary onClick={submit} disabled={!categoryId || !amount || !expenseDate || !businessPurpose.trim() || (receiptRequired && !receiptFile) || submitting}>{submitting ? 'Submitting…' : 'Submit Claim'}</BtnPrimary>
+        <BtnPrimary onClick={submit} disabled={!categoryId || !amount || !expenseDate || isFutureDate || !businessPurpose.trim() || (receiptRequired && !receiptFile) || submitting}>{submitting ? 'Submitting…' : 'Submit Claim'}</BtnPrimary>
       </div>
     </Modal>
   );
