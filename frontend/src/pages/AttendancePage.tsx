@@ -37,6 +37,7 @@ import { useToast } from '../context/ToastContext';
 import { toShellRole } from '../lib/nav.config';
 import { TimeFormatProvider, useTimeFormat, formatLateBySeconds } from '../context/TimeFormatContext';
 import { minutesSinceMidnight, secondsBetween, shiftMarkerPositions, segmentBarPosition, breakMarkerPosition, resolveWorkdayWindow, punchCalendarDateIfDiffers } from '../utils/shiftMarkers';
+import { computeWorkedMinutesFromPunches, msToMinuteEpoch } from '../utils/workedMinutes';
 
 // ─── Formatting helpers ───────────────────────────────────────────────────────
 // Server timestamps are wall-clock strings in the business timezone (no offset), so they are
@@ -507,15 +508,9 @@ function PunchHistoryList({ date, token, refreshKey }: { date: string; token: st
   const officeSessions = sortedPunches.filter(p => p.source !== 'WEB_REMOTE').map(p => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt, note: p.note }));
   const webSessions = sortedPunches.filter(p => p.source === 'WEB_REMOTE').map(p => ({ key: p.id, checkInAt: p.checkInAt, checkOutAt: p.checkOutAt, note: p.note }));
 
-  // A single NORMAL session adds nothing beyond the Check In/Check Out bookends shown above this
-  // list — but that's only true for the normal session: Web Clock-Out deliberately never writes
-  // the shared Attendance record's own checkOutAt (see WebClockInService's own class Javadoc), so
-  // those bookends never reflect a Web session's check-out time at all, however many Web cycles
-  // there are. Suppressing this whole list whenever total punches <= 1 (the old check) therefore
-  // hid the ONLY place a lone Web Clock-In/Out cycle's check-out time is ever shown. Only skip
-  // when there's truly nothing beyond the bookends: at most one normal session AND no Web session.
-  if (officeSessions.length <= 1 && webSessions.length === 0) return null;
-
+  // Every punch — including a single still-open office session right after the first
+  // check-in of the day — is shown here; the only suppression is the "no punches yet"
+  // empty case handled above (punches.length === 0).
   return (
     <div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 9.5, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 8 }}>
@@ -3644,32 +3639,34 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
     return () => { cancelled = true; };
   }, [token, showToast]);
 
-  // sessionStartedAt (not checkInAt) — the currently-open session's own start, so a resumed
-  // session's live worked-time (workedMinutesToday below) counts from its own resume, not the
-  // day's original check-in (which would wrongly include the break). This is purely an input to
-  // that live calculation — it must never be read for a DISPLAYED "Check In" time; the day's
-  // original checkInAt (frozen across every resume, see AttendanceService.checkIn's own doc
-  // comment) is what "Check In" itself always shows, see the render below.
-  const openSince = today?.canCheckOut ? today.record?.sessionStartedAt ?? today.record?.checkInAt ?? null : null;
+  // Today's punches (already fetched for Punch History via the same /attendance/punches endpoint
+  // — reused here as-is, never re-fetched or recomputed differently) — the exact input
+  // computeWorkedMinutesFromPunches needs to mirror the backend's own Effective Hours model.
+  const todaysPunches = today ? punchesByDate.get(today.workDate) : undefined;
+  // Whether ANY punch today — normal or Web Clock-In, there can be one of each open at once — is
+  // still open. Drives both the live-tick interval below and whether "now" is substituted for a
+  // missing checkOutAt in the calculation itself.
+  const hasOpenPunchToday = todaysPunches?.some((p) => p.checkOutAt == null) ?? false;
 
   useEffect(() => {
-    if (!openSince) return;
+    if (!hasOpenPunchToday) return;
     const id = setInterval(() => setTick((n) => n + 1), 60000);
     return () => clearInterval(id);
-  }, [openSince]);
+  }, [hasOpenPunchToday]);
 
-  // Raw minutes-worked-so-far-today, for the Today's Timings progress bar / break panel, the
-  // Attendance Log's "Effective Hours" column, and the Calendar's "Worked Today" figure — the
-  // ONE shared live-aware calculation all three read, rather than each computing (or a UI
-  // element separately re-deriving) its own "elapsed" figure that could drift from this one.
+  // The single source of truth for "Worked Today"/"Effective Hours" today: computed via
+  // computeWorkedMinutesFromPunches (see its own Javadoc-style comment) — the SAME merge-and-sum
+  // model as the backend's recomputeCombinedWorkedMinutes, not a separate raw calculation — fed
+  // today's real punches plus "now" for whichever punch(es) are still open. Read by the Today's
+  // Timings progress bar / break panel, the Attendance Log's "Effective Hours" column, and the
+  // Calendar's "Worked Today" figure alike, so none of them can drift from one another.
   const workedMinutesToday = useMemo(() => {
-    if (openSince) {
-      void tick;
-      const minutes = Math.floor((Date.now() + serverOffsetMs.current - wallClockMs(openSince)) / 60000);
-      return minutes >= 0 ? minutes : null;
-    }
-    return today?.record?.workedMinutes ?? null;
-  }, [openSince, tick, today]);
+    if (!today) return null;
+    if (!todaysPunches) return today.record?.workedMinutes ?? null;
+    void tick; // re-derive every tick so a live open interval keeps advancing
+    const nowMinuteEpoch = hasOpenPunchToday ? msToMinuteEpoch(Date.now() + serverOffsetMs.current) : null;
+    return computeWorkedMinutesFromPunches(todaysPunches, nowMinuteEpoch);
+  }, [today, todaysPunches, hasOpenPunchToday, tick]);
 
   // Check In/Check Out summary for today: Check In is always the day's original checkInAt
   // (frozen across every resume regardless of source, see AttendanceService.checkIn's own doc
