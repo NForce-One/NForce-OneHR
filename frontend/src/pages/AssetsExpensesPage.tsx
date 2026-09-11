@@ -1309,7 +1309,15 @@ function ExpenseCategoryModal({ category, token, onClose, onSaved }: { category:
   function setPositiveDecimal(k: string, v: string) { set(k, sanitizePositiveDecimalInput(v)); }
 
   async function submit() {
-    if (!form.name.trim()) return;
+    const trimmedName = form.name.trim();
+    if (!trimmedName) return;
+    // Mirrors OrgSetupPage's Department/Designation name check: must include at least one
+    // letter, rejecting numeric-only ("123"), negative-number ("-5"), and symbol-only ("@#$")
+    // category names before they ever reach the backend's identical @Pattern check.
+    if (!/^(?=.*[A-Za-z])[^0-9]+$/.test(trimmedName)) {
+      showToast('error', 'Category name must contain letters and cannot contain numbers or be made up of special characters only');
+      return;
+    }
     const dailyLimitNum = form.dailyLimit ? parseFloat(form.dailyLimit) : null;
     const secondApprovalNum = form.secondApprovalAbove ? parseFloat(form.secondApprovalAbove) : null;
     if (dailyLimitNum != null && (isNaN(dailyLimitNum) || dailyLimitNum < 0)) {
@@ -1323,7 +1331,7 @@ function ExpenseCategoryModal({ category, token, onClose, onSaved }: { category:
     setSubmitting(true);
     try {
       const payload = {
-        name: form.name.trim(),
+        name: trimmedName,
         requiresReceiptAbove: parseFloat(form.requiresReceiptAbove) || 0,
         dailyLimit: dailyLimitNum,
         secondApprovalAbove: secondApprovalNum,
