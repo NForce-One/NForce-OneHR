@@ -406,6 +406,7 @@ export default function HelpDeskAdminPage() {
   const [agents, setAgents] = useState<AssignableAgent[]>([]);
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [totalPages, setTotalPages] = useState(0);
+  const [totalElements, setTotalElements] = useState(0);
   const [page, setPage] = useState(0);
   const [statusFilter, setStatusFilter] = useState<string>('ACTIVE');
   const [assigneeFilter, setAssigneeFilter] = useState('');
@@ -423,9 +424,14 @@ export default function HelpDeskAdminPage() {
       assignedTo: assigneeFilter || undefined,
       search: search || undefined,
       page: p, size: 10,
-    }).then(res => { setTickets(res.content); setTotalPages(res.totalPages); setPage(res.number); })
+    }).then(res => { setTickets(res.content); setTotalPages(res.totalPages); setPage(res.number); setTotalElements(res.totalElements); })
       .finally(() => setLoading(false));
   }
+
+  // Cards above are always global totals across every ticket, regardless of these filters —
+  // that mismatch is expected, but only worth calling out once a search/assignee filter is
+  // actually narrowing the list below.
+  const hasActiveNarrowing = Boolean(search || assigneeFilter);
 
   function loadDashboard() {
     hrHelpdeskApi.dashboard(token).then(setDashboard);
@@ -475,13 +481,16 @@ export default function HelpDeskAdminPage() {
         <p style={{ fontSize: 13, color: 'var(--txt-mut)', marginTop: 4 }}>Help Desk tickets raised by employees across the organization.</p>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 22 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 8 }}>
         <Kpi icon={<Inbox size={14} />} label="Active Queue" value={dashboard.openCount + dashboard.inProgressCount} danger />
         <Kpi icon={<Inbox size={14} />} label="Open" value={dashboard.openCount} />
         <Kpi icon={<Clock size={14} />} label="In Progress" value={dashboard.inProgressCount} />
         <Kpi icon={<CheckCircle2 size={14} />} label="Resolved" value={dashboard.resolvedCount} />
         <Kpi icon={<UserCog size={14} />} label="Closed" value={dashboard.closedCount} />
       </div>
+      <p style={{ fontSize: 11.5, color: 'var(--txt-dim)', margin: '0 0 22px' }}>
+        Totals across all tickets — the search and assignee filters below narrow the list only.
+      </p>
 
       <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
         <input
@@ -495,6 +504,11 @@ export default function HelpDeskAdminPage() {
           {agents.map(a => <option key={a.userId} value={a.userId}>{a.name}</option>)}
         </select>
       </div>
+      {hasActiveNarrowing && (
+        <div style={{ fontSize: 11.5, color: 'var(--txt-dim)', marginBottom: 12 }}>
+          Showing {totalElements} ticket{totalElements === 1 ? '' : 's'} matching your search/assignee filter — the cards above still reflect all tickets.
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
         {QUEUE_FILTERS.map(f => (

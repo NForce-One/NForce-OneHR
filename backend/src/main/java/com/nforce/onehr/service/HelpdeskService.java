@@ -366,12 +366,22 @@ public class HelpdeskService {
     @Transactional(readOnly = true)
     public HelpdeskDashboardDto getDashboard(String actorEmail) {
         requireAdmin(actorEmail);
+        // Must mirror listQueue's filtering exactly (including requesterNotDeleted()) so the
+        // counts shown on the summary cards always match what's actually listed under each
+        // status tab — a bare countByStatus() would count tickets the queue silently excludes.
         return HelpdeskDashboardDto.builder()
-                .openCount(ticketRepo.countByStatus(TicketStatus.OPEN.name()))
-                .inProgressCount(ticketRepo.countByStatus(TicketStatus.IN_PROGRESS.name()))
-                .resolvedCount(ticketRepo.countByStatus(TicketStatus.RESOLVED.name()))
-                .closedCount(ticketRepo.countByStatus(TicketStatus.CLOSED.name()))
+                .openCount(countByStatus(TicketStatus.OPEN.name()))
+                .inProgressCount(countByStatus(TicketStatus.IN_PROGRESS.name()))
+                .resolvedCount(countByStatus(TicketStatus.RESOLVED.name()))
+                .closedCount(countByStatus(TicketStatus.CLOSED.name()))
                 .build();
+    }
+
+    private long countByStatus(String status) {
+        Specification<HelpdeskTicket> spec = Specification.allOf(
+                HelpdeskTicketSpecifications.statusIs(status),
+                HelpdeskTicketSpecifications.requesterNotDeleted());
+        return ticketRepo.count(spec);
     }
 
     @Transactional(readOnly = true)

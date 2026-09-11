@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Users, Clock, Calendar, TrendingUp, UserCheck, X,
@@ -492,14 +492,35 @@ type DashboardScope = 'manager' | 'hr';
 function useTeamAttendanceToday(token: string, scope: DashboardScope) {
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  // Overlap guard for the 60s periodic refresh below (same in-flight/queued-ref coalescing
+  // pattern as AttendancePage's refreshLeaves) — if a slow request is still pending when the
+  // next tick fires, queue one more retry instead of piling up concurrent requests.
+  const inFlightRef = useRef(false);
+  const queuedRef = useRef(false);
 
-  useEffect(() => {
+  const load = useCallback((opts?: { silent?: boolean }) => {
+    if (inFlightRef.current) { queuedRef.current = true; return; }
+    inFlightRef.current = true;
+    if (!opts?.silent) setLoading(true);
     const fetchToday = scope === 'hr' ? attendanceApi.day : attendanceApi.team;
     fetchToday(todayIsoDate(), token)
       .then(setRecords)
-      .catch(() => setRecords([]))
-      .finally(() => setLoading(false));
+      .catch(() => { if (!opts?.silent) setRecords([]); })
+      .finally(() => {
+        setLoading(false);
+        inFlightRef.current = false;
+        if (queuedRef.current) { queuedRef.current = false; load({ silent: true }); }
+      });
   }, [token, scope]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Background refresh only — no loading spinner is toggled on these ticks (see load's
+  // `silent` guard), so a long-open tab keeps this stat current without flashing "—".
+  useEffect(() => {
+    const id = setInterval(() => load({ silent: true }), 60000);
+    return () => clearInterval(id);
+  }, [load]);
 
   return { records, loading };
 }
@@ -524,30 +545,51 @@ function TeamDashboardView({ scope }: { scope: DashboardScope }) {
   const [showPresentModal, setShowPresentModal] = useState(false);
   const [showLeaveModal, setShowLeaveModal] = useState(false);
 
-  useEffect(() => {
+  // Overlap guard for the 60s periodic refresh below — same in-flight/queued-ref coalescing
+  // pattern as AttendancePage's refreshLeaves, so a slow response doesn't pile up requests.
+  const inFlightRef = useRef(false);
+  const queuedRef = useRef(false);
+
+  const loadTeamDashboardData = useCallback((opts?: { silent?: boolean }) => {
+    if (inFlightRef.current) { queuedRef.current = true; return; }
+    inFlightRef.current = true;
+    const silent = opts?.silent ?? false;
+    if (!silent) { setLoading(true); setOnLeaveLoading(true); }
+
     const fetchDashboard = isHr ? dashboardApi.hrDashboard : dashboardApi.managerDashboard;
-    fetchDashboard(token)
-      .then(setData)
-      .catch(e => setError(e instanceof Error ? e.message : `Failed to load ${isHr ? 'organization' : 'team'} data`))
-      .finally(() => setLoading(false));
+    const fetchOnLeave = isHr ? leaveApi.organization : leaveApi.team;
+    const today = todayIsoDate();
+
+    Promise.all([
+      fetchDashboard(token)
+        .then(d => { setData(d); setError(''); })
+        // Keep whatever dashboard data is already showing on a background refresh failure;
+        // only surface the error message on the initial (non-silent) load.
+        .catch(e => { if (!silent) setError(e instanceof Error ? e.message : `Failed to load ${isHr ? 'organization' : 'team'} data`); }),
+      fetchOnLeave(today, today, token)
+        .then(setOnLeaveRows)
+        .catch(() => { if (!silent) setOnLeaveRows([]); }),
+      leaveApi.listApprovals(token)
+        .then(rows => setPendingLeaveCount(rows.length))
+        .catch(() => { if (!silent) setPendingLeaveCount(0); }),
+    ]).finally(() => {
+      setLoading(false);
+      setOnLeaveLoading(false);
+      inFlightRef.current = false;
+      if (queuedRef.current) { queuedRef.current = false; loadTeamDashboardData({ silent: true }); }
+    });
   }, [token, isHr]);
 
+  useEffect(() => { loadTeamDashboardData(); }, [loadTeamDashboardData]);
+
+  // Background refresh only — no loading state is toggled on these ticks (silent: true), so
+  // stat tiles update quietly instead of flashing back to "—" every 60s.
   useEffect(() => {
-    const today = todayIsoDate();
-    const fetchOnLeave = isHr ? leaveApi.organization : leaveApi.team;
-    fetchOnLeave(today, today, token)
-      .then(setOnLeaveRows)
-      .catch(() => setOnLeaveRows([]))
-      .finally(() => setOnLeaveLoading(false));
-  }, [token, isHr]);
+    const id = setInterval(() => loadTeamDashboardData({ silent: true }), 60000);
+    return () => clearInterval(id);
+  }, [loadTeamDashboardData]);
 
   const onLeaveCount = useMemo(() => new Set(onLeaveRows.map(r => r.employeeUserId)).size, [onLeaveRows]);
-
-  useEffect(() => {
-    leaveApi.listApprovals(token)
-      .then(rows => setPendingLeaveCount(rows.length))
-      .catch(() => setPendingLeaveCount(0));
-  }, [token]);
 
   const firstName = user?.fullName ?? user?.email?.split('@')[0] ?? (isHr ? 'there' : 'Manager');
   const presentCount = teamToday.filter(r => r.checkInAt).length;
@@ -848,6 +890,15 @@ const SUPER_ADMIN_QUICK_ACTIONS: QuickActionItem[] = [
 
 // ── Stat tiles ───────────────────────────────────────────────────────────────────
 
+// Shared by the "Leave remaining" stat tile and the Leave Balance donut so the two
+// numbers can never diverge: entries with no configured quota (totalDays <= 0) are
+// excluded, and any negative remainingDays is clamped to 0 before summing.
+function usableRemaining(balances: LeaveBalance[]): number {
+  return balances
+    .filter(b => b.totalDays > 0)
+    .reduce((sum, b) => sum + Math.max(0, Number(b.remainingDays)), 0);
+}
+
 function EmployeeStatTiles({
   stats, balances, statsLoading,
 }: {
@@ -856,7 +907,7 @@ function EmployeeStatTiles({
   statsLoading: boolean;
 }) {
   const totalLeaveRemaining = useMemo(
-    () => balances.reduce((sum, b) => sum + (b.remainingDays ?? 0), 0),
+    () => usableRemaining(balances),
     [balances]
   );
 
@@ -1087,7 +1138,7 @@ const LEAVE_DONUT_COLORS = { available: '#7A0C10', consumed: '#E8B4B6' };
 function LeaveBalancePanel({ balances }: { balances: LeaveBalance[] }) {
   const configured = useMemo(() => balances.filter(b => b.totalDays > 0), [balances]);
 
-  const totalRemaining = configured.reduce((s, b) => s + Math.max(0, Number(b.remainingDays)), 0);
+  const totalRemaining = usableRemaining(balances);
   const totalQuota = configured.reduce((s, b) => s + Number(b.totalDays), 0);
   const totalConsumed = Math.max(0, totalQuota - totalRemaining);
   const data = [
@@ -1442,18 +1493,48 @@ function EmployeeDashboardView() {
   const [holidays, setHolidays]       = useState<HolidayRow[]>([]);
   const [config, setConfig]           = useState<AttendanceConfig | null>(null);
 
-  useEffect(() => {
+  // Overlap guard for the 60s periodic refresh below — same in-flight/queued-ref coalescing
+  // pattern as AttendancePage's refreshLeaves, so a slow response doesn't pile up requests.
+  const inFlightRef = useRef(false);
+  const queuedRef = useRef(false);
+
+  // Feeds the EmployeeStatTiles row (presentDays/avgHours/onTime + the leave-remaining tile) —
+  // pulled out of the mount-only effect below so it can also be re-run on a 60s interval.
+  const loadEmployeeStats = useCallback((opts?: { silent?: boolean }) => {
+    if (inFlightRef.current) { queuedRef.current = true; return; }
+    inFlightRef.current = true;
+    const silent = opts?.silent ?? false;
+    if (!silent) setStatsLoading(true);
+
     const today = todayIsoDate();
     const from  = `${today.slice(0, 8)}01`;
-    attendanceApi.stats(from, today, token)
-      .then(setStats)
-      .catch(() => {})
-      .finally(() => setStatsLoading(false));
-    leaveApi.listBalances(token).then(setBalances).catch(() => {});
+
+    Promise.all([
+      attendanceApi.stats(from, today, token).catch(() => null),
+      leaveApi.listBalances(token).catch(() => null),
+    ]).then(([s, b]) => {
+      if (s) setStats(s);
+      if (b) setBalances(b);
+    }).finally(() => {
+      setStatsLoading(false);
+      inFlightRef.current = false;
+      if (queuedRef.current) { queuedRef.current = false; loadEmployeeStats({ silent: true }); }
+    });
+  }, [token]);
+
+  useEffect(() => {
+    loadEmployeeStats();
     myRequestsApi.list(token).then(setRequests).catch(() => {});
     holidaysApi.listForMyLocation(token).then(setHolidays).catch(() => {});
     attendanceApi.config(token).then(setConfig).catch(() => {});
-  }, [token]);
+  }, [token, loadEmployeeStats]);
+
+  // Background refresh only — no loading state is toggled on these ticks (silent: true), so
+  // the stat tiles update quietly instead of flashing back to "—" every 60s.
+  useEffect(() => {
+    const id = setInterval(() => loadEmployeeStats({ silent: true }), 60000);
+    return () => clearInterval(id);
+  }, [loadEmployeeStats]);
 
   const today = new Date();
   const dateLabel = today.toLocaleDateString('en-US', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
@@ -1550,7 +1631,16 @@ function SuperAdminDashboardView() {
   const pendingDonutRef = useRef<HTMLDivElement>(null);
   const roleDonutRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
+  // Overlap guard for the 60s periodic refresh below — same in-flight/queued-ref coalescing
+  // pattern as AttendancePage's refreshLeaves, so a slow response doesn't pile up requests.
+  const inFlightRef = useRef(false);
+  const queuedRef = useRef(false);
+
+  const loadSuperAdminData = useCallback((opts?: { silent?: boolean }) => {
+    if (inFlightRef.current) { queuedRef.current = true; return; }
+    inFlightRef.current = true;
+    if (!opts?.silent) setLoading(true);
+
     const today = todayIsoDate();
     const now = new Date();
     const monthStartStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
@@ -1582,18 +1672,32 @@ function SuperAdminDashboardView() {
         } catch { return false; }
       }).length;
       setRoleChangesMonth(roleChanges);
-    }).finally(() => setLoading(false));
+    }).finally(() => {
+      setLoading(false);
+      inFlightRef.current = false;
+      if (queuedRef.current) { queuedRef.current = false; loadSuperAdminData({ silent: true }); }
+    });
   }, [token]);
+
+  useEffect(() => { loadSuperAdminData(); }, [loadSuperAdminData]);
+
+  // Background refresh only — no loading spinner is toggled on these ticks (silent: true), so
+  // this heavy multi-source dataset updates quietly instead of blanking the whole view every 60s.
+  useEffect(() => {
+    const id = setInterval(() => loadSuperAdminData({ silent: true }), 60000);
+    return () => clearInterval(id);
+  }, [loadSuperAdminData]);
 
   const activeUsers   = allUsers.filter(u => u.active).length;
   const inactiveUsers = allUsers.filter(u => !u.active).length;
   const presentCount  = todayRecords.filter(r => r.checkInAt).length;
   const pendingCount  = pendingItems.length;
 
-  const monthStart = useMemo(() => {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
-  }, []);
+  // Computed fresh on every render (not memoized) so a long-open tab doesn't keep
+  // reporting a stale month boundary after a month rollover. Cheap: a single
+  // `new Date()` and two Date calls.
+  const now = new Date();
+  const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
 
   const pendingByType = useMemo(() => {
     const counts: Record<string, number> = {};

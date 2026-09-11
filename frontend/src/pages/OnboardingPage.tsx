@@ -491,6 +491,14 @@ export default function OnboardingPage() {
   const active = rows.filter(r => !r.archived);
   const archived = rows.filter(r => r.archived);
   const overdueCount = active.filter(r => r.status === 'OVERDUE').length;
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  const completedThisMonth = archived.filter(r => {
+    if (!r.completedDate) return false;
+    const d = new Date(r.completedDate);
+    return d >= monthStart && d < monthEnd;
+  }).length;
   const avgDays = archived.length
     ? Math.round(archived.reduce((s, r) => s + (r.durationDays ?? 0), 0) / archived.length)
     : 0;
@@ -511,7 +519,7 @@ export default function OnboardingPage() {
       <div className="nf-kpi-2x2-mobile" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12, marginBottom: 20 }}>
         <Kpi icon={<Users size={14} />} label="Active flows" value={active.length} note="In progress right now" />
         <Kpi icon={<AlertTriangle size={14} />} label="Overdue tasks" value={overdueCount} note="Flows with a missed due date" danger={overdueCount > 0} />
-        <Kpi icon={<Check size={14} />} label="Completed this month" value={archived.length} note="Archived onboarding flows" />
+        <Kpi icon={<Check size={14} />} label="Completed this month" value={completedThisMonth} note="Archived onboarding flows this calendar month" />
         <Kpi icon={<Clock size={14} />} label="Avg. time to complete" value={`${avgDays} d`} note="Joining date to full checklist" />
       </div>
 

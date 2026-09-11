@@ -35,6 +35,7 @@ import { profileApi } from '../api/profile';
 import { useAuthStore } from '../store/authStore';
 import { useToast } from '../context/ToastContext';
 import { toShellRole } from '../lib/nav.config';
+import { subscribeToNewNotifications } from '../lib/notificationEvents';
 import { TimeFormatProvider, useTimeFormat, formatLateBySeconds } from '../context/TimeFormatContext';
 import { minutesSinceMidnight, secondsBetween, shiftMarkerPositions, segmentBarPosition, breakMarkerPosition, resolveWorkdayWindow, punchCalendarDateIfDiffers } from '../utils/shiftMarkers';
 import { computeWorkedMinutesFromPunches, msToMinuteEpoch } from '../utils/workedMinutes';
@@ -3406,6 +3407,38 @@ const MyAttendance = forwardRef<MyAttendanceHandle, {
     });
     profileApi.get(token).then((p) => setJoiningDate(p.joiningDate)).catch(() => setJoiningDate(null));
   }, [token]);
+
+  // AttendancePage has no leave-apply UI of its own (leave is only submitted from LeavePage), so
+  // `leaves` can only go stale here, never be optimistically patched on submit. Mirror LeavePage's
+  // fix for the same staleness problem: react to LEAVE_APPROVED/LEAVE_REJECTED notifications as
+  // the app-wide notification poll (Shell) detects them, and re-fetch just `leaves` so the
+  // "Leave / Holidays" tile (and calendar) reflect the decision without a full page reload.
+  const leaveRefreshInFlightRef = useRef(false);
+  const leaveRefreshQueuedRef = useRef(false);
+  const refreshLeaves = useCallback(async () => {
+    if (leaveRefreshInFlightRef.current) { leaveRefreshQueuedRef.current = true; return; }
+    leaveRefreshInFlightRef.current = true;
+    try {
+      const fresh = await leaveApi.listMine(token);
+      setLeaves(fresh);
+    } catch {
+      // Keep showing whatever leaves are already loaded rather than clearing them on error.
+    } finally {
+      leaveRefreshInFlightRef.current = false;
+      if (leaveRefreshQueuedRef.current) {
+        leaveRefreshQueuedRef.current = false;
+        refreshLeaves();
+      }
+    }
+  }, [token]);
+
+  useEffect(() => {
+    return subscribeToNewNotifications((items) => {
+      if (items.some((n) => n.type === 'LEAVE_APPROVED' || n.type === 'LEAVE_REJECTED')) {
+        refreshLeaves();
+      }
+    });
+  }, [refreshLeaves]);
 
   const refreshMonth = useCallback(() => {
     setMonthLoading(true);

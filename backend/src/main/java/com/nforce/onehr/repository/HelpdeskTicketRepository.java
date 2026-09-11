@@ -22,6 +22,4 @@ public interface HelpdeskTicketRepository extends JpaRepository<HelpdeskTicket, 
 
     @Query(value = "SELECT nextval('helpdesk_ticket_no_seq')", nativeQuery = true)
     long nextTicketSequence();
-
-    long countByStatus(String status);
 }
