@@ -76,6 +76,9 @@ export interface CreateUserPayload extends CreateEmployeePayload {
 
 export interface UpdateUserPayload {
   fullName?: string;
+  /** Super-Admin-only. Changing this updates the user's login email, force-logs them out, and
+   * sends an "email updated" notice to the NEW address (see UserManagementService#updateUser). */
+  email?: string;
   role?: string;
   businessUnitId?: string;
   departmentId?: string;

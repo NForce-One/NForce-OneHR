@@ -221,6 +221,8 @@ public class UserManagementService {
         boolean forceLogoutRequired = false;
         boolean roleChanged = false;
         boolean managerChanged = false;
+        boolean emailChanged = false;
+        String oldEmail = null;
 
         // Role/manager/department/designation/employment type imply active employment — for a
         // deactivated user these are blocked behind an explicit confirmation (name, location,
@@ -237,6 +239,20 @@ public class UserManagementService {
             if (!Objects.equals(emp.getFullName(), fullName)) {
                 emp.setFullName(fullName);
                 forceLogoutRequired = true;
+            }
+        }
+        // Email — same uniqueness rule as createUser (excluding this user's own current row,
+        // since re-saving the same value the employee already has must never trip "already
+        // exists"). Normalized to lowercase+trim before storing/comparing, matching createUser.
+        if (req.getEmail() != null && !req.getEmail().isBlank()) {
+            String newEmail = req.getEmail().toLowerCase().trim();
+            if (!Objects.equals(target.getEmail(), newEmail)) {
+                if (userRepository.existsByEmailAndDeletedAtIsNull(newEmail))
+                    throw new IllegalArgumentException("A user with this email already exists");
+                oldEmail = target.getEmail();
+                target.setEmail(newEmail);
+                forceLogoutRequired = true;
+                emailChanged = true;
             }
         }
         if (req.getEmploymentType() != null && !req.getEmploymentType().isBlank()
@@ -362,6 +378,18 @@ public class UserManagementService {
                     "Your manager has been updated.",
                     "/profile");
         }
+        if (emailChanged) {
+            // Sent to the NEW address — the whole point is confirming the user can actually
+            // receive mail there and giving them the correct address to sign in with next time.
+            // In-app notification is a soft-effort companion, not the primary channel: the token
+            // bump above (forceLogoutRequired) already ends their session, so they won't see it
+            // until they sign back in with the new email anyway.
+            emailService.sendEmailUpdatedEmail(target.getEmail(), emp.getFullName(), oldEmail);
+            notificationService.send(target.getId(), "ACCOUNT",
+                    "Email Updated",
+                    "Your account email has been updated to " + target.getEmail() + ".",
+                    "/profile");
+        }
 
         String after = auditSnapshot.toJson(userSnapshot(emp, target));
         auditService.log(actor.getId(), "USER_UPDATED", userId, before, after);
@@ -423,6 +451,7 @@ public class UserManagementService {
     private Map<String, Object> userSnapshot(Employee emp, User user) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
         snapshot.put("fullName", emp.getFullName());
+        snapshot.put("email", user.getEmail());
         snapshot.put("employmentType", emp.getEmploymentType());
         snapshot.put("workMode", emp.getWorkMode());
         snapshot.put("businessUnit", emp.getBusinessUnit() != null ? emp.getBusinessUnit().getName() : null);
