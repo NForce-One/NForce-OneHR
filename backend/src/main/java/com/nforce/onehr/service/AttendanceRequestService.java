@@ -117,6 +117,20 @@ public class AttendanceRequestService {
             }
         }
         if (TYPE_PARTIAL_DAY.equals(type)) {
+            // Same date + same mode + same duration = the same slot. A PENDING or APPROVED
+            // request already occupies it; a REJECTED one doesn't — the employee is free to
+            // resubmit for that exact slot once it's been turned down.
+            boolean slotOccupied = requestRepository
+                    .findByEmployeeUserIdAndRequestTypeAndRequestDate(actor.getId(), TYPE_PARTIAL_DAY, req.getRequestDate())
+                    .stream()
+                    .anyMatch(r -> !STATUS_REJECTED.equals(r.getStatus())
+                            && partialDayMode.equals(r.getPartialDayMode())
+                            && partialDayHours.compareTo(r.getPartialDayHours()) == 0);
+            if (slotOccupied) {
+                throw new IllegalArgumentException(
+                        "You already have a pending or approved Partial Day request for this date, mode, and duration.");
+            }
+
             BigDecimal usedThisMonth = partialDayHoursUsedInMonth(actor.getId(), req.getRequestDate());
             if (usedThisMonth.add(partialDayHours).compareTo(PARTIAL_DAY_MONTHLY_LIMIT_HOURS) > 0) {
                 // "You have used your 120 minutes" only holds when the allowance is actually

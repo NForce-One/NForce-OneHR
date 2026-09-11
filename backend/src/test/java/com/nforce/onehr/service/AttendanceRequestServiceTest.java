@@ -76,12 +76,17 @@ class AttendanceRequestServiceTest {
     }
 
     private AttendanceRequest existing(LocalDate date, double hours, String status) {
+        return existing(date, hours, "LATE_ARRIVE", status);
+    }
+
+    private AttendanceRequest existing(LocalDate date, double hours, String mode, String status) {
         return AttendanceRequest.builder()
                 .id(UUID.randomUUID())
                 .employeeUserId(employeeId)
                 .requestType("PARTIAL_DAY")
                 .requestDate(date)
                 .partialDayHours(BigDecimal.valueOf(hours))
+                .partialDayMode(mode)
                 .status(status)
                 .build();
     }
@@ -125,6 +130,62 @@ class AttendanceRequestServiceTest {
         // (see wfhDaysUsedInMonth/partialDayHoursUsedInMonth) — it's called here for WFH's own
         // cap, just never with PARTIAL_DAY as the type.
         verify(requestRepository, never()).findByEmployeeUserIdAndRequestTypeAndRequestDateBetween(any(), eq("PARTIAL_DAY"), any(), any());
+    }
+
+    // ---------------------------------------------------------------- Partial Day duplicate-slot blocking
+
+    @Test
+    void blocksPartialDayRequestWhenSameSlotIsPending() {
+        when(requestRepository.findByEmployeeUserIdAndRequestTypeAndRequestDate(
+                eq(employeeId), eq("PARTIAL_DAY"), eq(LocalDate.of(2026, 8, 9))))
+                .thenReturn(List.of(existing(LocalDate.of(2026, 8, 9), 1.0, "LATE_ARRIVE", "PENDING")));
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> service.submit(partialDayRequest(LocalDate.of(2026, 8, 9), 1.0), employeeEmail));
+        assertTrue(ex.getMessage().contains("pending or approved"));
+    }
+
+    @Test
+    void blocksPartialDayRequestWhenSameSlotIsApproved() {
+        when(requestRepository.findByEmployeeUserIdAndRequestTypeAndRequestDate(
+                eq(employeeId), eq("PARTIAL_DAY"), eq(LocalDate.of(2026, 8, 9))))
+                .thenReturn(List.of(existing(LocalDate.of(2026, 8, 9), 1.0, "LATE_ARRIVE", "APPROVED")));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> service.submit(partialDayRequest(LocalDate.of(2026, 8, 9), 1.0), employeeEmail));
+    }
+
+    @Test
+    void allowsPartialDayRequestWhenSameSlotWasRejected() {
+        when(requestRepository.findByEmployeeUserIdAndRequestTypeAndRequestDate(
+                eq(employeeId), eq("PARTIAL_DAY"), eq(LocalDate.of(2026, 8, 9))))
+                .thenReturn(List.of(existing(LocalDate.of(2026, 8, 9), 1.0, "LATE_ARRIVE", "REJECTED")));
+
+        AttendanceRequestResponse response = service.submit(partialDayRequest(LocalDate.of(2026, 8, 9), 1.0), employeeEmail);
+
+        assertEquals(BigDecimal.valueOf(1.0), response.getPartialDayHours());
+    }
+
+    @Test
+    void allowsPartialDayRequestWhenSameDateButDifferentMode() {
+        when(requestRepository.findByEmployeeUserIdAndRequestTypeAndRequestDate(
+                eq(employeeId), eq("PARTIAL_DAY"), eq(LocalDate.of(2026, 8, 9))))
+                .thenReturn(List.of(existing(LocalDate.of(2026, 8, 9), 1.0, "LEAVING_EARLY", "PENDING")));
+
+        AttendanceRequestResponse response = service.submit(partialDayRequest(LocalDate.of(2026, 8, 9), 1.0), employeeEmail);
+
+        assertEquals(BigDecimal.valueOf(1.0), response.getPartialDayHours());
+    }
+
+    @Test
+    void allowsPartialDayRequestWhenSameDateAndModeButDifferentDuration() {
+        when(requestRepository.findByEmployeeUserIdAndRequestTypeAndRequestDate(
+                eq(employeeId), eq("PARTIAL_DAY"), eq(LocalDate.of(2026, 8, 9))))
+                .thenReturn(List.of(existing(LocalDate.of(2026, 8, 9), 2.0, "LATE_ARRIVE", "PENDING")));
+
+        AttendanceRequestResponse response = service.submit(partialDayRequest(LocalDate.of(2026, 8, 9), 1.0), employeeEmail);
+
+        assertEquals(BigDecimal.valueOf(1.0), response.getPartialDayHours());
     }
 
     // ---------------------------------------------------------------- WFH prior notice

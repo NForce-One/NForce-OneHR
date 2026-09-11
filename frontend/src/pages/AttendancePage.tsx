@@ -4496,15 +4496,17 @@ function AttendanceRequestsSection({ token, canApprove }: { token: string; canAp
   const [loading, setLoading] = useState(true);
   const [showRequest, setShowRequest] = useState(false);
   const [month, setMonth] = useState(ALL_MONTHS_VALUE);
-  const [acting, setActing] = useState<{ request: AttendanceRequestRecord; action: 'APPROVE' | 'REJECT' } | null>(null);
-  const [comment, setComment] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  // WFH's own "View Request" drawer (Keka-style) — separate from the plain `acting` confirm
-  // modal Partial Day still uses. A "group" is a groupWfhRequests() batch: one decision here
-  // applies to every date in that batch, since the drawer displays the whole range as one row.
+  // WFH's own "View Request" drawer (Keka-style). A "group" is a groupWfhRequests() batch: one
+  // decision here applies to every date in that batch, since the drawer displays the whole range
+  // as one row.
   const [wfhDrawer, setWfhDrawer] = useState<{ group: AttendanceRequestRecord[]; mode: 'VIEW' | 'APPROVE' | 'REJECT' } | null>(null);
   const [wfhComment, setWfhComment] = useState('');
   const [wfhSubmitting, setWfhSubmitting] = useState(false);
+  // Same "View Request" drawer pattern for a single Partial Day record — no grouping, since
+  // unlike WFH a Partial Day request is never split across dates.
+  const [partialDayDrawer, setPartialDayDrawer] = useState<{ request: AttendanceRequestRecord; mode: 'VIEW' | 'APPROVE' | 'REJECT' } | null>(null);
+  const [partialDayComment, setPartialDayComment] = useState('');
+  const [partialDaySubmitting, setPartialDaySubmitting] = useState(false);
 
   const loadAll = useCallback(() => {
     const calls: Promise<unknown>[] = [attendanceRequestApi.mine(token).then(setMyRequests)];
@@ -4521,22 +4523,23 @@ function AttendanceRequestsSection({ token, canApprove }: { token: string; canAp
     [myRequests, month],
   );
 
-  async function handleAct() {
-    if (!acting) return;
-    if (acting.action === 'REJECT' && !comment.trim()) { showToast('error', 'A comment is required when rejecting'); return; }
-    setSubmitting(true);
+  function closePartialDayDrawer() { setPartialDayDrawer(null); setPartialDayComment(''); }
+
+  async function handleActPartialDay() {
+    if (!partialDayDrawer || partialDayDrawer.mode === 'VIEW') return;
+    if (partialDayDrawer.mode === 'REJECT' && !partialDayComment.trim()) { showToast('error', 'A comment is required when rejecting'); return; }
+    setPartialDaySubmitting(true);
     try {
-      const updated = acting.action === 'APPROVE'
-        ? await attendanceRequestApi.approve(acting.request.id, token, comment.trim() || undefined)
-        : await attendanceRequestApi.reject(acting.request.id, comment.trim(), token);
+      const updated = partialDayDrawer.mode === 'APPROVE'
+        ? await attendanceRequestApi.approve(partialDayDrawer.request.id, token, partialDayComment.trim() || undefined)
+        : await attendanceRequestApi.reject(partialDayDrawer.request.id, partialDayComment.trim(), token);
       setPending((prev) => prev.filter((r) => r.id !== updated.id));
-      showToast('success', acting.action === 'APPROVE' ? 'Request approved' : 'Request rejected');
-      setActing(null);
-      setComment('');
+      showToast('success', partialDayDrawer.mode === 'APPROVE' ? 'Request approved' : 'Request rejected');
+      closePartialDayDrawer();
     } catch (err) {
       showToast('error', err instanceof Error ? err.message : 'Action failed');
     } finally {
-      setSubmitting(false);
+      setPartialDaySubmitting(false);
     }
   }
 
@@ -4563,15 +4566,6 @@ function AttendanceRequestsSection({ token, canApprove }: { token: string; canAp
     } finally {
       setWfhSubmitting(false);
     }
-  }
-
-  function typeLabel(r: AttendanceRequestRecord) {
-    if (r.requestType === 'WFH') {
-      const wfhModeLabel = WFH_SINGLE_DAY_MODE_OPTIONS.find((o) => o.value === r.partialDayMode)?.label;
-      return wfhModeLabel && wfhModeLabel !== 'Full Day' ? `Work From Home (${wfhModeLabel})` : 'Work From Home';
-    }
-    const modeLabel = PARTIAL_DAY_MODE_OPTIONS.find((o) => o.value === r.partialDayMode)?.label;
-    return modeLabel ? `Partial Day (${modeLabel})` : 'Partial Day';
   }
 
   function partialDayModeLabel(r: AttendanceRequestRecord) {
@@ -4709,8 +4703,10 @@ function AttendanceRequestsSection({ token, canApprove }: { token: string; canAp
                 {/* Employee only shown for Pending Approvals (showActions) — in "My Requests"
                     every row is the viewer's own, so the name would be redundant. Mirrors
                     RegularizationSection's own Employee column, shown only in its reviewer-facing
-                    Pending Approvals table for the same reason. */}
-                <tr>{[...(showActions ? ['Employee'] : []), 'Date', 'Mode', 'Hours', 'Reason', 'Approver', 'Status', ...(showActions ? ['Actions'] : [])].map((h) => <th key={h} style={thStyle}>{h}</th>)}</tr>
+                    Pending Approvals table for the same reason. The Actions column, unlike
+                    Employee, is unconditional — every row (own or pending-approval) can at least
+                    be viewed, matching renderWfhTable. */}
+                <tr>{[...(showActions ? ['Employee'] : []), 'Date', 'Mode', 'Hours', 'Reason', 'Approver', 'Status', 'Actions'].map((h) => <th key={h} style={thStyle}>{h}</th>)}</tr>
               </thead>
               <tbody>
                 {rows.map((r) => (
@@ -4724,16 +4720,15 @@ function AttendanceRequestsSection({ token, canApprove }: { token: string; canAp
                     <td style={{ ...tdStyle, maxWidth: 220 }}><TruncatedText text={r.reason} /></td>
                     <td style={tdStyle}>{r.assignedApproverName ?? dash}</td>
                     <td style={tdStyle}><RegularizationStatusPill status={r.status} /></td>
-                    {showActions && (
-                      <td style={tdStyle}>
-                        {r.status === 'PENDING' ? (
-                          <div style={{ display: 'flex', gap: 6 }}>
-                            <button onClick={() => setActing({ request: r, action: 'APPROVE' })} style={{ background: 'rgba(47,182,124,.15)', border: '1px solid rgba(47,182,124,.3)', borderRadius: 5, padding: '4px 9px', fontSize: 10.5, color: '#2FB67C', cursor: 'pointer', fontWeight: 600 }}>Approve</button>
-                            <button onClick={() => setActing({ request: r, action: 'REJECT' })} style={{ background: 'rgba(228,55,61,.1)', border: '1px solid rgba(228,55,61,.25)', borderRadius: 5, padding: '4px 9px', fontSize: 10.5, color: '#E4373D', cursor: 'pointer', fontWeight: 600 }}>Reject</button>
-                          </div>
-                        ) : dash}
-                      </td>
-                    )}
+                    <td style={tdStyle}>
+                      <PartialDayActionMenu
+                        request={r}
+                        canApprove={showActions && canApprove}
+                        onView={() => setPartialDayDrawer({ request: r, mode: 'VIEW' })}
+                        onApprove={() => setPartialDayDrawer({ request: r, mode: 'APPROVE' })}
+                        onReject={() => setPartialDayDrawer({ request: r, mode: 'REJECT' })}
+                      />
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -4796,31 +4791,6 @@ function AttendanceRequestsSection({ token, canApprove }: { token: string; canAp
           onSaved={(r) => setMyRequests((prev) => [r, ...prev])}
         />
       )}
-      {acting && (
-        <div style={overlayStyle}>
-          <div style={{ ...modalStyle, maxWidth: 420 }}>
-            <ModalHeader title={`${acting.action === 'APPROVE' ? 'Approve' : 'Reject'} — ${acting.request.employeeName}`} onClose={() => setActing(null)} />
-            <div style={{ padding: 24 }}>
-              <div style={{ fontSize: 12.5, color: 'var(--txt-mut)', marginBottom: 14 }}>
-                {typeLabel(acting.request)} · {formatDay(acting.request.requestDate)}
-              </div>
-              <Field label={acting.action === 'APPROVE' ? 'Comment (optional)' : 'Reason for rejection *'}>
-                <textarea style={{ ...inputStyle, minHeight: 70, resize: 'vertical', fontFamily: 'inherit' }} value={comment} onChange={(e) => setComment(e.target.value)} />
-              </Field>
-              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
-                <button onClick={() => setActing(null)} style={{ background: 'var(--raised2)', color: 'var(--txt-mut)', border: '1px solid var(--line2)', borderRadius: 7, padding: '9px 18px', fontSize: 12.5, cursor: 'pointer' }}>Cancel</button>
-                <button
-                  onClick={handleAct}
-                  disabled={submitting}
-                  style={{ background: acting.action === 'APPROVE' ? '#2FB67C' : '#C0392B', color: '#fff', border: 'none', borderRadius: 7, padding: '9px 20px', fontSize: 12.5, fontWeight: 600, cursor: submitting ? 'not-allowed' : 'pointer', opacity: submitting ? 0.7 : 1 }}
-                >
-                  {submitting ? 'Submitting…' : acting.action === 'APPROVE' ? 'Confirm Approval' : 'Reject Request'}
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
       {wfhDrawer && (
         <WfhDetailDrawer
           group={wfhDrawer.group}
@@ -4830,6 +4800,17 @@ function AttendanceRequestsSection({ token, canApprove }: { token: string; canAp
           submitting={wfhSubmitting}
           onClose={closeWfhDrawer}
           onConfirmAction={handleActWfh}
+        />
+      )}
+      {partialDayDrawer && (
+        <PartialDayDetailDrawer
+          request={partialDayDrawer.request}
+          mode={partialDayDrawer.mode}
+          comment={partialDayComment}
+          setComment={setPartialDayComment}
+          submitting={partialDaySubmitting}
+          onClose={closePartialDayDrawer}
+          onConfirmAction={handleActPartialDay}
         />
       )}
     </div>
@@ -4995,6 +4976,69 @@ function WfhActionMenu({ group, canApprove, onView, onApprove, onReject }: {
   );
 }
 
+/** Same "•••" row menu as OvertimeActionMenu/WfhActionMenu, keyed to a single Partial Day record
+ * — no grouping, since a Partial Day request never spans more than one date. */
+function PartialDayActionMenu({ request, canApprove, onView, onApprove, onReject }: {
+  request: AttendanceRequestRecord; canApprove: boolean;
+  onView: () => void; onApprove: () => void; onReject: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDocClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  return (
+    <div ref={ref} style={{ position: 'relative', display: 'inline-block' }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-label="Actions"
+        style={{ background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 6, width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: 'var(--txt-mut)' }}
+      >
+        <MoreVertical size={14} />
+      </button>
+      {open && (
+        <div style={{ position: 'absolute', top: '100%', right: 0, marginTop: 4, zIndex: 40, background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,.35)', minWidth: 150, overflow: 'hidden' }}>
+          <button
+            onClick={() => { setOpen(false); onView(); }}
+            style={dropdownMenuItemStyle}
+            onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--raised)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+          >
+            View Request
+          </button>
+          {canApprove && request.status === 'PENDING' && (
+            <>
+              <button
+                onClick={() => { setOpen(false); onApprove(); }}
+                style={{ ...dropdownMenuItemStyle, color: '#2FB67C' }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--raised)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+              >
+                Approve
+              </button>
+              <button
+                onClick={() => { setOpen(false); onReject(); }}
+                style={{ ...dropdownMenuItemStyle, color: '#E4373D' }}
+                onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--raised)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+              >
+                Reject
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Day-number-over-weekday chip used in the WFH detail drawer's date range header (Keka's "25 THU"
  * boxes) — zone-less, same parsing convention as formatDay/formatShortDay above. */
 function DateBox({ isoDate }: { isoDate: string }) {
@@ -5103,6 +5147,116 @@ function WfhDetailDrawer({ group, mode, comment, setComment, submitting, onClose
                   {lastAction.reviewedAt && <span style={{ fontWeight: 400, color: 'var(--txt-dim)' }}> · {formatDay(lastAction.reviewedAt.slice(0, 10))}</span>}
                 </div>
                 {lastAction.reviewComment && <div style={{ fontSize: 11.5, color: 'var(--txt-mut)', marginTop: 3 }}>{lastAction.reviewComment}</div>}
+              </div>
+            </div>
+          )}
+
+          {mode !== 'VIEW' && (
+            <div>
+              <Field label={mode === 'APPROVE' ? 'Comment (optional)' : 'Reason for rejection *'}>
+                <textarea style={{ ...inputStyle, minHeight: 70, resize: 'vertical', fontFamily: 'inherit' }} value={comment} onChange={(e) => setComment(e.target.value)} />
+              </Field>
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 12 }}>
+                <button onClick={onClose} style={{ background: 'var(--raised2)', color: 'var(--txt-mut)', border: '1px solid var(--line2)', borderRadius: 7, padding: '9px 18px', fontSize: 12.5, cursor: 'pointer' }}>Cancel</button>
+                <button
+                  onClick={onConfirmAction}
+                  disabled={submitting}
+                  style={{ background: mode === 'APPROVE' ? '#2FB67C' : '#C0392B', color: '#fff', border: 'none', borderRadius: 7, padding: '9px 20px', fontSize: 12.5, fontWeight: 600, cursor: submitting ? 'not-allowed' : 'pointer', opacity: submitting ? 0.7 : 1 }}
+                >
+                  {submitting ? 'Submitting…' : mode === 'APPROVE' ? 'Confirm Approval' : 'Reject Request'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * Right-side slide-out detail drawer for a single Partial Day record — same shape as
+ * WfhDetailDrawer (requestor summary, date/mode/hours, who it was routed to, the free-text note,
+ * the approval/rejection event, and — only in APPROVE/REJECT mode — the comment field), just
+ * without the date-range grouping WFH needs, since a Partial Day request never spans more than
+ * one date.
+ */
+function PartialDayDetailDrawer({ request, mode, comment, setComment, submitting, onClose, onConfirmAction }: {
+  request: AttendanceRequestRecord;
+  mode: 'VIEW' | 'APPROVE' | 'REJECT';
+  comment: string;
+  setComment: (v: string) => void;
+  submitting: boolean;
+  onClose: () => void;
+  onConfirmAction: () => void;
+}) {
+  const { formatDuration } = useTimeFormat();
+  const initials = request.employeeName.split(' ').filter(Boolean).slice(0, 2).map((p) => p[0]?.toUpperCase()).join('');
+  const modeLabel = PARTIAL_DAY_MODE_OPTIONS.find((o) => o.value === request.partialDayMode)?.label ?? dash;
+  const hoursLabel = request.partialDayHours != null ? formatDuration(Math.round(request.partialDayHours * 60)) ?? dash : dash;
+
+  return (
+    <>
+      <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.5)', zIndex: 600 }} />
+      <div style={{ position: 'fixed', top: 0, right: 0, bottom: 0, width: 'min(440px, 100vw)', background: 'var(--panel)', borderLeft: '1px solid var(--line)', boxShadow: '-12px 0 32px rgba(0,0,0,.4)', zIndex: 601, display: 'flex', flexDirection: 'column', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', borderBottom: '1px solid var(--line)', flexShrink: 0 }}>
+          <span style={{ fontFamily: 'Inter, sans-serif', fontWeight: 700, fontSize: 14, color: 'var(--txt)' }}>Partial Day Request Details</span>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--txt-dim)', padding: 4, borderRadius: 4, display: 'flex' }}><X size={16} /></button>
+        </div>
+
+        <div style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 18 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ width: 36, height: 36, borderRadius: '50%', background: 'var(--raised2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12.5, fontWeight: 700, color: 'var(--txt-mut)', flexShrink: 0 }}>
+              {initials || <User size={16} />}
+            </div>
+            <div>
+              <div style={{ fontWeight: 600, color: 'var(--txt)', fontSize: 13 }}>{request.employeeName}</div>
+              <div style={{ fontSize: 11, color: 'var(--txt-dim)' }}>Requested on {formatDay(request.createdAt.slice(0, 10))}</div>
+            </div>
+          </div>
+
+          <div style={{ background: 'var(--raised)', border: '1px solid var(--line2)', borderRadius: 8, padding: '12px 14px', display: 'flex', alignItems: 'center', gap: 14 }}>
+            <DateBox isoDate={request.requestDate} />
+            <div>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--txt)' }}>{modeLabel}</div>
+              <div style={{ fontSize: 11, color: 'var(--txt-dim)', marginTop: 2 }}>{hoursLabel}</div>
+            </div>
+          </div>
+
+          {request.assignedApproverName && (
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>Approver</div>
+              <div style={{ fontSize: 12.5, color: 'var(--txt)' }}>{request.assignedApproverName}</div>
+              {request.notifyUserName && request.notifyUserName !== request.assignedApproverName && <div style={{ fontSize: 12.5, color: 'var(--txt)', marginTop: 2 }}>{request.notifyUserName}</div>}
+            </div>
+          )}
+
+          <div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--txt-dim)', textTransform: 'uppercase', letterSpacing: '.06em', marginBottom: 6 }}>Note</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ width: 28, height: 28, borderRadius: '50%', background: 'var(--raised2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 10.5, fontWeight: 700, color: 'var(--txt-mut)', flexShrink: 0 }}>
+                {initials || <User size={13} />}
+              </div>
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt)' }}>
+                  {request.employeeName} <span style={{ fontWeight: 400, color: 'var(--txt-dim)', fontSize: 10.5 }}>{formatDay(request.createdAt.slice(0, 10))}</span>
+                </div>
+                <div style={{ fontSize: 12.5, color: 'var(--txt-mut)', marginTop: 2 }}>{request.reason}</div>
+              </div>
+            </div>
+          </div>
+
+          {request.reviewedByName && (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, background: request.status === 'REJECTED' ? 'rgba(228,55,61,.08)' : 'rgba(47,182,124,.08)', border: `1px solid ${request.status === 'REJECTED' ? 'rgba(228,55,61,.25)' : 'rgba(47,182,124,.25)'}`, borderRadius: 8, padding: '10px 12px' }}>
+              {request.status === 'REJECTED'
+                ? <XCircle size={15} style={{ color: '#E4373D', flexShrink: 0, marginTop: 1 }} />
+                : <CheckCircle2 size={15} style={{ color: '#2FB67C', flexShrink: 0, marginTop: 1 }} />}
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--txt)' }}>
+                  {request.status === 'REJECTED' ? 'Rejected' : 'Approved'} by {request.reviewedByName}
+                  {request.reviewedAt && <span style={{ fontWeight: 400, color: 'var(--txt-dim)' }}> · {formatDay(request.reviewedAt.slice(0, 10))}</span>}
+                </div>
+                {request.reviewComment && <div style={{ fontSize: 11.5, color: 'var(--txt-mut)', marginTop: 3 }}>{request.reviewComment}</div>}
               </div>
             </div>
           )}
