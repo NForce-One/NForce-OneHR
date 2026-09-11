@@ -60,6 +60,15 @@ public class EmailService {
         sendAsync(toEmail, subject, html);
     }
 
+    /** Sent to the NEW email address after a Super Admin edits a user's account email — confirms
+     * the address is reachable and tells the user to sign in with it going forward. oldEmail is
+     * shown for their own confidence that this wasn't a mistaken account. */
+    public void sendEmailUpdatedEmail(String toEmail, String fullName, String oldEmail) {
+        String subject = "NForce OneHR — your account email has been updated";
+        String html = buildEmailUpdatedHtml(fullName, toEmail, oldEmail);
+        sendAsync(toEmail, subject, html);
+    }
+
     /** Echoes back the requesting environment's own origin (validated against the same
      * allowlist CORS uses) so the emailed link returns to wherever the request came from —
      * local, Dev, or any other deployed environment — instead of a fixed default. Falls back
@@ -182,6 +191,49 @@ public class EmailService {
                 </body>
                 </html>
                 """.formatted(fullName, email, tempPassword, baseUrl);
+    }
+
+    private String buildEmailUpdatedHtml(String fullName, String newEmail, String oldEmail) {
+        return """
+                <!DOCTYPE html>
+                <html lang="en">
+                <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+                <body style="margin:0;padding:0;background:#080808;font-family:Inter,Arial,sans-serif;">
+                  <table width="100%%" cellpadding="0" cellspacing="0" style="background:#080808;padding:40px 16px;">
+                    <tr><td align="center">
+                      <table width="560" cellpadding="0" cellspacing="0" style="background:#16181D;border:1px solid #2A2E37;border-radius:12px;overflow:hidden;">
+                        <!-- Header -->
+                        <tr><td style="background:#B11116;padding:28px 36px;">
+                          <span style="font-family:'Space Grotesk',Arial,sans-serif;font-size:20px;font-weight:700;color:#ffffff;letter-spacing:-0.02em;">NForce OneHR</span>
+                        </td></tr>
+                        <!-- Body -->
+                        <tr><td style="padding:36px;">
+                          <h1 style="font-family:'Space Grotesk',Arial,sans-serif;font-size:22px;font-weight:700;color:#E8EAED;margin:0 0 8px;">Your account email was updated</h1>
+                          <p style="color:#9BA1AC;font-size:14px;line-height:1.6;margin:0 0 28px;">Hi %s, an administrator has updated the email address on your NForce OneHR account.</p>
+
+                          <table width="100%%" cellpadding="0" cellspacing="0" style="background:#1E2128;border:1px solid #2A2E37;border-radius:8px;margin-bottom:28px;">
+                            <tr><td style="padding:20px 24px;">
+                              <p style="margin:0 0 6px;font-size:13px;color:#9BA1AC;">Previous email: <span style="color:#E8EAED;font-weight:600;">%s</span></p>
+                              <p style="margin:0;font-size:13px;color:#9BA1AC;">New email: <span style="color:#E8EAED;font-weight:600;">%s</span></p>
+                            </td></tr>
+                          </table>
+
+                          <div style="background:rgba(228,55,61,.08);border:1px solid rgba(228,55,61,.2);border-radius:8px;padding:14px 18px;margin-bottom:28px;">
+                            <p style="margin:0;font-size:13px;color:#f4a5a8;line-height:1.5;">Sign in using this new email address from now on. If you didn't expect this change, contact your HR administrator immediately.</p>
+                          </div>
+
+                          <a href="%s/login" style="display:inline-block;background:#B11116;color:#ffffff;font-weight:700;font-size:14px;text-decoration:none;padding:12px 28px;border-radius:8px;">Sign in to OneHR →</a>
+                        </td></tr>
+                        <!-- Footer -->
+                        <tr><td style="padding:20px 36px;border-top:1px solid #2A2E37;">
+                          <p style="margin:0;font-size:12px;color:#6B7280;">This email was sent by NForce OneHR. If you didn't expect this, contact your HR administrator.</p>
+                        </td></tr>
+                      </table>
+                    </td></tr>
+                  </table>
+                </body>
+                </html>
+                """.formatted(fullName, oldEmail, newEmail, baseUrl);
     }
 
     private String buildResetHtml(String fullName, String email, String tempPassword, String baseUrl) {

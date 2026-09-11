@@ -1,5 +1,6 @@
 package com.nforce.onehr.dto;
 
+import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.Pattern;
 import lombok.Data;
 
@@ -11,6 +12,14 @@ public class UpdateUserRequest {
     @Pattern(regexp = "^(?=.*\\p{L})[\\p{L}\\s'-]+$",
              message = "Full name can only contain letters, spaces, hyphens, and apostrophes")
     private String fullName;
+
+    // Optional — null/blank means "leave unchanged" (same convention as every other field here).
+    // Mirrors CreateUserRequest's identical @Email + @Pattern pair; see its comment for why the
+    // extra pattern is needed on top of bare @Email.
+    @Email
+    @Pattern(regexp = "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$", message = "Enter a valid email address with a proper domain (e.g. name@company.com)")
+    private String email;
+
     private String role;
     private UUID businessUnitId;
     private UUID departmentId;
