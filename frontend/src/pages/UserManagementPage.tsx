@@ -539,6 +539,7 @@ function EditModal({ user, onClose, onUpdated, token, opts, setOpts }: {
   const { showToast } = useToast();
   const [form, setForm] = useState<UpdateUserPayload>({
     fullName: user.fullName,
+    email: user.email,
     role: user.role,
     businessUnitId: user.businessUnitId ?? undefined,
     departmentId: user.departmentId ?? undefined,
@@ -563,8 +564,16 @@ function EditModal({ user, onClose, onUpdated, token, opts, setOpts }: {
   const [joiningDate, setJoiningDate] = useState(user.joiningDate);
   const [joiningDateNote, setJoiningDateNote] = useState('');
 
+  const emailChanged = (form.email ?? '') !== user.email;
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    const rawEmail = form.email ?? '';
+    if (!rawEmail) { setError('Email is required.'); return; }
+    // Same checks AddModal runs on create — see EMAIL_PATTERN's comment for why the raw
+    // (untrimmed) value is checked rather than silently trimming a leading/trailing space.
+    if (rawEmail !== rawEmail.trim()) { setError('Email must not have leading or trailing spaces.'); return; }
+    if (!EMAIL_PATTERN.test(rawEmail)) { setError('Enter a valid email address with a proper domain (e.g. name@company.com).'); return; }
     if (form.role !== 'SUPER_ADMIN' && !form.managerId) { setError('Reporting Manager is required for this role.'); return; }
     setSubmitting(true); setError(null);
     try {
@@ -593,6 +602,16 @@ function EditModal({ user, onClose, onUpdated, token, opts, setOpts }: {
           {error && <div style={{ gridColumn: '1/-1', color: 'var(--risk)', background: 'rgba(228,55,61,.08)', border: '1px solid rgba(228,55,61,.2)', borderRadius: 6, padding: '10px 14px', fontSize: 13 }}>{error}</div>}
           {isInactive && <InactiveEditBanner />}
           <div style={{ gridColumn: '1/-1' }}><Field label="Full Name"><input style={inputStyle} value={form.fullName ?? ''} onChange={e => setForm(f => ({ ...f, fullName: e.target.value }))} /></Field></div>
+          <div style={{ gridColumn: '1/-1' }}>
+            <Field label="Company Email">
+              <input type="email" style={inputStyle} value={form.email ?? ''} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="jane@nforceone.com" />
+            </Field>
+            {emailChanged && (
+              <div style={{ fontSize: 11, color: '#E0A93B', marginTop: 4 }}>
+                Changing the email signs the user out and sends a notice to the new address with a sign-in link.
+              </div>
+            )}
+          </div>
           <Field label="Role">
             <select style={inputStyle} disabled={gatedFieldsLocked} value={form.role ?? 'EMPLOYEE'} onChange={e => {
               const newRole = e.target.value;
