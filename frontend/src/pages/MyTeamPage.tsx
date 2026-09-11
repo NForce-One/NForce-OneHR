@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { ChevronLeft, ChevronRight, Search, Check, X, AlertTriangle, Users, CheckCircle2, Clock, Home, MapPin, Mail, Sparkles } from 'lucide-react';
 import { useAuthStore } from '../store/authStore';
+import { toShellRole } from '../lib/nav.config';
 import { useToast } from '../context/ToastContext';
 import { dashboardApi, type DirectReport } from '../api/dashboard';
 import {
@@ -23,6 +24,7 @@ import { directoryApi, type DirectoryEntry } from '../api/directory';
 import { kudosApi } from '../api/kudos';
 import { StatusBadge, inactiveDimStyle } from '../components/EmployeeStatus';
 import { EmployeeAvatar } from '../components/EmployeeAvatar';
+import { TypeBadge, groupRequestsByType } from '../components/TypeBadge';
 
 /* ── Date helpers (local to this page, matching the codebase's per-page convention) ── */
 function todayIsoDate(): string {
@@ -91,18 +93,6 @@ const panelStyle: React.CSSProperties = { background: 'var(--panel)', border: '1
 const panelHeadStyle: React.CSSProperties = { padding: '14px 18px', borderBottom: '1px solid var(--line)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 };
 const panelTitleStyle: React.CSSProperties = { fontFamily: 'Inter, sans-serif', fontWeight: 700, fontSize: 14, color: 'var(--txt)' };
 const panelCountStyle: React.CSSProperties = { fontSize: 11, fontWeight: 700, color: 'var(--txt-mut)', background: 'var(--raised2)', padding: '2px 8px', borderRadius: 20 };
-
-const TYPE_LABELS: Record<'LEAVE' | 'REGULARIZATION', string> = { LEAVE: 'Leave', REGULARIZATION: 'Attendance Reg.' };
-const TYPE_COLORS: Record<'LEAVE' | 'REGULARIZATION', string> = { LEAVE: 'rgba(99,102,241,.18)', REGULARIZATION: 'rgba(245,158,11,.18)' };
-const TYPE_TEXT: Record<'LEAVE' | 'REGULARIZATION', string> = { LEAVE: '#818CF8', REGULARIZATION: '#F59E0B' };
-
-function TypeBadge({ type }: { type: 'LEAVE' | 'REGULARIZATION' }) {
-  return (
-    <span style={{ fontSize: 10.5, fontWeight: 700, padding: '3px 8px', borderRadius: 20, background: TYPE_COLORS[type], color: TYPE_TEXT[type], whiteSpace: 'nowrap' }}>
-      {TYPE_LABELS[type]}
-    </span>
-  );
-}
 
 function Avatar({ userId, name, size = 34 }: { userId?: string | null; name: string; size?: number }) {
   return (
@@ -1952,11 +1942,30 @@ function PenaltiesTab({ token }: { token: string }) {
 
 export default function MyTeamPage() {
   const token = useAuthStore(s => s.token)!;
+  const user = useAuthStore(s => s.user);
+  const role = toShellRole(user?.role);
+  const isEmployee = role === 'Employee';
+
   const today = todayIsoDate();
   const [searchParams] = useSearchParams();
   const rosterRef = useRef<HTMLDivElement>(null);
 
-  const [tab, setTab] = useState<'overview' | 'effort' | 'negligence' | 'penalties' | 'assignments' | 'reports'>('overview');
+  const [tab, setTabState] = useState<'overview' | 'effort' | 'negligence' | 'penalties' | 'assignments' | 'reports'>(() => {
+    const fromParam = searchParams.get('tab');
+    if (fromParam && ['overview', 'effort', 'negligence', 'penalties', 'assignments', 'reports'].includes(fromParam)) {
+      return fromParam as any;
+    }
+    const saved = sessionStorage.getItem('onehr:myteam:tab');
+    if (saved && ['overview', 'effort', 'negligence', 'penalties', 'assignments', 'reports'].includes(saved)) {
+      return saved as any;
+    }
+    return 'overview';
+  });
+
+  const setTab = useCallback((newTab: 'overview' | 'effort' | 'negligence' | 'penalties' | 'assignments' | 'reports') => {
+    setTabState(newTab);
+    sessionStorage.setItem('onehr:myteam:tab', newTab);
+  }, []);
 
   const [directReports, setDirectReports] = useState<DirectReport[]>([]);
   const [directReportCount, setDirectReportCount] = useState(0);
@@ -1983,9 +1992,20 @@ export default function MyTeamPage() {
   const [viewingEmployeeDetails, setViewingEmployeeDetails] = useState<DirectoryEntry | null>(null);
   const [directory, setDirectory] = useState<DirectoryEntry[]>([]);
 
-  // Direct Reports / Peers toggle (ONEHR-73) — every employee can see Peers; Direct Reports
-  // only appears once we know the caller actually has any (reuses ONEHR-72 as-is otherwise).
-  const [viewMode, setViewMode] = useState<'direct' | 'peers'>('direct');
+  // Direct Reports / Peers toggle (ONEHR-73) — employees always view Peers (Project Team);
+  // managers default to Direct Reports unless peers is explicitly selected or they have no reports.
+  const [viewMode, setViewModeState] = useState<'direct' | 'peers'>(() => {
+    if (isEmployee) return 'peers';
+    const saved = sessionStorage.getItem('onehr:myteam:viewMode');
+    return saved === 'peers' ? 'peers' : 'direct';
+  });
+
+  const setViewMode = useCallback((mode: 'direct' | 'peers') => {
+    if (isEmployee) return;
+    setViewModeState(mode);
+    sessionStorage.setItem('onehr:myteam:viewMode', mode);
+  }, [isEmployee]);
+
   const autoSwitched = useRef(false);
 
   // Landed here via a dashboard link (e.g. "On Leave" KPI) — scroll straight to the roster
@@ -1996,6 +2016,7 @@ export default function MyTeamPage() {
   }, []);
 
   useEffect(() => {
+    if (isEmployee) return;
     dashboardApi.managerDashboard(token)
       .then(d => {
         // Keep inactive direct reports visible (dimmed + badge, see RosterRow render) instead of
@@ -2003,17 +2024,19 @@ export default function MyTeamPage() {
         // active" rather than simply vanishing from the manager's team.
         setDirectReports(d.directReports);
         setDirectReportCount(d.directReportCount);
-        if (d.directReportCount === 0 && !autoSwitched.current) {
+        const savedViewMode = sessionStorage.getItem('onehr:myteam:viewMode');
+        if (d.directReportCount === 0 && !savedViewMode && !autoSwitched.current) {
           autoSwitched.current = true;
           setViewMode('peers');
         }
       })
       .catch(() => {});
-  }, [token]);
+  }, [token, isEmployee, setViewMode]);
 
   useEffect(() => {
+    if (isEmployee) return;
     attendanceApi.team(today, token).then(setTodayRecords).catch(() => setTodayRecords([])).finally(() => setLoading(false));
-  }, [token, today]);
+  }, [token, today, isEmployee]);
 
   // Org-wide directory (same unrestricted endpoint the Directory tab itself uses) — backs the
   // "Not in yet today" card's employment-details click-through, since DirectReport itself only
@@ -2023,25 +2046,30 @@ export default function MyTeamPage() {
   }, [token]);
 
   useEffect(() => {
+    if (isEmployee) return;
     leaveApi.team(today, today, token).then(setTodayLeave).catch(() => setTodayLeave([]));
-  }, [token, today]);
+  }, [token, today, isEmployee]);
 
   const weekStart = useMemo(() => mondayOf(new Date()), []);
   const weekEnd = useMemo(() => addDays(weekStart, 4), [weekStart]);
 
   useEffect(() => {
+    if (isEmployee) return;
     leaveApi.team(toISO(weekStart), toISO(weekEnd), token).then(setWeekLeave).catch(() => setWeekLeave([]));
-  }, [token, weekStart, weekEnd]);
+  }, [token, weekStart, weekEnd, isEmployee]);
 
   useEffect(() => {
+    if (isEmployee) return;
     approvalCenterApi.listPending(token).then(setPendingItems).catch(() => setPendingItems([]));
-  }, [token]);
+  }, [token, isEmployee]);
 
   useEffect(() => {
+    if (isEmployee) return;
     holidaysApi.listForMyLocation(token).then(setHolidays).catch(() => setHolidays([]));
-  }, [token]);
+  }, [token, isEmployee]);
 
   useEffect(() => {
+    if (isEmployee) return;
     const year = viewDate.getFullYear(), month = viewDate.getMonth();
     const from = toISODate(year, month, 1);
     const to = toISODate(year, month, daysInMonth(year, month));
@@ -2049,7 +2077,7 @@ export default function MyTeamPage() {
       attendanceApi.teamMonth(from, to, token).catch(() => []),
       leaveApi.team(from, to, token).catch(() => []),
     ]).then(([att, lv]) => { setMonthAttendance(att); setMonthLeave(lv); });
-  }, [token, viewDate]);
+  }, [token, viewDate, isEmployee]);
 
   const attendanceByEmployee = useMemo(() => new Map(todayRecords.map(r => [r.employeeUserId, r])), [todayRecords]);
   const directoryByEmployee = useMemo(() => new Map(directory.map(d => [d.userId, d])), [directory]);
@@ -2129,7 +2157,7 @@ export default function MyTeamPage() {
               : "Who's around today on your project team, plus a quick way to find and reach a teammate — without opening the full company directory."}
           </p>
         </div>
-        {directReportCount > 0 && (
+        {!isEmployee && directReportCount > 0 && (
           <div style={{ display: 'inline-flex', gap: 4, background: 'var(--shell)', border: '1px solid var(--line2)', borderRadius: 9, padding: 4, flexShrink: 0 }} role="tablist" aria-label="My Team view">
             <button role="tab" aria-selected={viewMode === 'direct'} onClick={() => setViewMode('direct')} style={{
               display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, fontWeight: 600, padding: '7px 14px', borderRadius: 6, border: 'none', cursor: 'pointer',
@@ -2368,7 +2396,9 @@ export default function MyTeamPage() {
                 </div>
                 {row.requests.length > 0 && (
                   <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-                    {row.requests.map(r => <TypeBadge key={`${r.requestType}:${r.id}`} type={r.requestType as 'LEAVE' | 'REGULARIZATION'} />)}
+                    {groupRequestsByType(row.requests).map(({ type, count }) => (
+                      <TypeBadge key={type} type={type} count={count} />
+                    ))}
                   </div>
                 )}
                 <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -2417,7 +2447,7 @@ export default function MyTeamPage() {
                     {weekDayDates.map((d, i) => {
                       const on = toISO(d) >= l.startDate && toISO(d) <= l.endDate;
                       return (
-                        <div key={i} style={{ width: 18, height: 18, borderRadius: 4, display: 'grid', placeItems: 'center', fontSize: 8.5, fontWeight: 700, background: on ? 'var(--info)' : 'var(--raised2)', color: on ? '#fff' : 'var(--txt-dim)' }}>
+                        <div key={i} style={{ width: 18, height: 18, borderRadius: 4, display: 'grid', placeItems: 'center', fontSize: 8.5, fontWeight: 700, background: on ? DAY_COLORS.leave : 'var(--raised2)', color: on ? '#fff' : 'var(--txt-dim)' }}>
                           {WEEK_CHIPS[i]}
                         </div>
                       );

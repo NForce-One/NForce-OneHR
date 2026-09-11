@@ -1,5 +1,6 @@
 package com.nforce.onehr.service;
 
+import com.nforce.onehr.config.AttendanceProperties;
 import com.nforce.onehr.dto.expense.*;
 import com.nforce.onehr.entity.*;
 import com.nforce.onehr.repository.*;
@@ -27,6 +28,7 @@ public class ExpenseService {
     private final AuditService auditService;
     private final AuditSnapshotSerializer auditSnapshot;
     private final NotificationService notificationService;
+    private final AttendanceProperties attendanceProperties;
 
     // ── Categories ────────────────────────────────────────
 
@@ -68,6 +70,12 @@ public class ExpenseService {
         User actor = requireActor(actorEmail);
         ExpenseCategory category = categoryRepo.findById(req.getCategoryId())
                 .orElseThrow(() -> new IllegalArgumentException("Unknown expense category"));
+        LocalDate today = (attendanceProperties != null && attendanceProperties.getZone() != null)
+                ? LocalDate.now(ZoneId.of(attendanceProperties.getZone()))
+                : LocalDate.now();
+        if (req.getExpenseDate() != null && req.getExpenseDate().isAfter(today)) {
+            throw new IllegalArgumentException("Expense date cannot be in the future");
+        }
 
         // Server-side receipt requirement check — mirrors the frontend's live validation
         boolean receiptRequired = req.getAmount().compareTo(category.getRequiresReceiptAbove()) > 0;
